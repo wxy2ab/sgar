@@ -59,12 +59,15 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/wxy2ab/sgar"
-Source = "https://github.com/wxy2ab/sgar"
-Issues = "https://github.com/wxy2ab/sgar/issues"
-Documentation = "https://github.com/wxy2ab/sgar#readme"
-"Core Idea: Audit Engineering" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md"
-"Core Idea: State-Governed Agent Regime" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md"
+"Homepage / 项目主页" = "https://github.com/wxy2ab/sgar"
+"Source / 源码仓库" = "https://github.com/wxy2ab/sgar"
+"Issues / 问题反馈" = "https://github.com/wxy2ab/sgar/issues"
+"Documentation (ZH) / 中文文档" = "https://github.com/wxy2ab/sgar/blob/main/README.md"
+"Documentation (EN) / English Docs" = "https://github.com/wxy2ab/sgar/blob/main/README.en.md"
+"Core Idea (ZH): 审计工程" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.zh-CN.md"
+"Core Idea (EN): Audit Engineering" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md"
+"Core Idea (ZH): 状态治理代理体制" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.zh-CN.md"
+"Core Idea (EN): State-Governed Agent Regime" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md"
 
 [project.optional-dependencies]
 dev = ["pytest", "mypy", "ruff"]

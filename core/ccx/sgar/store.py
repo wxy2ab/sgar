@@ -143,6 +143,7 @@ class SgarStore:
             self.stage_spec_path("stage-01"),
             stage_spec_template("stage-01"),
         )
+        self._ensure_gitignore_entries()
         return state
 
     def read_text(self, path: Path) -> str:
@@ -157,6 +158,27 @@ class SgarStore:
     def write_text_if_missing(self, path: Path, text: str) -> None:
         if not path.exists():
             self.write_text(path, text)
+
+    def _ensure_gitignore_entries(self) -> None:
+        gitignore_path = self.cwd / ".gitignore"
+        if not gitignore_path.exists() or not gitignore_path.is_file():
+            return
+
+        existing_text = gitignore_path.read_text(encoding="utf-8")
+        existing_lines = {line.strip() for line in existing_text.splitlines()}
+        missing_entries = [
+            entry
+            for entry in (".sgar/", ".sgarx/")
+            if entry not in existing_lines
+        ]
+        if not missing_entries:
+            return
+
+        updated_text = existing_text
+        if updated_text and not updated_text.endswith("\n"):
+            updated_text += "\n"
+        updated_text += "".join(f"{entry}\n" for entry in missing_entries)
+        _atomic_write_text(gitignore_path, updated_text)
 
     def read_json(self, path: Path) -> dict[str, Any]:
         try:
