@@ -5,12 +5,34 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sgar"
 version = "0.1.9"
-description = "SGAR — ccx 治理化 agent 运行时（自 llm_dealer 导出的独立分发）"
+description = "Embedded coding agent for long-range code editing, automated repair, and state-governed operations."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
-authors = [{ name = "wxy2ab" }]
-keywords = ["ccx", "sgar", "agent", "llm", "governance"]
+authors = [
+    { name = "wxy2ab" },
+]
+keywords = [
+    "sgar",
+    "embedded-coding-agent",
+    "long-range-code-editing",
+    "automated-repair",
+    "automated-operations",
+    "state-governed-agent",
+    "audit-engineering",
+    "openclaw",
+]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "anthropic",
     "azure-ai-inference",
@@ -35,6 +57,14 @@ dependencies = [
     "tree-sitter-python",
     "volcengine-python-sdk[ark]"
 ]
+
+[project.urls]
+Homepage = "https://github.com/wxy2ab/sgar"
+Source = "https://github.com/wxy2ab/sgar"
+Issues = "https://github.com/wxy2ab/sgar/issues"
+Documentation = "https://github.com/wxy2ab/sgar#readme"
+"Core Idea: Audit Engineering" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md"
+"Core Idea: State-Governed Agent Regime" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md"
 
 [project.optional-dependencies]
 dev = ["pytest", "mypy", "ruff"]
