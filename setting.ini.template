@@ -1,0 +1,131 @@
+# sgar 配置模板 —— 复制为 setting.ini 后填入真实值。
+# 留空表示使用代码内置默认值；所有键也可用同名大写环境变量提供。
+# 由 task/copy/ccx_out.py 自动生成，请勿手工编辑本模板。
+
+[Default]
+# ---- 语言 / 主用 LLM 客户端 ----
+prompt_language = 
+llm_api = 
+cc_default_llm_client = 
+cc_default_backend = 
+
+# ---- LLM 供应商密钥 ----
+deep_seek_api_key = 
+openai_api_key = 
+claude_api_key = 
+glm_api_key = 
+dashscope_api_key = 
+moonshot_api_key = 
+minimax_api_key = 
+baichuan_api_key = 
+google_api_key = 
+openrouter_api_key = 
+siliconflow_key = 
+qiniu_api_key = 
+sense_api_key = 
+tencent_api_key = 
+volcengine_api_key = 
+volcengine_doubao = 
+volcengine_doubao_32k = 
+zero_one_api_key = 
+mimo_api_key = 
+mi_key = 
+infinity_api_key = 
+ppio_api_key = 
+px_api_key = 
+deepbricks_api_key = 
+baidu_bce_api_key = 
+ark_coding_key = 
+hunyuan_SecretId = 
+hunyuan_SecretKey = 
+ERNIE_API_KEY = 
+ERNIE_SERCRET_KEY = 
+AZURE_OPENAI_API_KEY = 
+AZURE_OPENAI_ENDPOINT = 
+AZURE_DEEPSEEK_API_KEY = 
+ollama_url = 
+proxy_host = 
+proxy_port = 
+
+# ---- 角色路由（可选） ----
+MAIN_LLM = 
+MAIN_LLM_WEIGHTS = 
+AUXILIARY_LLMS = 
+
+# ---- 云 / 凭证 ----
+aws_access_key_id = 
+aws_secret_access_key = 
+aws_sf_key = 
+AWS_SESSION_TOKEN = 
+project_id = 
+location = 
+service_account_path = 
+
+# ---- ccx 运行时调参（留空=用代码内置默认值） ----
+cc_permission_mode = 
+cc_agent_mode = 
+cc_execute_policy = 
+cc_plan_root = 
+cc_spec_root = 
+cc_spec_max_parallel_agents = 
+cc_max_tool_rounds = 
+cc_llm_request_timeout_seconds = 
+cc_max_turn_timeout_seconds = 
+cc_compact_soft_threshold = 
+cc_compact_hard_threshold = 
+cc_auto_compact_enabled = 
+cc_runtime_validation_enabled = 
+cc_rollback_on_runtime_failure = 
+cc_persist_sessions = 
+cc_concurrency_enabled = 
+cc_use_recommended_routing = 
+cc_agent_runtime_event_buffer_size = 
+cc_ccx_max_cost_usd = 
+cc_ccx_max_tokens = 
+cc_ccx_cost_per_1k_tokens = 
+cc_ccx_max_spawn_fanout = 
+cc_ccx_max_spawn_depth = 
+cc_ccx_count_research_in_fanout = 
+cc_memory_enabled = 
+cc_memory_provider = 
+cc_memory_auto_recall = 
+cc_memory_auto_store = 
+cc_memory_store_structural_only = 
+cc_memory_structure_first = 
+cc_memory_max_prompt_hits = 
+cc_memory_prompt_summary_max_chars = 
+cc_memory_recall_char_budget = 
+cc_memory_write_char_budget = 
+cc_memory_mempalace_config_dir = 
+cc_memory_mempalace_kg_path = 
+cc_memory_mempalace_palace_path = 
+cc_consume_enabled = 
+cc_consume_max_assets = 
+cc_consume_max_chars = 
+cc_consume_pin_threshold = 
+cc_emitter_enabled = 
+cc_emitter_max_candidates_per_turn = 
+cc_emitter_prompt_section_enabled = 
+tool_emitter_enabled = 
+tool_emitter_max_candidates_per_call = 
+tool_emitter_prompt_section_enabled = 
+cc_swarm_assignment_event_buffer_size = 
+cc_swarm_assignment_response_timeout_seconds = 
+cc_swarm_default_assignment_timeout_seconds = 
+cc_swarm_retry_backoff_base_ms = 
+cc_swarm_retry_backoff_max_ms = 
+cc_durable_runtime_enabled = 
+cc_durable_runtime_mode = 
+cc_durable_runtime_root = 
+cc_durable_recover_on_startup = 
+cc_durable_checkpoint_interval = 
+cc_durable_default_lease_ttl_seconds = 
+cc_durable_default_max_attempts = 
+cc_durable_cognition_mode = 
+cc_durable_cognition_model = 
+cc_durable_cognition_reasoning_effort = 
+cc_durable_wrap_readonly_tools = 
+cc_durable_wrap_side_effect_tools = 
+cc_durable_tool_flush_outbox = 
+cc_durable_emitter_threshold_events = 
+cc_durable_emitter_overflow_token_ratio =

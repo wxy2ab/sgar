@@ -1,0 +1,547 @@
+<!--
+  ccx static report template. Placeholders are written as {{NAME}} below
+  but appear in the body as the open-brace pair, NAME, close-brace pair
+  separated by a single space on each side ("{{ NAME }}" form).
+  core.ccx.report._render_template substitutes them via str.replace.
+  No real Jinja2; the .j2 extension is a hint, not a dependency.
+
+  Defined placeholders (each appears exactly once below):
+    TITLE          - <title> text and h1 banner.
+    GENERATED_AT   - ISO timestamp (UTC) of report generation.
+    HEADER         - run summary block (status/timing/counts/metadata).
+    DAG_SECTION    - Mermaid DAG block, or a warning if skipped.
+    CONTROLS       - filter buttons + search input + jump-to-failures.
+    NODES_TABLE    - sortable nodes table.
+    NODE_DETAILS   - per-node <details> blocks.
+    EVENTS_SECTION - events timeline.
+
+  Every placeholder MUST be HTML-escaped on the Python side BEFORE
+  insertion; the renderer never does its own escaping.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ TITLE }}</title>
+<style>
+:root {
+  /* Surface & text */
+  --bg: #fcfcfc;
+  --fg: #1a1a1a;
+  --muted: #5e5e5e;
+  --border: #d0d0d0;
+  --panel: #f4f4f5;
+  --code-bg: #edede8;
+  --link: #0a4b9a;
+
+  /* Interactive */
+  --hover-bg: rgba(0,0,0,.05);
+  --focus-ring: #1976d2;
+  --focus-ring-alpha: rgba(25,118,210,.35);
+
+  /* Table */
+  --table-stripe: rgba(0,0,0,.025);
+  --table-hover: rgba(0,0,0,.06);
+
+  /* Decorative */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.06);
+  --radius: 6px;
+  --radius-sm: 3px;
+  --transition: 150ms ease;
+
+  /* Spacing scale (used in media queries) */
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+
+  /* Status tokens — light */
+  --st-succeeded: #2e7d32;
+  --st-succeeded-bg: #e8f5e9;
+  --st-failed: #c62828;
+  --st-failed-bg: #ffebee;
+  --st-running: #1565c0;
+  --st-running-bg: #e3f2fd;
+  --st-pending: #616161;
+  --st-pending-bg: #e8e8e8;
+  --st-skipped: #8c8c8c;
+  --st-skipped-bg: #f0f0f0;
+  --st-hang: #e65100;
+  --st-hang-bg: #fff3e0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Surface & text */
+    --bg: #131316;
+    --fg: #e4e4e7;
+    --muted: #8b8b95;
+    --border: #2c2c34;
+    --panel: #1c1c22;
+    --code-bg: #0e0e12;
+    --link: #90bcf6;
+
+    /* Interactive */
+    --hover-bg: rgba(255,255,255,.06);
+    --focus-ring: #64b5f6;
+    --focus-ring-alpha: rgba(100,181,246,.35);
+
+    /* Table */
+    --table-stripe: rgba(255,255,255,.025);
+    --table-hover: rgba(255,255,255,.06);
+
+    /* Decorative */
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.30);
+
+    /* Status tokens — dark */
+    --st-succeeded: #66bb6a;
+    --st-succeeded-bg: #1a331b;
+    --st-failed: #ef5350;
+    --st-failed-bg: #3a1717;
+    --st-running: #64b5f6;
+    --st-running-bg: #0d2438;
+    --st-pending: #a8a8b0;
+    --st-pending-bg: #25252c;
+    --st-skipped: #6e6e78;
+    --st-skipped-bg: #1e1e24;
+    --st-hang: #ffb74d;
+    --st-hang-bg: #3a260e;
+  }
+}
+
+/* Manual theme override — applied via JS on <html> */
+html[data-theme="light"] {
+  --bg: #fcfcfc;
+  --fg: #1a1a1a;
+  --muted: #5e5e5e;
+  --border: #d0d0d0;
+  --panel: #f4f4f5;
+  --code-bg: #edede8;
+  --link: #0a4b9a;
+  --hover-bg: rgba(0,0,0,.05);
+  --focus-ring: #1976d2;
+  --focus-ring-alpha: rgba(25,118,210,.35);
+  --table-stripe: rgba(0,0,0,.025);
+  --table-hover: rgba(0,0,0,.06);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.06);
+  --st-succeeded: #2e7d32;
+  --st-succeeded-bg: #e8f5e9;
+  --st-failed: #c62828;
+  --st-failed-bg: #ffebee;
+  --st-running: #1565c0;
+  --st-running-bg: #e3f2fd;
+  --st-pending: #616161;
+  --st-pending-bg: #e8e8e8;
+  --st-skipped: #8c8c8c;
+  --st-skipped-bg: #f0f0f0;
+  --st-hang: #e65100;
+  --st-hang-bg: #fff3e0;
+}
+html[data-theme="dark"] {
+  --bg: #131316;
+  --fg: #e4e4e7;
+  --muted: #8b8b95;
+  --border: #2c2c34;
+  --panel: #1c1c22;
+  --code-bg: #0e0e12;
+  --link: #90bcf6;
+  --hover-bg: rgba(255,255,255,.06);
+  --focus-ring: #64b5f6;
+  --focus-ring-alpha: rgba(100,181,246,.35);
+  --table-stripe: rgba(255,255,255,.025);
+  --table-hover: rgba(255,255,255,.06);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.30);
+  --st-succeeded: #66bb6a;
+  --st-succeeded-bg: #1a331b;
+  --st-failed: #ef5350;
+  --st-failed-bg: #3a1717;
+  --st-running: #64b5f6;
+  --st-running-bg: #0d2438;
+  --st-pending: #a8a8b0;
+  --st-pending-bg: #25252c;
+  --st-skipped: #6e6e78;
+  --st-skipped-bg: #1e1e24;
+  --st-hang: #ffb74d;
+  --st-hang-bg: #3a260e;
+}
+* { box-sizing: border-box; }
+img, svg, pre, .dag-host, table { max-width: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+/* ── Responsive layout ── */
+@media (max-width: 600px) {
+  main { padding: 12px 10px 48px; }
+  .theme-toggle { top: 8px; right: 8px; width: 36px; height: 36px; font-size: 16px; }
+}
+@media (min-width: 601px) and (max-width: 900px) {
+  main { padding: 20px 24px 56px; }
+}
+h1, h2, h3 { margin: 0 0 12px; font-weight: 600; }
+h1 { font-size: 22px; letter-spacing: -0.01em; }
+h2 { font-size: 18px; margin-top: 32px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 15px; }
+
+/* Narrow: scale headings */
+@media (max-width: 600px) {
+  h1 { font-size: 18px; }
+  h2 { font-size: 15px; margin-top: 24px; }
+  h3 { font-size: 13px; }
+  body { font-size: 13px; }
+}
+a { color: var(--link); }
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  font-size: 12px;
+  white-space: pre;
+  margin: 4px 0;
+}
+.muted { color: var(--muted); }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 8px 0; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+.badge.s-succeeded, .badge.s-completed { color: var(--st-succeeded); background: var(--st-succeeded-bg); border-color: var(--st-succeeded); }
+.badge.s-failed, .badge.s-abandoned, .badge.s-budget_exhausted, .badge.s-aborted { color: var(--st-failed); background: var(--st-failed-bg); border-color: var(--st-failed); }
+.badge.s-running { color: var(--st-running); background: var(--st-running-bg); border-color: var(--st-running); }
+.badge.s-pending, .badge.s-ready { color: var(--st-pending); background: var(--st-pending-bg); border-color: var(--st-pending); }
+.badge.s-skipped, .badge.s-cancelled { color: var(--st-skipped); background: var(--st-skipped-bg); border-color: var(--st-skipped); text-decoration: line-through; }
+.badge.s-approval_hang, .badge.s-timer_hang, .badge.s-blocked { color: var(--st-hang); background: var(--st-hang-bg); border-color: var(--st-hang); }
+.counts { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.warn {
+  padding: 10px 12px;
+  border-radius: 4px;
+  background: var(--st-hang-bg);
+  border: 1px solid var(--st-hang);
+  color: var(--st-hang);
+  margin: 8px 0;
+}
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.controls button, .controls input[type=text] {
+  font: inherit;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--fg);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition), border-color var(--transition), box-shadow var(--transition);
+}
+.controls button:hover { background: var(--table-hover); border-color: var(--muted); }
+.controls button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+.controls button:active { transform: scale(0.97); }
+.controls button.active { background: var(--st-running-bg); border-color: var(--st-running); color: var(--st-running); }
+.controls button.active:hover { background: var(--st-running); color: #fff; }
+.controls input[type=text] { cursor: text; min-width: 180px; }
+.controls input[type=text]:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; border-color: var(--link); }
+
+/* Narrow: stack controls */
+@media (max-width: 600px) {
+  .controls { gap: 6px; }
+  .controls input[type=text] { min-width: 0; width: 100%; flex-basis: 100%; }
+  .controls button { padding: 4px 8px; font-size: 12px; }
+}
+table.nodes {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.table-wrap {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+table.nodes th, table.nodes td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+table.nodes th {
+  cursor: pointer;
+  user-select: none;
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  white-space: nowrap;
+}
+table.nodes th::after { content: " ⇅"; color: var(--muted); font-size: 11px; }
+table.nodes td.node-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+table.nodes tbody tr:nth-child(even) { background: var(--table-stripe); }
+table.nodes tbody tr:hover { background: var(--table-hover); }
+table.nodes tbody tr { transition: background var(--transition); }
+
+/* Narrow: compact table */
+@media (max-width: 600px) {
+  table.nodes { font-size: 11px; }
+  table.nodes th, table.nodes td { padding: 4px 5px; }
+  .table-wrap { border-radius: var(--radius-sm); }
+}
+details.node {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin: 6px 0;
+  background: var(--panel);
+}
+details.node > summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  list-style: revert;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+details.node[data-state="failed"], details.node[data-state="abandoned"] {
+  border-color: var(--st-failed);
+}
+details.node .body { padding: 8px 12px 12px; }
+details.node .field { margin-top: 8px; }
+details.node .field h4 { margin: 0 0 4px; font-size: 13px; color: var(--muted); }
+details.node .field.failure pre { border-color: var(--st-failed); }
+.events { display: flex; flex-direction: column; gap: 4px; }
+.event {
+  display: grid;
+  grid-template-columns: 90px 160px 1fr;
+  gap: 10px;
+  padding: 4px 8px;
+  border-bottom: 1px dashed var(--border);
+  font-size: 12px;
+}
+.event .seq { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.event .kind { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.event[data-kind^="state_transition"] .kind { color: var(--st-running); }
+.event[data-kind*="failure"] .kind, .event[data-kind*="failed"] .kind { color: var(--st-failed); }
+.event[data-kind*="lease"] .kind { color: var(--st-hang); }
+.event details summary { cursor: pointer; }
+.event .preview { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); }
+
+/* Narrow: stack event fields */
+@media (max-width: 600px) {
+  .event {
+    grid-template-columns: 1fr;
+    gap: 2px;
+    padding: 4px 6px;
+  }
+  .event .seq::before { content: "# "; }
+  .event .kind::before { content: "kind: "; font-weight: 600; }
+  .event .preview { white-space: normal; }
+}
+.dag-host { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 12px; overflow-x: auto; }
+.dag-host .mermaid { background: transparent; }
+footer { margin-top: 40px; color: var(--muted); font-size: 12px; }
+.collapsible-goal { max-height: 4.5em; overflow: hidden; position: relative; }
+.collapsible-goal.expanded { max-height: none; }
+.collapsible-goal .toggle { color: var(--link); cursor: pointer; }
+
+/* Theme toggle button */
+.theme-toggle {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  z-index: 100;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 18px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: var(--shadow-sm);
+  transition: background var(--transition), border-color var(--transition);
+}
+.theme-toggle:hover { background: var(--hover-bg); }
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+</style>
+</head>
+<body>
+<main>
+<button id="theme-toggle" class="theme-toggle" aria-label="Toggle dark/light theme" title="Toggle theme">☀</button>
+<header class="run-header">{{ HEADER }}</header>
+
+{{ DAG_SECTION }}
+
+<section id="nodes">
+<h2>Nodes</h2>
+<div class="controls">
+{{ CONTROLS }}
+</div>
+{{ NODES_TABLE }}
+</section>
+
+<section id="details">
+<h2>Node Details</h2>
+{{ NODE_DETAILS }}
+</section>
+
+<section id="events">
+<h2>Events</h2>
+{{ EVENTS_SECTION }}
+</section>
+
+<footer>
+<p>Generated {{ GENERATED_AT }} by <code>core.ccx.report</code>. The DAG image needs network access to load Mermaid from a CDN; everything else is offline-capable.</p>
+</footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  if (typeof mermaid !== "undefined") {
+    mermaid.initialize({ startOnLoad: true, securityLevel: "strict", theme: "default" });
+  }
+</script>
+<script>
+(function () {
+  var STATE_GROUPS = {
+    succeeded: ["succeeded"],
+    failed: ["failed", "abandoned"],
+    running: ["running"]
+  };
+  function applyFilter(name) {
+    var rows = document.querySelectorAll("#nodes-tbody tr");
+    var details = document.querySelectorAll("#details details.node");
+    var match = function (state) {
+      if (name === "all") return true;
+      var group = STATE_GROUPS[name];
+      if (group) return group.indexOf(state) !== -1;
+      return ["succeeded","failed","abandoned","running"].indexOf(state) === -1;
+    };
+    rows.forEach(function (tr) {
+      var st = (tr.getAttribute("data-state") || "").toLowerCase();
+      tr.style.display = match(st) ? "" : "none";
+    });
+    details.forEach(function (d) {
+      var st = (d.getAttribute("data-state") || "").toLowerCase();
+      d.style.display = match(st) ? "" : "none";
+    });
+    document.querySelectorAll(".controls button[data-filter]").forEach(function (b) {
+      b.classList.toggle("active", b.getAttribute("data-filter") === name);
+    });
+  }
+  function applySearch(q) {
+    q = (q || "").toLowerCase();
+    var rows = document.querySelectorAll("#nodes-tbody tr");
+    var details = document.querySelectorAll("#details details.node");
+    rows.forEach(function (tr) {
+      var id = (tr.getAttribute("data-node-id") || "").toLowerCase();
+      tr.style.display = (q === "" || id.indexOf(q) !== -1) ? "" : "none";
+    });
+    details.forEach(function (d) {
+      var id = (d.getAttribute("data-node-id") || "").toLowerCase();
+      d.style.display = (q === "" || id.indexOf(q) !== -1) ? "" : "none";
+    });
+  }
+  function jumpToFailures() {
+    var sel = '#nodes-tbody tr[data-state="failed"], #nodes-tbody tr[data-state="abandoned"]';
+    var target = document.querySelector(sel);
+    if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  function sortByColumn(idx, kind) {
+    var tbody = document.getElementById("nodes-tbody");
+    if (!tbody) return;
+    var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+    var key = function (tr) {
+      var cell = tr.cells[idx];
+      if (!cell) return "";
+      if (kind === "num") {
+        var n = parseFloat(cell.getAttribute("data-sort") || cell.textContent || "0");
+        return isNaN(n) ? 0 : n;
+      }
+      return (cell.getAttribute("data-sort") || cell.textContent || "").toLowerCase();
+    };
+    var current = tbody.getAttribute("data-sort-col");
+    var asc = current === String(idx) ? tbody.getAttribute("data-sort-asc") !== "true" : true;
+    rows.sort(function (a, b) {
+      var av = key(a), bv = key(b);
+      if (av < bv) return asc ? -1 : 1;
+      if (av > bv) return asc ? 1 : -1;
+      return 0;
+    });
+    rows.forEach(function (r) { tbody.appendChild(r); });
+    tbody.setAttribute("data-sort-col", String(idx));
+    tbody.setAttribute("data-sort-asc", asc ? "true" : "false");
+  }
+  function toggleGoal(ev) {
+    var box = ev.target.closest(".collapsible-goal");
+    if (!box) return;
+    box.classList.toggle("expanded");
+    ev.target.textContent = box.classList.contains("expanded") ? "[show less]" : "[show more]";
+  }
+  document.addEventListener("DOMContentLoaded", function () {
+    document.querySelectorAll(".controls button[data-filter]").forEach(function (b) {
+      b.addEventListener("click", function () { applyFilter(b.getAttribute("data-filter")); });
+    });
+    var search = document.getElementById("nodes-search");
+    if (search) search.addEventListener("input", function () { applySearch(search.value); });
+    var jump = document.getElementById("jump-failures");
+    if (jump) jump.addEventListener("click", jumpToFailures);
+    document.querySelectorAll("table.nodes th[data-sort-idx]").forEach(function (th) {
+      th.addEventListener("click", function () {
+        sortByColumn(parseInt(th.getAttribute("data-sort-idx"), 10),
+                     th.getAttribute("data-sort-kind") || "str");
+      });
+    });
+    document.querySelectorAll(".collapsible-goal .toggle").forEach(function (t) {
+      t.addEventListener("click", toggleGoal);
+    });
+    applyFilter("all");
+
+    /* Theme toggle */
+    var toggleBtn = document.getElementById("theme-toggle");
+    var html = document.documentElement;
+    var stored = localStorage.getItem("ccx-report-theme");
+    if (stored) html.setAttribute("data-theme", stored);
+    function updateToggleIcon() {
+      var current = html.getAttribute("data-theme");
+      var isDark = current === "dark" || (!current && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      toggleBtn.textContent = isDark ? "☀" : "☾";
+    }
+    updateToggleIcon();
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", updateToggleIcon);
+    toggleBtn.addEventListener("click", function () {
+      var current = html.getAttribute("data-theme");
+      var isDark = current === "dark" || (!current && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      var next = isDark ? "light" : "dark";
+      html.setAttribute("data-theme", next);
+      localStorage.setItem("ccx-report-theme", next);
+      updateToggleIcon();
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sgar"
+version = "0.1.0"
+description = "SGAR — ccx 治理化 agent 运行时（自 llm_dealer 导出的独立分发）"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "wxy2ab" }]
+keywords = ["ccx", "sgar", "agent", "llm", "governance"]
+dependencies = [
+    "anthropic",
+    "azure-ai-inference",
+    "boto3",
+    "colorlog",
+    "dashscope",
+    "google-generativeai",
+    "grep-ast",
+    "httpx",
+    "matplotlib",
+    "numpy",
+    "openai",
+    "pandas",
+    "pillow",
+    "rank-bm25",
+    "ratelimit",
+    "regex",
+    "requests",
+    "tenacity",
+    "tencentcloud-sdk-python",
+    "tree-sitter",
+    "tree-sitter-python",
+    "volcengine-python-sdk[ark]"
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "mypy", "ruff"]
+
+[project.scripts]
+sgar = "core.ccx.sgar.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["core*", "sgar*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.md", "*.toml", "*.j2", "*.typed", "*.ini", "*.json", "*.html", "*.txt", "*.yaml", "*.yml"]

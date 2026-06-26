@@ -1,0 +1,24 @@
+# sgar 运行期依赖 —— 由 ccx 的 import 闭包自动推导。
+# 未固定版本（与上游仓库风格一致）；如需复现可自行加 == 锁定。
+anthropic
+azure-ai-inference
+boto3
+colorlog
+dashscope
+google-generativeai
+grep-ast
+httpx
+matplotlib
+numpy
+openai
+pandas
+pillow
+rank-bm25
+ratelimit
+regex
+requests
+tenacity
+tencentcloud-sdk-python
+tree-sitter
+tree-sitter-python
+volcengine-python-sdk[ark]

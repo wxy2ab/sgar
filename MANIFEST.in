@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include requirements.txt
+include setting.ini.template
+recursive-include core *.md *.toml *.j2 *.typed *.ini *.json *.html *.txt *.yaml *.yml
+global-exclude *.py[cod]
+global-exclude __pycache__/*
