@@ -46,6 +46,7 @@ coverage.xml
 
 # 虚拟环境
 .venv/
+.venv-smoke/
 venv/
 env/
 ENV/
@@ -59,6 +60,7 @@ setting.ini
 *.db
 
 # 编辑器 / 系统
+.trae/
 .idea/
 .vscode/
 *.swp

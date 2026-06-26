@@ -39,7 +39,12 @@ from typing import Any, Sequence
 from ..sgar.checks import CheckOutcome, check_unrunnable, run_criterion_check
 from ..sgar.models import ExitCriterion
 from .check_template import validate_check_command
-from .finding_ledger import append_finding, code_location_key, count_prior
+from .finding_ledger import (
+    append_finding,
+    code_location_key,
+    count_prior,
+    defect_lifecycle,
+)
 from .mutation import Mutation, MutationResult, ephemeral_worktree, run_mutation_campaign
 
 __all__ = [
@@ -70,6 +75,15 @@ class PromotionResult:
     teeth: list[MutationResult] = field(default_factory=list)
     ledger_record: dict[str, Any] | None = None
     detail: str = ""
+    #: Lifecycle state of this ``(file, func)`` *before* this promotion's record
+    #: (theory §7.3). ``"regression_passed"`` means a resident guard already
+    #: existed for it.
+    prior_state: str = "unknown"
+    #: True when ``prior_state == "regression_passed"`` — a new confirmed
+    #: promotion at a location whose guard had already passed = the guard did
+    #: NOT hold (a silent re-break the ratchet exists to surface). Strictly
+    #: sharper than the scalar ``recidivism`` count.
+    is_reopen: bool = False
 
 
 def scaffold_test(repo_root: str | Path, test_path: str, test_source: str) -> Path:
@@ -112,6 +126,8 @@ def promote_finding(
     base_ref: str | None = None,
     track: str | None = None,
     pybin: str | None = None,
+    mismatch_type: str | None = None,
+    severity: str | None = None,
 ) -> PromotionResult:
     """Promote ``finding`` to a permanent, teeth-proven regression guard.
 
@@ -152,11 +168,18 @@ def promote_finding(
 
     repro_text = str(finding.get("repro") or "")
     recidivism = count_prior(ledger_path, key)
+    # Lifecycle state BEFORE this promotion's record. A prior ``regression_passed``
+    # means a resident guard already existed here — so a new confirmed promotion
+    # is a re-break the guard did not hold (sharper than the scalar recidivism).
+    prior_state = defect_lifecycle(ledger_path, key)
+    is_reopen = prior_state == "regression_passed"
 
     def _record(verdict: str, observed: str, *, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "code_location": key,
             "recidivism": recidivism,
+            "prior_state": prior_state,
+            "is_reopen": is_reopen,
             "test_path": test_path,
             "finding_id": finding.get("id"),
         }
@@ -175,6 +198,8 @@ def promote_finding(
             repro=repro_text or repro_check,
             path=ledger_path,
             evidence=evidence,
+            mismatch_type=mismatch_type,
+            severity=severity,
         )
 
     # (1) scaffold the permanent guard into the working tree.
@@ -197,6 +222,7 @@ def promote_finding(
         return PromotionResult(
             promoted=False, status=ABORTED_HARNESS_DEFECT, code_location=key,
             recidivism=recidivism, post_fix=post, ledger_record=rec,
+            prior_state=prior_state, is_reopen=is_reopen,
             detail="repro check could not execute; not a verdict",
         )
     if not post.passed:
@@ -209,6 +235,7 @@ def promote_finding(
         return PromotionResult(
             promoted=False, status=ABORTED_POSTFIX_RED, code_location=key,
             recidivism=recidivism, post_fix=post, ledger_record=rec,
+            prior_state=prior_state, is_reopen=is_reopen,
             detail="guard not green on the fixed tree",
         )
 
@@ -245,6 +272,7 @@ def promote_finding(
         return PromotionResult(
             promoted=False, status=REJECTED_BLIND_SPOT, code_location=key,
             recidivism=recidivism, post_fix=post, teeth=teeth, ledger_record=rec,
+            prior_state=prior_state, is_reopen=is_reopen,
             detail="; ".join(reasons),
         )
 
@@ -259,6 +287,7 @@ def promote_finding(
         return PromotionResult(
             promoted=False, status=NEEDS_REVIEW, code_location=key,
             recidivism=recidivism, post_fix=post, teeth=teeth, ledger_record=rec,
+            prior_state=prior_state, is_reopen=is_reopen,
             detail="only-tests-changed backstop tripped",
         )
 
@@ -266,11 +295,13 @@ def promote_finding(
     rec = _record(
         "confirmed",
         f"PROMOTED: guard GREEN on fixed tree; {len(teeth)} mutation(s) all caught "
-        f"(RED) → proven teeth. recidivism={recidivism}",
+        f"(RED) → proven teeth. recidivism={recidivism}"
+        + (f" REOPEN (prior_state={prior_state})" if is_reopen else ""),
         extra={"phase": "promoted", "teeth": [r.name for r in teeth]},
     )
     return PromotionResult(
         promoted=True, status=PROMOTED, code_location=key,
         recidivism=recidivism, post_fix=post, teeth=teeth, ledger_record=rec,
+        prior_state=prior_state, is_reopen=is_reopen,
         detail="green on fix + proven teeth",
     )
