@@ -21,20 +21,44 @@ pip install .
 
 ## 配置
 
-复制配置模板并填入你的密钥：
+推荐直接使用 `sgar config` 写入用户级配置文件：
 
 ```bash
-cp setting.ini.template setting.ini
-$EDITOR setting.ini
+sgar config where
+sgar config list
+sgar config set --client SimpleDeepSeekClient --api-key YOUR_KEY --model deepseek-v4-pro
 ```
 
-所有键也可以用同名大写的环境变量提供（见 `core/utils/config_setting.py`）。
-`setting.ini` 含密钥，已在 `.gitignore` 中忽略，请勿提交。
+上述命令会把配置写入 `~/.sgar/setting.ini`，默认同时设置：
+
+```ini
+[Default]
+llm_api = SimpleDeepSeekClient
+cc_default_llm_client = SimpleDeepSeekClient
+```
+
+`sgar config list` 会列出当前分发支持的 `ClientName`、对应 `credential_keys`、
+`model_keys` 和一句命令示例。
+
+如果某个 client 只有一个凭证键，可以直接用 `--api-key`。如果某个 client 需要多个
+凭证或连接参数（例如某些云厂商 client），请改用可重复参数：
+
+```bash
+sgar config set --client SparkClient \
+  --key xunfei_spark_api_key=YOUR_KEY \
+  --key xunfei_spark_secret_key=YOUR_SECRET \
+  --model 4.0Ultra
+```
+
+仍然可以手工编辑配置文件；`core/utils/config_setting.py` 会优先读取环境变量，其次读取
+项目目录 `setting.ini`，再回退到用户目录 `~/.sgar/setting.ini`。
 
 ## 使用
 
 ```bash
 sgar --help                 # 安装后提供的命令行入口
+sgar config --help          # 管理用户级 LLM 配置
+sgar config list            # 查看支持的 ClientName / key / model
 python -m sgar --help
 python -m core.ccx.sgar --help
 ```
