@@ -1,4 +1,4 @@
-# sgar
+# sgar: 状态治理代理体制 / State-Governed Agent Regime
 
 [English Version](./README.en.md)
 
@@ -18,8 +18,11 @@
 
 `sgar` 的设计建立在两篇核心文档之上：
 
-- [Audit Engineering](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md)
-- [State-Governed Agent Regime](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md)
+- [审计工程](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.zh-CN.md)
+- [状态治理代理体制](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.zh-CN.md)
+
+- `Audit Engineering`：把“能生成”变成“能持续修正”。利用 LLM 的生成-验证不对称性，以及“缺陷诊断本身就是改进药方”这一事实，让 agent 在长程运行中越跑越准，而不是越跑越飘。
+- `State-Governed Agent Regime`：把 agent 从“靠提示词漂移”变成“靠硬状态推进”。用外部化状态约束运行轨迹，用 `action` 和 `delta` 驱动每一步改进，让长程执行可控、可追踪、可迭代。
 
 如果你想理解为什么 `sgar` 强调审计、状态、阶段切换和长程运行，建议先读这两篇文档。
 
@@ -28,7 +31,7 @@
 你可以把 `sgar` 理解为三层能力的统一封装：
 
 - `Embedded Coding Agent`：把现代代码编辑能力嵌入现有系统、平台、机器人或自动化流水线
-- `OpenClaw Long-Range Skill`：把 openclaw 风格的长程代码编辑技能产品化、可重复调用
+- `OpenClaw Long-Range Skill`：让 OpenClaw 拥有长程稳定的 coding agent
 - `Standalone CLI`：直接在仓库里运行，用命令行驱动长程规划、执行、验证与收敛
 
 这意味着 `sgar` 既可以作为单独工具使用，也可以作为你系统内部的一个代码修复/治理组件使用。
@@ -55,19 +58,7 @@
 
 - Python `>= 3.12`
 
-从源码安装：
-
-```bash
-pip install .
-```
-
-开发模式安装：
-
-```bash
-pip install -e .
-```
-
-如果你将该包发布到 PyPI，也可以直接安装分发名：
+安装：
 
 ```bash
 pip install sgar
@@ -142,7 +133,12 @@ deepseek_model = deepseek-v4-pro
 
 ## 使用方法
 
-### 快速开始
+### 最简单的用法
+
+- `sgar`：标准的长程稳定 coding agent 工作流，适合初始化、查看状态、诊断问题、查看轨迹
+- `sgarx`：扩展模式，适合需要更强阶段恢复能力的场景；它的数据落在 `.sgarx/`，通常作为集成模式使用，而不是单独的顶层 CLI 命令
+
+如果你只想快速把 `sgar` 跑起来，最短路径就是：
 
 ```bash
 sgar config set --client SimpleDeepSeekClient --api-key YOUR_KEY --model deepseek-v4-pro
@@ -150,8 +146,23 @@ sgar init --project my-repo
 sgar status
 ```
 
+几个最常用的日常动作：
+
+```bash
+sgar status   # 看当前阶段和项目状态
+sgar doctor   # 看工作区是否缺文件、状态是否异常
+sgar trace    # 看最近的运行轨迹
+```
+
 执行 `sgar init` 后，会在当前仓库下生成一个 `.sgar/` 工作区，保存 agent 的硬状态与治理
 文档，例如：
+
+如果仓库根目录已经存在 `.gitignore`，`sgar init` 还会自动补入：
+
+```text
+.sgar/
+.sgarx/
+```
 
 ```text
 .sgar/
@@ -171,7 +182,7 @@ sgar status
 .sgar/sessions/<id>/
 ```
 
-### 常用命令
+### 进阶用法
 
 查看帮助：
 

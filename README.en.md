@@ -1,4 +1,4 @@
-# sgar
+# sgar: State-Governed Agent Regime / 状态治理代理体制
 
 [中文版本](./README.md)
 
@@ -7,7 +7,7 @@ and long-range code editing inside your own systems.
 
 It is simultaneously:
 
-- an openclaw long-range code editing skill
+- a skill that gives OpenClaw a stable long-range coding agent
 - a standalone CLI for long-running code editing workflows
 - an embeddable agent runtime that gives your system self-repair and
   self-maintenance capabilities
@@ -23,6 +23,9 @@ The design of `sgar` is grounded in two core documents:
 - [Audit Engineering](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md)
 - [State-Governed Agent Regime](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md)
 
+- `Audit Engineering`: turn "can generate" into "can keep correcting". It exploits the generation-verification asymmetry of LLMs and the fact that, in coding, a defect diagnosis is often already the prescription. That is how long-running agents get sharper instead of drifting.
+- `State-Governed Agent Regime`: move the agent from prompt drift to hard-state progression. Externalized state constrains the trajectory, while `action` and `delta` drive each improvement step, making long-range execution controllable, traceable, and iterative.
+
 If you want to understand why `sgar` emphasizes auditability, explicit state,
 stage transitions, and long-horizon execution, start with those two documents.
 
@@ -32,8 +35,7 @@ You can think of `sgar` as one package with three layers:
 
 - `Embedded Coding Agent`: embed modern code editing capability into your own
   systems, products, platforms, or automation pipelines
-- `OpenClaw Long-Range Skill`: package an openclaw-style long-range editing
-  skill into a reusable runtime
+- `OpenClaw Long-Range Skill`: give OpenClaw a stable long-range coding agent
 - `Standalone CLI`: run governed planning, execution, verification, and
   convergence directly from the command line
 
@@ -66,19 +68,7 @@ Requirements:
 
 - Python `>= 3.12`
 
-Install from source:
-
-```bash
-pip install .
-```
-
-Install in editable mode:
-
-```bash
-pip install -e .
-```
-
-If you publish this package to PyPI, you can also install the distribution as:
+Install:
 
 ```bash
 pip install sgar
@@ -155,7 +145,12 @@ overrides the file value.
 
 ## Usage
 
-### Quick Start
+### Simplest Path
+
+- `sgar`: the standard long-range stable coding-agent workflow for init, status, diagnostics, and trace
+- `sgarx`: the extended mode for stronger stage-recovery workflows; its state lives under `.sgarx/` and it is typically used as an integrated mode rather than a standalone top-level CLI command
+
+If you just want to get `sgar` running, the shortest path is:
 
 ```bash
 sgar config set --client SimpleDeepSeekClient --api-key YOUR_KEY --model deepseek-v4-pro
@@ -163,8 +158,23 @@ sgar init --project my-repo
 sgar status
 ```
 
+The most common day-to-day commands are:
+
+```bash
+sgar status   # show current stage and project state
+sgar doctor   # detect missing files or inconsistent state
+sgar trace    # show recent operation trace
+```
+
 After `sgar init`, a `.sgar/` workspace is created in your repository to store
 hard state and governance artifacts:
+
+If a `.gitignore` already exists at the repository root, `sgar init` also adds:
+
+```text
+.sgar/
+.sgarx/
+```
 
 ```text
 .sgar/
@@ -184,7 +194,7 @@ If you pass `--session <id>`, the state is isolated under:
 .sgar/sessions/<id>/
 ```
 
-### Common Commands
+### Advanced Usage
 
 Help:
 
