@@ -20,6 +20,16 @@ python cli.py <command> [options]
 ```
 首次使用先安装依赖：`pip install -r requirements.txt`。
 
+用户级 LLM 配置可直接写入 `~/.sgar/setting.ini`：
+
+```bash
+python cli.py config where
+python cli.py config list
+python cli.py config set --client SimpleDeepSeekClient --api-key YOUR_KEY --model deepseek-v4-pro
+```
+
+如果某个 client 需要多个凭证键，请使用可重复参数 `--key KEY=VALUE`。
+
 ## 常用命令
 | 命令 | 作用 |
 |------|------|
@@ -31,6 +41,7 @@ python cli.py <command> [options]
 | `verify` | 记录某阶段的验证证据 |
 | `close-stage` | 关闭一个已验证阶段 |
 | `mission ...` | 管理隔离的 mission |
+| `config ...` | 管理用户级 LLM 配置（写入 `~/.sgar/setting.ini`） |
 | `doctor` | 检测缺失文件/状态不一致 |
 | `trace` | 查看 SGAR 操作轨迹 |
 
