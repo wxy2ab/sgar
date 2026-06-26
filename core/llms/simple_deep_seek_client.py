@@ -100,9 +100,9 @@ class SimpleDeepSeekClient(LLMApiClient):
         self.thinking = thinking
         self._last_reasoning_content = None
         self._response_format: Optional[Dict[str, Any]] = None
-        if model=="deepseek-chat":
+        if self.model=="deepseek-chat":
             self.max_tokens = 8192
-        elif "speciale" in model:
+        elif "speciale" in self.model:
             self.max_tokens = 128000
         # Total context window (tokens), used as the token-budget-aware
         # compaction budget. Derived from the model unless explicitly set.
