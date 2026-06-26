@@ -1,27 +1,90 @@
 # sgar
 
-`ccx` 治理化 agent 运行时，从 `llm_dealer` 仓库中按 `core/ccx` 的依赖闭包自动导出的
-独立、可 pip 安装项目。
+[English Version](./README.en.md)
 
-本目录由 `task/copy/ccx_out.py` 生成：包含 321 个源文件、61 个运行期资源文件，
-覆盖子包 `core.cc`, `core.ccx`, `core.deepstack_v5`, `core.llms`, `core.utils`。
+`sgar` 是一个 embedded coding agent，用来把自动化修复、自动化运维与长程代码编辑能力
+嵌入到你的系统中。
 
-> 注意：分发名是 `sgar`，但可导入的顶层包是 `core`（保留原命名空间以免改写大量
-> `import core.*`）。
+它同时是：
+
+- 一个 openclaw 的长程代码编辑技能
+- 一个可以独立使用的 CLI 长程代码编辑工具
+- 一个可嵌入你自己系统的 agent runtime，让你的系统具备持续修复、持续迭代、持续维护能力
+
+`sgar` 不只是“调用一次 LLM 写点代码”，而是把代码编辑、状态治理、阶段推进、审计验证和
+运行痕迹组合成一个可长期运行的 agent 模型。
+
+## 核心思想
+
+`sgar` 的设计建立在两篇核心文档之上：
+
+- [Audit Engineering](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md)
+- [State-Governed Agent Regime](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md)
+
+如果你想理解为什么 `sgar` 强调审计、状态、阶段切换和长程运行，建议先读这两篇文档。
+
+## 重新定位
+
+你可以把 `sgar` 理解为三层能力的统一封装：
+
+- `Embedded Coding Agent`：把现代代码编辑能力嵌入现有系统、平台、机器人或自动化流水线
+- `OpenClaw Long-Range Skill`：把 openclaw 风格的长程代码编辑技能产品化、可重复调用
+- `Standalone CLI`：直接在仓库里运行，用命令行驱动长程规划、执行、验证与收敛
+
+这意味着 `sgar` 既可以作为单独工具使用，也可以作为你系统内部的一个代码修复/治理组件使用。
+
+## 优势
+
+`sgar` 的核心优势包括：
+
+1. 长程运行的 agent  
+   `sgar` 不只关注单次回答，而是支持阶段化推进、跨步骤执行、状态持续保存与长链路收敛。
+
+2. 把现代化代码编辑能力集成到你的系统  
+   你可以把 `sgar` 嵌入自己的平台，让系统拥有低成本的自更新、自修复、自维护能力。
+
+3. 基于审计的可靠迭代  
+   `sgar` 把验证、证据、痕迹和可追踪性视为一等能力，而不是“写完代码就结束”。
+
+4. 基于 SGAR 的硬状态运行模型  
+   `sgar` 用显式状态与阶段切换约束 agent 行为，降低长程运行中的漂移、跳步和失控风险。
 
 ## 安装
 
+要求：
+
+- Python `>= 3.12`
+
+从源码安装：
+
 ```bash
-pip install -e .
-# 或
 pip install .
 ```
 
-需要 Python >=3.12。
+开发模式安装：
+
+```bash
+pip install -e .
+```
+
+如果你将该包发布到 PyPI，也可以直接安装分发名：
+
+```bash
+pip install sgar
+```
+
+安装完成后可使用以下入口：
+
+```bash
+sgar --help
+python -m sgar --help
+```
 
 ## 配置
 
-推荐直接使用 `sgar config` 写入用户级配置文件：
+### 方式一：使用 `sgar config`
+
+最推荐的方式是通过 CLI 写入用户级配置文件：
 
 ```bash
 sgar config where
@@ -29,19 +92,26 @@ sgar config list
 sgar config set --client SimpleDeepSeekClient --api-key YOUR_KEY --model deepseek-v4-pro
 ```
 
-上述命令会把配置写入 `~/.sgar/setting.ini`，默认同时设置：
+这会把配置写入：
+
+```text
+~/.sgar/setting.ini
+```
+
+典型内容如下：
 
 ```ini
 [Default]
 llm_api = SimpleDeepSeekClient
 cc_default_llm_client = SimpleDeepSeekClient
+deepseek_api_key = YOUR_KEY
+deepseek_model = deepseek-v4-pro
 ```
 
-`sgar config list` 会列出当前分发支持的 `ClientName`、对应 `credential_keys`、
-`model_keys` 和一句命令示例。
+`sgar config list` 会列出当前分发支持的 `ClientName`、凭证键、模型键和示例命令。
 
-如果某个 client 只有一个凭证键，可以直接用 `--api-key`。如果某个 client 需要多个
-凭证或连接参数（例如某些云厂商 client），请改用可重复参数：
+如果某个 client 只有一个凭证键，可以直接使用 `--api-key`。如果某个 client 需要多个凭证
+或连接参数，请改用可重复的 `--key`：
 
 ```bash
 sgar config set --client SparkClient \
@@ -50,27 +120,217 @@ sgar config set --client SparkClient \
   --model 4.0Ultra
 ```
 
-仍然可以手工编辑配置文件；`core/utils/config_setting.py` 会优先读取环境变量，其次读取
-项目目录 `setting.ini`，再回退到用户目录 `~/.sgar/setting.ini`。
+### 方式二：手工编辑 `setting.ini`
 
-## 使用
+你也可以自己创建配置文件：
+
+```ini
+[Default]
+llm_api = SimpleDeepSeekClient
+cc_default_llm_client = SimpleDeepSeekClient
+deepseek_api_key = YOUR_KEY
+deepseek_model = deepseek-v4-pro
+```
+
+当前实现中的读取优先级为：
+
+1. 环境变量
+2. 当前工作目录下的 `setting.ini`
+3. 用户目录下的 `~/.sgar/setting.ini`
+
+也就是说，只要环境变量里存在同名键，例如 `DEEPSEEK_API_KEY`，它会覆盖文件中的值。
+
+## 使用方法
+
+### 快速开始
 
 ```bash
-sgar --help                 # 安装后提供的命令行入口
-sgar config --help          # 管理用户级 LLM 配置
-sgar config list            # 查看支持的 ClientName / key / model
-python -m sgar --help
-python -m core.ccx.sgar --help
+sgar config set --client SimpleDeepSeekClient --api-key YOUR_KEY --model deepseek-v4-pro
+sgar init --project my-repo
+sgar status
 ```
+
+执行 `sgar init` 后，会在当前仓库下生成一个 `.sgar/` 工作区，保存 agent 的硬状态与治理
+文档，例如：
+
+```text
+.sgar/
+  config.json
+  state.json
+  blueprint.md
+  roadmap.md
+  stages/
+    stage-01/
+      spec.md
+  missions/
+```
+
+如果你传入 `--session <id>`，则会把状态隔离到：
+
+```text
+.sgar/sessions/<id>/
+```
+
+### 常用命令
+
+查看帮助：
+
+```bash
+sgar --help
+sgar config --help
+python -m sgar --help
+```
+
+初始化与状态查看：
+
+```bash
+sgar init --project my-repo
+sgar status
+sgar trace
+sgar doctor
+```
+
+写入或生成治理文档：
+
+```bash
+sgar set-blueprint --text "..."
+sgar set-roadmap --text "..."
+sgar set-stage-spec --stage stage-01 --text "..."
+
+sgar draft-blueprint --llm-client SimpleDeepSeekClient --prompt "为这个仓库生成 blueprint"
+sgar draft-roadmap --llm-client SimpleDeepSeekClient --prompt "拆解阶段路线图"
+sgar draft-stage-spec --stage stage-01 --llm-client SimpleDeepSeekClient --prompt "细化 stage-01"
+```
+
+验证与阶段推进：
+
+```bash
+sgar validate blueprint --accept
+sgar validate roadmap --accept
+sgar validate stage --stage stage-01
+sgar start-stage stage-01
+sgar verify --stage stage-01 --criterion c1 --pass --evidence "pytest tests/test_api.py -q"
+sgar close-stage stage-01
+```
+
+启用可机器检查的退出准则：
+
+```bash
+sgar --run-checks --check-timeout 120 verify --stage stage-01 --all-pass --evidence "all checks passed"
+```
+
+隔离 mission：
+
+```bash
+sgar mission create \
+  --kind patch \
+  --id fix-login \
+  --input src/auth.py \
+  --objective "修复登录超时问题" \
+  --expected-output patch.diff
+
+sgar mission status fix-login
+sgar mission list
+```
+
+## 集成到代码
+
+`sgar` 提供两类集成方式：
+
+- SGAR 状态治理运行时：适合把阶段、规范、验证和痕迹管理嵌入你的系统
+- Embedded Coding Agent API：适合把代码编辑/自动修复能力嵌入你的产品或服务
+
+需要注意当前分发的导入面：
+
+- `sgar` CLI 与 `python -m sgar` 对应的是独立命令行入口
+- `from sgar import SgarRuntime` 对应的是 SGAR 状态治理运行时
+- `from core.cc.api import ...` 对应的是嵌入式代码编辑 agent API
+
+### 方式一：嵌入 SGAR 状态运行时
 
 ```python
-from core.ccx.api import AgentRunRequest  # 程序化入口
+from sgar import SgarRuntime
+
+runtime = SgarRuntime("/path/to/repo")
+runtime.init(project_name="demo-project")
+
+runtime.set_blueprint(
+    """
+    # Problem
+    Need a governed repair workflow.
+    """
+)
+runtime.set_roadmap(
+    """
+    - stage-01: stabilize tests
+    """
+)
+runtime.set_stage_spec(
+    "stage-01",
+    """
+    # Objective
+    Make the failing tests pass.
+    """,
+)
+
+print(runtime.status())
 ```
 
-## 自动发布
+这种方式适合你自己控制外层编排，把 `sgar` 作为内部的状态机和治理内核。
 
-- 每次 push 到 `main` 后，GitHub Actions 会自动将 `pyproject.toml` 的 patch 版本加 `1`。
-- 版本 bump 成功后，会自动构建并发布到 PyPI。
-- 如需手动发布，可在 GitHub Actions 里运行 `Publish sgar to PyPI`，并选择 `pypi` 或 `testpypi`。
-- 正式发布使用 GitHub Repository Secret `PYPI_API_TOKEN`。
-- 如需手动发布到 TestPyPI，请额外配置 `TEST_PYPI_API_TOKEN`。
+### 方式二：嵌入代码编辑 agent
+
+如果你要把自动化修复、自动化改码能力直接接进你的系统，推荐使用 `core.cc.api`：
+
+```python
+from core.cc.api import build_code_with_agent
+
+result = build_code_with_agent(
+    goal="修复仓库中的 failing tests，并更新必要文档",
+    cwd="/path/to/repo",
+    context_paths=[
+        "README.md",
+        "src/app.py",
+        "tests/test_app.py",
+    ],
+    constraints=[
+        "保留现有公开 API",
+        "优先做最小必要修改",
+    ],
+    acceptance_criteria=[
+        "pytest tests/test_app.py -q 通过",
+        "行为变化必须同步更新 README",
+    ],
+    prompt_language="zh",
+)
+
+print(result.final_text)
+print(result.tool_call_count)
+print(result.failed, result.error_message)
+```
+
+如果你只想直接发送一个指令，也可以使用更轻量的同步包装：
+
+```python
+from core.cc.api import run_code_agent
+
+result = run_code_agent(
+    "检查仓库中的回归问题，修复后运行相关测试，并给出最终总结",
+    cwd="/path/to/repo",
+    prompt_language="zh",
+)
+
+print(result.final_text)
+```
+
+## 适合什么场景
+
+`sgar` 适合以下场景：
+
+- 把代码修复 agent 集成到现有研发平台、内部工具、机器人或运维系统
+- 在仓库里运行一个带审计能力的长程代码编辑流程
+- 为自动化修复提供状态治理、阶段推进、可验证证据和可回溯痕迹
+- 构建“能持续维护自己代码”的工程系统，而不只是一次性生成代码
+
+如果你需要的是短链路问答型助手，`sgar` 可能不是最小工具；如果你需要的是长期运行、可治理、
+可嵌入、可审计的代码 agent，`sgar` 正是为这件事设计的。
