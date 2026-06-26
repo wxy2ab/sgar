@@ -48,4 +48,5 @@ from core.ccx.api import AgentRunRequest  # 程序化入口
 - 每次 push 到 `main` 后，GitHub Actions 会自动将 `pyproject.toml` 的 patch 版本加 `1`。
 - 版本 bump 成功后，会自动构建并发布到 PyPI。
 - 如需手动发布，可在 GitHub Actions 里运行 `Publish sgar to PyPI`，并选择 `pypi` 或 `testpypi`。
-- 自动上传使用 PyPI Trusted Publishing，需要先在 PyPI 项目后台为仓库 `wxy2ab/sgar` 配置 trusted publisher。
+- 正式发布使用 GitHub Repository Secret `PYPI_API_TOKEN`。
+- 如需手动发布到 TestPyPI，请额外配置 `TEST_PYPI_API_TOKEN`。
