@@ -6,11 +6,13 @@ class HunterAlphaClient(LLMApiClient):
     pass
 
 class HunterAlphaClient(MoonShotClient):
-    def __init__(self, model: str = "openrouter/hunter-alpha"):
+    def __init__(self, model: str = ""):
         base_url = "https://openrouter.ai/api/v1"
         config = Config()
         api_key = config.get("openrouter_api_key")
         super().__init__(api_key, base_url, max_tokens=64000)
-        if model is None or model == "":
-            model = "openrouter/hunter-alpha"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("hunter_alpha_client_model",),
+            "openrouter/hunter-alpha",
+        )

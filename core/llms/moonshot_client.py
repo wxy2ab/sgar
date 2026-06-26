@@ -11,6 +11,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 
 class MoonShotClient(LLMApiClient):
     supports_structured_output = True
+    MODEL_CONFIG_KEYS = ("moonshot_model",)
 
     def __init__(self, api_key: str = "", base_url: str = "https://api.moonshot.cn/v1",
                  max_tokens: Optional[int] = None, temperature: float = 1, top_p: Optional[float] = None,
@@ -38,7 +39,10 @@ class MoonShotClient(LLMApiClient):
         self.completion_token_count = 0
         self.history = []
         self._model_list = ["moonshot-v1-128k", "moonshot-v1-8k", "moonshot-v1-32k"]
-        self.model = self._model_list[0]
+        self.model = config.get_with_fallback(
+            self.MODEL_CONFIG_KEYS,
+            self._model_list[0],
+        )
         self.temperature = temperature
         self.top_p = top_p
         self.presence_penalty = presence_penalty

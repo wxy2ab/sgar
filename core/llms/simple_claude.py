@@ -15,20 +15,27 @@ from tenacity import retry, wait_fixed,retry_if_exception,stop_after_attempt
 from core.utils.rate_limit import rate_limit
 
 class SimpleClaudeAwsClient(LLMApiClient):
+    DEFAULT_MODEL = "anthropic.claude-opus-4-8"
+
     def __init__(self, 
                 aws_access_key_id: Optional[str] = None,
                 aws_secret_access_key: Optional[str] = None,
                 aws_session_token: Optional[str] = None,
                 aws_region: str = "us-west-2", 
-                model: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                model: Optional[str] = None,
                 temperature: float = 0.5,
                 top_p: float = 1.0,
                 top_k: int = 250,
                 max_tokens: int = 4096,
                 stop_sequences: Optional[List[str]] = None,
                 anthropic_version: str = "2023-06-01"):
+        config = Config()
         self.aws_region = aws_region
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("simple_claude_model", "claude_aws_model"),
+            self.DEFAULT_MODEL,
+        )
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k

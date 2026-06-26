@@ -11,24 +11,31 @@ from PIL import Image
 import io
 from ..utils.retry import retry
 from ._llm_api_client import LLMApiClient
+from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 
 class ClaudeAwsClient(LLMApiClient):
+    DEFAULT_MODEL = "anthropic.claude-opus-4-8"
 
     def __init__(self,
                  aws_access_key_id: Optional[str] = None,
                  aws_secret_access_key: Optional[str] = None,
                  aws_session_token: Optional[str] = None,
                  aws_region: str = "us-west-2",
-                 model: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                 model: Optional[str] = None,
                 temperature: float = 0.5,
                 top_p: float = 0.9,
                 top_k: int = 250,
                 max_tokens: int = 4096,
                 stop_sequences: Optional[List[str]] = None,
                  ):
+        config = Config()
         self.aws_region = aws_region
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("claude_aws_model",),
+            self.DEFAULT_MODEL,
+        )
         self.aws_access_key_id = aws_access_key_id
         self.aws_secret_access_key = aws_secret_access_key
         self.aws_session_token = aws_session_token
@@ -54,7 +61,6 @@ class ClaudeAwsClient(LLMApiClient):
                                 (819, 1456), (784, 1568)]
 
     def _get_aws_credentials(self):
-        from ..utils.config_setting import Config
         config = Config()
         if config.has_key("aws_access_key_id") and config.has_key(
                 "aws_secret_access_key"):
@@ -673,4 +679,3 @@ class ContinuousStreamIterator:
     @stop.setter
     def stop(self, value):
         self._stop_sequences = value
-

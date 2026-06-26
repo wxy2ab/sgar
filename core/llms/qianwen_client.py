@@ -1,7 +1,7 @@
 import json
 from http import HTTPStatus
 from dashscope import Generation
-from typing import Iterator, List, Dict, Any, Union
+from typing import Iterator, List, Dict, Any, Optional, Union
 from ._llm_api_client import LLMApiClient
 from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
@@ -11,9 +11,13 @@ from ..utils.log import logger
 from ratelimit import limits, sleep_and_retry
 
 class QianWenClient(LLMApiClient):
+    DEFAULT_MODEL = "qwen-max-latest"
+    DEFAULT_VMODEL = "qwen-vl-max"
+
     def __init__(self, api_key: str = "", max_tokens: int = 8000, top_p: float = 0.8, 
                  repetition_penalty: float = 1, temperature: float = 1, 
-                 stop: Union[str, List[str], None] = None, enable_search: bool = False,model: str = "qwen3-max", vmodel: str = "qwen3-vl-plus"):
+                 stop: Union[str, List[str], None] = None, enable_search: bool = False,
+                 model: Optional[str] = None, vmodel: Optional[str] = None):
         import dashscope
         config = Config()
         if api_key == "" and config.has_key("DASHSCOPE_API_KEY"):
@@ -25,8 +29,16 @@ class QianWenClient(LLMApiClient):
         self.successful_requests = 0
         self.failed_requests = 0
         self.models = ['qwen-max','qwen-max-latest', 'qwen-plus', 'qwen-max-longcontext','qwen-plus-latest']
-        self.model = "qwen-max-latest" if model == "" or model is None else model
-        self.vmodel = "qwen-vl-max" if vmodel == "" or vmodel is None else vmodel
+        self.model = config.resolve_value(
+            model,
+            ("qianwen_model",),
+            self.DEFAULT_MODEL,
+        )
+        self.vmodel = config.resolve_value(
+            vmodel,
+            ("qianwen_vmodel",),
+            self.DEFAULT_VMODEL,
+        )
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty

@@ -7,12 +7,14 @@ class QwqClient(LLMApiClient):
 
 
 class QwqClient(MoonShotClient):
-    def __init__(self, model: str = "free:QwQ-32B"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.siliconflow.cn/v1"
         config = Config()
 
         api_key = "sk-W0rpStc95T7JVYVwDYc29IyirjtpPPby6SozFMQr17m8KWeo"
         super().__init__(api_key, base_url, max_tokens=4096)
-        if model is None or model == "":
-            model = "free:QwQ-32B"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("qwq_client_model",),
+            "free:QwQ-32B",
+        )

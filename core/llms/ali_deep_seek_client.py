@@ -6,11 +6,13 @@ class AliDeepSeekClient(LLMApiClient):
     pass
 
 class AliDeepSeekClient(QianWenClient):
-    def __init__(self, model: str = "deepseek-v3"):
+    def __init__(self, model: str = ""):
         config = Config()
         api_key = config.get("dashscope_api_key")
-        if model is None or model == "":
-            model = "deepseek-v3"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("ali_deep_seek_client_model",),
+            "deepseek-v3",
+        )
         super().__init__(api_key, max_tokens=8192 ,model=self.model)
 

@@ -11,7 +11,9 @@ from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 
 class GLMClient(LLMApiClient):
-    def __init__(self, api_key: str = "", model: Literal["glm-4-plus", "glm-5", "glm-5.1", "glm-5.2", "glm-4-air", "glm-4-airx", "glm-4-long", "glm-4-flashx", "glm-4-flash"] = "glm-5.2",
+    DEFAULT_MODEL = "glm-5.2"
+
+    def __init__(self, api_key: str = "", model: Optional[Literal["glm-4-plus", "glm-5", "glm-5.1", "glm-5.2", "glm-4-air", "glm-4-airx", "glm-4-long", "glm-4-flashx", "glm-4-flash"]] = None,
                  do_sample: bool = False, temperature: float = 1, top_p: float = 0.7, max_tokens: Optional[int] = None, stop: Union[str, List[str], None] = None,
                  thinking: bool = False):
         config = Config()
@@ -20,7 +22,11 @@ class GLMClient(LLMApiClient):
         self.api_key = api_key
         self.base_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         self.timeout = 600
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("glm_model",),
+            self.DEFAULT_MODEL,
+        )
         self.history = []
         self.do_sample = do_sample
         self.temperature = temperature

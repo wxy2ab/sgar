@@ -9,7 +9,7 @@ class TencentDeepSeekR1Client(LLMApiClient):
 
 
 class TencentDeepSeekR1Client(MoonShotClient):
-    def __init__(self, model: str = "deepseek-r1"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.lkeap.cloud.tencent.com/v1"
 
 
@@ -17,7 +17,8 @@ class TencentDeepSeekR1Client(MoonShotClient):
 
         api_key = config.get("tencent_api_key")
         super().__init__(api_key, base_url, max_tokens=8196)
-        if model is None or model == "":
-
-            model = "deepseek-r1"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("tencent_deep_seek_r1_client_model",),
+            "deepseek-r1",
+        )

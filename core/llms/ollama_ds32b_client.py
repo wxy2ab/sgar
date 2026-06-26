@@ -8,7 +8,7 @@ class OllamaDS32bClient(LLMApiClient):
 
 
 class OllamaDS32bClient(MoonShotClient):
-    def __init__(self, model: str = "deepseek-r1:32b"):
+    def __init__(self, model: str = ""):
         
         config = Config()
 
@@ -16,6 +16,8 @@ class OllamaDS32bClient(MoonShotClient):
         base_url = ollama_url
         api_key='ollama'
         super().__init__(api_key, base_url, max_tokens=8196)
-        if model is None or model == "":
-            model = "deepseek-r1:32b"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("ollama_ds32b_client_model",),
+            "deepseek-r1:32b",
+        )

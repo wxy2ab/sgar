@@ -37,9 +37,12 @@ class SimpleDeepSeekClientReasoning(LLMApiClient):
 
 
 class SimpleDeepSeekClientReasoning(SimpleDeepSeekClient):
+    MODEL_CONFIG_KEYS = ("simple_deep_seek_reasoning_model", "simple_deep_seek_model")
+    DEFAULT_MODEL = "deepseek-v4-pro"
+
     def __init__(
         self,
-        model: str = "deepseek-v4-pro",
+        model: Optional[str] = None,
         max_tokens: int = 64000,
         temperature: float = 1.0,
         top_p: float = 1,

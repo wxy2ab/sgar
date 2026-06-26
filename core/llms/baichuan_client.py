@@ -1,17 +1,22 @@
 import json
 import requests
-from typing import Generator, Iterator, List, Dict, Any, Union
+from typing import Generator, Iterator, List, Dict, Any, Optional, Union
 from ._llm_api_client import LLMApiClient
 from ..utils.handle_max_tokens import handle_max_tokens
 from ..utils.config_setting import Config
 
 class BaichuanClient(LLMApiClient):
     supports_structured_output = True
+    DEFAULT_MODEL = "Baichuan4"
 
-    def __init__(self, api_key: str ="", model: str = "Baichuan4"):
+    def __init__(self, api_key: str ="", model: Optional[str] = None):
         config = Config()
         self.api_key = api_key if api_key else config.get("baichuan_api_key")
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("baichuan_model",),
+            self.DEFAULT_MODEL,
+        )
         self.base_url = "https://api.baichuan-ai.com/v1/chat"
         self.history: List[Dict[str, str]] = []
         self.parameters: Dict[str, Any] = {

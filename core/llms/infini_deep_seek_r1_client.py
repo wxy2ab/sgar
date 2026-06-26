@@ -7,13 +7,15 @@ class InfinityDeepSeekR1Client(LLMApiClient):
 
 
 class InfinityDeepSeekR1Client(MoonShotClient):
-    def __init__(self, model: str = "deepseek-r1"):
+    def __init__(self, model: str = ""):
         base_url = "https://cloud.infini-ai.com/maas/v1"
 
         config = Config()
 
         api_key = config.get("infinity_api_key")
         super().__init__(api_key, base_url, max_tokens=4096)
-        if model is None or model == "":
-            model = "deepseek-r1"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("infini_deep_seek_r1_client_model",),
+            "deepseek-r1",
+        )

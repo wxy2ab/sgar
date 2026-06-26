@@ -9,7 +9,7 @@ class SenseDeepSeekR1Client(LLMApiClient):
 
 
 class SenseDeepSeekR1Client(MoonShotClient):
-    def __init__(self, model: str = "DeepSeek-R1"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.sensenova.cn/compatible-mode/v1/"
 
 
@@ -17,8 +17,8 @@ class SenseDeepSeekR1Client(MoonShotClient):
 
         api_key = config.get("sense_api_key")
         super().__init__(api_key, base_url, max_tokens=8196,presence_penalty=None,frequency_penalty=None,top_p=None)
-        if model is None or model == "":
-
-
-            model = "DeepSeek-R1"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("sense_deep_seek_r1_client_model",),
+            "DeepSeek-R1",
+        )

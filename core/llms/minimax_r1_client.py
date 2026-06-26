@@ -9,11 +9,15 @@ class MiniMaxR1Client(LLMApiClient):
 
 
 class MiniMaxR1Client(MiniMaxClient):
-    def __init__(self, model: str = "DeepSeek-R1"):
+    def __init__(self, model: str = ""):
         config = Config()
         api_key = config.get("minimax_api_key")
+        model = config.resolve_value(
+            model,
+            ("minimax_r1_client_model",),
+            "DeepSeek-R1",
+        )
         super().__init__(api_key, model)
-
 
 
 

@@ -12,15 +12,22 @@ from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 
 class ClaudeClient(LLMApiClient):
+    DEFAULT_MODEL = "claude-opus-4-8"
+
     def __init__(self, 
                  api_key: Optional[str] = None,
-                 model: str = "claude-opus-4.6",
+                 model: Optional[str] = None,
                  temperature: float = 1,
                  top_p: float = 1.0,
                  top_k: int = 250,
                  max_tokens: Optional[int] = None,
                  stop_sequences: Optional[List[str]] = None):
-        self.model = model
+        config = Config()
+        self.model = config.resolve_value(
+            model,
+            ("claude_model",),
+            self.DEFAULT_MODEL,
+        )
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k

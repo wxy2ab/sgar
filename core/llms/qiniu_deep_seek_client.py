@@ -14,14 +14,16 @@ class QiniuDeepSeekClient(LLMApiClient):
 
 
 class QiniuDeepSeekClient(MoonShotClient):
-    def __init__(self, model: str = "deepseek-v3-0324"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.qnaigc.com/v1/"
 
         config = Config()
 
         api_key = config.get("qiniu_api_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "deepseek-v3-0324"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("qiniu_deep_seek_client_model",),
+            "deepseek-v3-0324",
+        )
 

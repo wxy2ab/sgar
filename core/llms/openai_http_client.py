@@ -19,10 +19,11 @@ _RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504, 520
 
 
 class OpenAIHttpClient(LLMApiClient):
+    DEFAULT_MODEL = "gpt-5.5"
 
     def __init__(self,
                  api_key: str = "",
-                 model: str = "gpt-5.4-mini",
+                 model: Optional[str] = None,
                  base_url: str = "https://api.openai.com/v1",
                  max_tokens: Optional[int] = None,
                  temperature: Optional[float] = 0.7,
@@ -41,6 +42,11 @@ class OpenAIHttpClient(LLMApiClient):
             api_key = os.getenv("OPENAI_API_KEY", "") or ""
 
         self.api_key = self._sanitize_api_key(api_key)
+        self.model = config.resolve_value(
+            model,
+            ("openai_http_model", "openai_model"),
+            self.DEFAULT_MODEL,
+        )
         # Defensive: callers sometimes include backticks/whitespace.
         self.base_url = base_url.strip().strip("`").strip().rstrip("/")
         self.client_request_id = client_request_id.strip() if isinstance(client_request_id, str) and client_request_id.strip() else None
@@ -53,7 +59,6 @@ class OpenAIHttpClient(LLMApiClient):
         self.prompt_token_count = 0
         self.completion_token_count = 0
         self.history: List[Dict[str, Any]] = []
-        self.model = model
         self.max_output_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
