@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgar"
-version = "0.1.8"
+version = "0.1.9"
 description = "SGAR — ccx 治理化 agent 运行时（自 llm_dealer 导出的独立分发）"
 readme = "README.md"
 requires-python = ">=3.12"
