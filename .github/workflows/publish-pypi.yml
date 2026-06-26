@@ -1,6 +1,11 @@
 name: Publish sgar to PyPI
 
 on:
+  workflow_run:
+    workflows:
+      - Bump Package Version
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       repository:
@@ -14,13 +19,17 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,9 +52,13 @@ jobs:
           path: dist/
 
   publish-pypi:
-    if: ${{ inputs.repository == 'pypi' }}
+    if: >
+      needs.build.result == 'success' &&
+      (github.event_name == 'workflow_run' || inputs.repository == 'pypi')
     needs: build
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
     steps:
       - name: Download distributions
         uses: actions/download-artifact@v4
@@ -55,13 +68,13 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
 
   publish-testpypi:
-    if: ${{ inputs.repository == 'testpypi' }}
+    if: needs.build.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.repository == 'testpypi'
     needs: build
     runs-on: ubuntu-latest
+    environment:
+      name: testpypi
     steps:
       - name: Download distributions
         uses: actions/download-artifact@v4
@@ -72,5 +85,4 @@ jobs:
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
           repository-url: https://test.pypi.org/legacy/
