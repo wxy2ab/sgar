@@ -16,14 +16,16 @@ from ..utils.log import logger
 
 
 class MiniMaxClient(LLMApiClient):
-    def __init__(self, api_key: str = "", model: str = "MiniMax-M3"):
+    def __init__(self, api_key: str = "", model: str = ""):
         config = Config()
         if api_key == "" and config.has_key("minimax_api_key"):
             api_key = config.get("minimax_api_key")
         self.api_key = api_key
-        if model is None or model == "":
-            model = "MiniMax-M3"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("mini_max_client_model",),
+            "MiniMax-M3",
+        )
 
 
         self.base_url = "https://api.minimax.chat/v1/text/chatcompletion_v2"

@@ -10,12 +10,14 @@ class MinMaxM2Client(LLMApiClient):
 
 
 class MinMaxM2Client(MoonShotClient):
-    def __init__(self, model: str = "MiniMax-M3"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.minimax.chat/v1"
         config = Config()
 
         api_key = config.get("minimax_api_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "MiniMax-M3"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("minmax_m2_client_model",),
+            "MiniMax-M3",
+        )

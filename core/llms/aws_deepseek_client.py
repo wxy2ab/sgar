@@ -7,12 +7,14 @@ class AWSDeepSeekClient(LLMApiClient):
 
 
 class AWSDeepSeekClient(MoonShotClient):
-    def __init__(self, model: str = "Pro/deepseek-ai/DeepSeek-V3"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.siliconflow.cn/v1"
         config = Config()
 
         api_key = config.get("aws_sf_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "deepseek-ai/DeepSeek-V3"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("aws_deepseek_client_model",),
+            "Pro/deepseek-ai/DeepSeek-V3",
+        )

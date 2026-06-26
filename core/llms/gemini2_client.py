@@ -3,7 +3,7 @@ import json
 import time
 import base64
 import httpx
-from typing import Any, Dict, List, Union, Iterator
+from typing import Any, Dict, List, Optional, Union, Iterator
 import google.generativeai as genai
 from PIL import Image
 import queue
@@ -39,13 +39,19 @@ class AsyncContentIterator(Iterator[str]):
         return item
     
 class Gemini2Client(LLMApiClient ):
-    def __init__(self,model :str = "gemini-2.0-flash-exp"):
+    DEFAULT_MODEL = "gemini-2.0-flash-exp"
+
+    def __init__(self,model :Optional[str] = None):
         config = Config()
         api_key = config.get("google_api_key")
         if not api_key:
             raise ValueError("Google API key not found in configuration")
 
-        self.model_name = model
+        self.model_name = config.resolve_value(
+            model,
+            ("gemini2_model",),
+            self.DEFAULT_MODEL,
+        )
 
         genai.configure(api_key=api_key)
         
@@ -98,7 +104,7 @@ class Gemini2Client(LLMApiClient ):
         try:
             # Create a new model instance for this single interaction
             temp_model = genai.GenerativeModel(
-                model_name="gemini-2.0-flash-exp",
+                model_name=self.model_name,
                 generation_config=self.generation_config
             )
             
@@ -324,7 +330,7 @@ class Gemini2Client(LLMApiClient ):
             "max_output_tokens": max_output_tokens,
         }
         self.model = genai.GenerativeModel(
-            model_name="gemini-2.0-flash-exp",
+            model_name=self.model_name,
             generation_config=self.generation_config
         )
         self.chat = self.model.start_chat()
@@ -382,4 +388,3 @@ class Gemini2Client(LLMApiClient ):
 
     def get_chat_history(self):
         return self._get_chat_history()
-

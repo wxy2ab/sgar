@@ -8,10 +8,11 @@ from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 
 class OpenAIClient(LLMApiClient):
+    DEFAULT_MODEL = "gpt-5.5"
 
     def __init__(self,
                  api_key: str = "",
-                 model="gpt-5.4-mini",
+                 model: Optional[str] = None,
                  base_url: str = "",
                  max_tokens: Optional[int] = None,
                  temperature: float = 0.3,
@@ -23,6 +24,11 @@ class OpenAIClient(LLMApiClient):
         if api_key == "" and config.has_key("openai_api_key"):
             api_key = config.get("openai_api_key")
         self.api_key = api_key
+        self.model = config.resolve_value(
+            model,
+            ("openai_model",),
+            self.DEFAULT_MODEL,
+        )
         
         http_client = httpx.Client(
             limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
@@ -46,7 +52,6 @@ class OpenAIClient(LLMApiClient):
         self.chat_count = 0
         self.token_count = 0
         self.history = []
-        self.model = model
         self.max_output_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p

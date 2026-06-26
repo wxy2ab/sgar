@@ -13,11 +13,13 @@ from ..utils.handle_max_tokens import handle_max_tokens
 logger.setLevel("ERROR")
 
 class SimpleAzureClient(LLMApiClient):
+    DEFAULT_DEPLOYMENT_NAME = "gpt-5.5"
+
     def __init__(self, 
                  api_key: str = None,
                  azure_endpoint: str = None,
                  max_tokens: int = 4000,
-                 deployment_name: str = "gpt-4o",
+                 deployment_name: Optional[str] = None,
                  api_version: str = "2023-05-15",
                  temperature: float = 0.7,
                  top_p: float = 1.0,
@@ -28,7 +30,11 @@ class SimpleAzureClient(LLMApiClient):
         
         self.api_key = api_key or config.get("AZURE_OPENAI_API_KEY")
         self.azure_endpoint = azure_endpoint or config.get("AZURE_OPENAI_ENDPOINT")
-        self.deployment_name = deployment_name
+        self.deployment_name = config.resolve_value(
+            deployment_name,
+            ("simple_azure_deployment_name",),
+            self.DEFAULT_DEPLOYMENT_NAME,
+        )
         self.api_version = api_version
         self.temperature = temperature
         self.top_p = top_p

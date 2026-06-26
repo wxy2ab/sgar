@@ -8,12 +8,16 @@ class PPioClaudeOpusClient(LLMApiClient):
 
 
 class PPioClaudeOpusClient(MoonShotClient):
-    def __init__(self, model: str = "pa/claude-opus-4-5-20251101"):
+    DEFAULT_MODEL = "pa/claude-opus-4-8"
+
+    def __init__(self, model: str = ""):
         base_url = "https://api.ppinfra.com/openai"
         config = Config()
 
         api_key = config.get("ppio_api_key")
         super().__init__(api_key, base_url, max_tokens=128000)
-        if model is None or model == "":
-            model = "pa/claude-opus-4-5-20251101"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("ppio_cluade_opus_model",),
+            self.DEFAULT_MODEL,
+        )

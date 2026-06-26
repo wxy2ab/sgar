@@ -70,6 +70,9 @@ class SimpleDeepSeekClientChat(LLMApiClient):
 
 
 class SimpleDeepSeekClientChat(SimpleDeepSeekClient):
+    MODEL_CONFIG_KEYS = ("simple_deep_seek_chat_model", "simple_deep_seek_model")
+    DEFAULT_MODEL = "deepseek-v4-flash"
+
     def __init__(
         self,
         # ``deepseek-v4-flash`` is the cheap / fast non-reasoning model.
@@ -78,7 +81,7 @@ class SimpleDeepSeekClientChat(SimpleDeepSeekClient):
         # model but with ``thinking=True``). Callers who want pro-tier
         # quality without reasoning can pass ``model="deepseek-v4-pro"``.
         # ``deepseek-chat`` is deprecated upstream — don't reintroduce it.
-        model: str = "deepseek-v4-flash",
+        model: Optional[str] = None,
         max_tokens: int = 64000,
         temperature: float = 1.0,
         top_p: float = 1,

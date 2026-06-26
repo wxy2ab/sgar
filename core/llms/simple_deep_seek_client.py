@@ -31,8 +31,10 @@ def _default_context_window(model: str) -> int:
 
 class SimpleDeepSeekClient(LLMApiClient):
     supports_structured_output = True
+    MODEL_CONFIG_KEYS = ("simple_deep_seek_model",)
+    DEFAULT_MODEL = "deepseek-v4-flash"
 
-    def __init__(self, api_key: str = "", base_url: str = "https://api.deepseek.com/",model:str = "deepseek-v4-flash",
+    def __init__(self, api_key: str = "", base_url: str = "https://api.deepseek.com/",model: Optional[str] = None,
                  max_tokens: int = 64000, temperature: float = 1.0, top_p: float = 1,
                  presence_penalty: float = 0, frequency_penalty: float = 0, stop: Union[str, List[str]] = None,
                  reasoning_effort: Optional[str] = "high", extra_body: Optional[Dict[str, Any]] = None,
@@ -78,7 +80,11 @@ class SimpleDeepSeekClient(LLMApiClient):
             "deepseek-coder",
             "deepseek-reasoner",
         ]
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            getattr(self, "MODEL_CONFIG_KEYS", self.MODEL_CONFIG_KEYS),
+            self.DEFAULT_MODEL,
+        )
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p

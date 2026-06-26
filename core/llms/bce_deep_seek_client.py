@@ -8,13 +8,15 @@ class BceDeepSeekClient(LLMApiClient):
 
 
 class BceDeepSeekClient(MoonShotClient):
-    def __init__(self, model: str = "deepseek-v3"):
+    def __init__(self, model: str = ""):
         base_url = "https://qianfan.baidubce.com/v2"
         config = Config()
 
 
         api_key = config.get("baidu_bce_api_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "deepseek-v3"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("bce_deep_seek_client_model",),
+            "deepseek-v3",
+        )

@@ -10,12 +10,14 @@ class MiClient(LLMApiClient):
 
 
 class MiClient(MoonShotClient):
-    def __init__(self, model: str = "mimo-v2-pro",thinking: bool = True):
+    def __init__(self, model: str = "",thinking: bool = True):
         base_url = "https://api.xiaomimimo.com/v1/chat/completions"
         config = Config()
 
         api_key = config.get("mi_key")
         super().__init__(api_key, base_url, thinking)
-        if model is None or model == "":
-            model = "mimo-v2-pro"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("mi_client_model",),
+            "mimo-v2-pro",
+        )

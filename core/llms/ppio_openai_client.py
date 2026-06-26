@@ -8,12 +8,16 @@ class PPioOpenAIClient(LLMApiClient):
 
 
 class PPioOpenAIClient(MoonShotClient):
-    def __init__(self, model: str = "pa/p3"):
+    DEFAULT_MODEL = "gpt-5.5"
+
+    def __init__(self, model: str = ""):
         base_url = "https://api.ppinfra.com/openai"
         config = Config()
 
         api_key = config.get("ppio_api_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "pa/p3"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("ppio_openai_model",),
+            self.DEFAULT_MODEL,
+        )

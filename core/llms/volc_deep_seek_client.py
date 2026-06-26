@@ -8,12 +8,14 @@ class VolcDeepSeekClient(LLMApiClient):
 
 
 class VolcDeepSeekClient(MoonShotClient):
-    def __init__(self, model: str = "deepseek-v3-250324"):
+    def __init__(self, model: str = ""):
         base_url = "https://ark.cn-beijing.volces.com/api/v3"
         config = Config()
 
         api_key = config.get("volcengine_api_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "deepseek-v3-250324"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("volc_deep_seek_client_model",),
+            "deepseek-v3-250324",
+        )

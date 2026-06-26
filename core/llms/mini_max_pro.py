@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, Generator, Iterator, List, Union, Literal
+from typing import Any, Dict, Generator, Iterator, List, Optional, Union, Literal
 
 from ratelimit import limits, sleep_and_retry
 import requests
@@ -10,10 +10,16 @@ from ..utils.handle_max_tokens import handle_max_tokens
 from ..utils.log import logger
 
 class MiniMaxProClient(LLMApiClient):
-    def __init__(self, model: Literal["MiniMax-M2.7-highspeed", "MiniMax-M3"] = "MiniMax-M3"):
+    DEFAULT_MODEL = "MiniMax-M3"
+
+    def __init__(self, model: Optional[Literal["MiniMax-M2.7-highspeed", "MiniMax-M3"]] = None):
         config = Config()
         self.api_key = config.get("minimax_api_key")
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("mini_max_pro_model",),
+            self.DEFAULT_MODEL,
+        )
         self.base_url = f"https://api.minimax.chat/v1/text/chatcompletion_pro"
         self.headers = {
             "Content-Type": "application/json",

@@ -75,12 +75,14 @@ class RegionClientPool:
             self.rate_limits[region]["tpm"] += token_count
 
 class MultiRegionClaudeClient(LLMApiClient):
+    DEFAULT_MODEL = "anthropic.claude-opus-4-8"
+
     def __init__(self, 
                 regions: List[str] = None,
                 aws_access_key_id: Optional[str] = None,
                 aws_secret_access_key: Optional[str] = None,
                 aws_session_token: Optional[str] = None,
-                model: str = "anthropic.claude-3-5-sonnet-20240620-v1:0",
+                model: Optional[str] = None,
                 temperature: float = 0.5,
                 top_p: float = 1.0,
                 top_k: int = 250,
@@ -88,8 +90,13 @@ class MultiRegionClaudeClient(LLMApiClient):
                 stop_sequences: Optional[List[str]] = None,
                 anthropic_version: str = "2023-06-01"):
         
+        config = Config()
         self.regions = regions or ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("multi_claude_model", "claude_aws_model"),
+            self.DEFAULT_MODEL,
+        )
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k

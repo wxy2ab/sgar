@@ -8,12 +8,14 @@ class GLMOpenAIClient(LLMApiClient):
 
 
 class GLMOpenAIClient(MoonShotClient):
-    def __init__(self, model: str = "glm-5.2"):
+    def __init__(self, model: str = ""):
         base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
         config = Config()
 
         api_key = config.get("glm_api_key")
         super().__init__(api_key, base_url)
-        if model is None or model == "":
-            model = "glm-5.2"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("glm_openai_client_model",),
+            "glm-5.2",
+        )

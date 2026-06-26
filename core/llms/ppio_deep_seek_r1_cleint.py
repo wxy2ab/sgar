@@ -7,13 +7,15 @@ class PPioDeepSeekR1Client(LLMApiClient):
 
 
 class PPioDeepSeekR1Client(MoonShotClient):
-    def __init__(self, model: str = "deepseek/deepseek-v3.2-exp"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.ppinfra.com/openai"
         config = Config()
 
         api_key = config.get("ppio_api_key")
         super().__init__(api_key, base_url, max_tokens=65536)
-        if model is None or model == "":
-            model = "deepseek/deepseek-v3.2-exp"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("ppio_deep_seek_r1_cleint_model",),
+            "deepseek/deepseek-v3.2-exp",
+        )
         self.enable_thinking = True

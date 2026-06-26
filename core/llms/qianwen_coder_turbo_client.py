@@ -6,10 +6,12 @@ class QianWenCoderTurboClient(LLMApiClient):
     pass
 
 class QianWenCoderTurboClient(QianWenClient):
-    def __init__(self, model: str = "qwen3-coder-480b-a35b-instruct"):
+    def __init__(self, model: str = ""):
         config = Config()
         api_key = config.get("dashscope_api_key")
-        if model is None or model == "":
-            model = "qwen3-coder-480b-a35b-instruct"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("qianwen_coder_turbo_client_model",),
+            "qwen3-coder-480b-a35b-instruct",
+        )
         super().__init__(api_key, max_tokens=8192 ,model=self.model)

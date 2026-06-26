@@ -8,11 +8,12 @@ from ..utils.handle_max_tokens import handle_max_tokens
 
 
 class PXClient(LLMApiClient):
+    DEFAULT_MODEL = "gpt-5.5"
 
     def __init__(self,
                  api_key: str = "",
-                 model: str = "gpt-5.4",
-                 review_model: str = "gpt-5.4",
+                 model: Optional[str] = None,
+                 review_model: Optional[str] = None,
                  base_url: str = "https://sub.jlypx.de",
                  max_tokens: int = 200000,
                  temperature: float = 1,
@@ -31,6 +32,16 @@ class PXClient(LLMApiClient):
             api_key = config.get("px_api_key")
 
         self.api_key = api_key
+        self.model = config.resolve_value(
+            model,
+            ("px_model",),
+            self.DEFAULT_MODEL,
+        )
+        self.review_model = config.resolve_value(
+            review_model,
+            ("px_review_model", "px_model"),
+            self.DEFAULT_MODEL,
+        )
         self.base_url = base_url.strip().strip("`").strip()
         http_client = httpx.Client(
             limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
@@ -45,8 +56,6 @@ class PXClient(LLMApiClient):
         self.chat_count = 0
         self.token_count = 0
         self.history = []
-        self.model = model
-        self.review_model = review_model
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p

@@ -6,10 +6,12 @@ class QianWenCoder32Client(LLMApiClient):
     pass
 
 class QianWenCoder32Client(QianWenClient):
-    def __init__(self, model: str = "qwen3-32b"):
+    def __init__(self, model: str = ""):
         config = Config()
         api_key = config.get("dashscope_api_key")
-        if model is None or model == "":
-            model = "qwen3-32b"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("qianwen32_client_model",),
+            "qwen3-32b",
+        )
         super().__init__(api_key, max_tokens=8192 ,model=self.model)

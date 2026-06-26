@@ -7,13 +7,15 @@ class SiliconDeepSeekR1Client(LLMApiClient):
 
 
 class SiliconDeepSeekR1Client(MoonShotClient):
-    def __init__(self, model: str = "Pro/deepseek-ai/DeepSeek-R1"):
+    def __init__(self, model: str = ""):
         base_url = "https://api.siliconflow.cn/v1"
         config = Config()
 
 
         api_key = config.get("siliconflow_key")
         super().__init__(api_key, base_url, max_tokens=8192)
-        if model is None or model == "":
-            model = "deepseek-ai/DeepSeek-R1"
-        self.model = model
+        self.model = config.resolve_value(
+            model,
+            ("silicon_deep_seek_r1_client_model",),
+            "Pro/deepseek-ai/DeepSeek-R1",
+        )
