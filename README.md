@@ -1,4 +1,4 @@
-# sgar: 状态治理代理体制 / State-Governed Agent Regime
+# sgar: 状态治理agent模式 / State-Governed Agent Regime
 
 [English Version](./README.en.md)
 
@@ -19,7 +19,7 @@
 `sgar` 的设计建立在两篇核心文档之上：
 
 - [审计工程](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.zh-CN.md)
-- [状态治理代理体制](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.zh-CN.md)
+- [状态治理agent模式](https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.zh-CN.md)
 
 - `Audit Engineering`：把“能生成”变成“能持续修正”。利用 LLM 的生成-验证不对称性，以及“缺陷诊断本身就是改进药方”这一事实，让 agent 在长程运行中越跑越准，而不是越跑越飘。
 - `State-Governed Agent Regime`：把 agent 从“靠提示词漂移”变成“靠硬状态推进”。用外部化状态约束运行轨迹，用 `action` 和 `delta` 驱动每一步改进，让长程执行可控、可追踪、可迭代。
