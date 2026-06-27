@@ -200,6 +200,24 @@ def _drop_cc_native_orchestration_tools(registry: Any) -> list[str]:
     return removed
 
 
+def _register_ask_human(
+    registry: Any, *, enabled: bool, timeout_s: float,
+) -> bool:
+    """Register the ``ask_human`` tool into a turn registry iff ``enabled``.
+
+    Returns whether the tool was registered. When disabled (the default,
+    i.e. no host interaction handler), this is a no-op so the registry,
+    system prompt, and prompt cache stay byte-identical. Extracted as a
+    module function so the byte-equivalence gate is directly unit-testable
+    against a real (or fake) registry without driving a full turn.
+    """
+    if not enabled or registry is None or not hasattr(registry, "register"):
+        return False
+    from .ask_human_tool import CcxAskHumanTool
+    registry.register(CcxAskHumanTool(timeout_s=timeout_s))
+    return True
+
+
 _NEEDS_MODEL_MARKER_RE = re.compile(
     r"(?m)^[ \t]*<<<NEEDS_([A-Z][A-Z0-9_]*)>>>[ \t]*$",
 )
@@ -697,6 +715,15 @@ class CcAgentRunner(ModeRunner):
     # so one operator switch governs every machine-check capability in ccx.
     enable_spawn_contract: bool = False
     contract_check_timeout_s: float = 120.0
+    # Human-in-the-loop (default OFF). When ``enable_ask_human=True`` this
+    # agent registers the ``ask_human`` cc tool, which bridges to a host
+    # interaction handler threaded onto the v5 dispatch context. Off ⇒ the tool
+    # is never registered, so the registry / prompt / cache are byte-identical.
+    # Wired from ``build_runtime(interaction_fn=...)`` (enabled iff a handler
+    # is present). The handler itself is read from the dispatch context at
+    # execute time, not held here.
+    enable_ask_human: bool = False
+    interaction_timeout_s: float = 300.0
 
     def run(self, invocation: SubagentInvocation) -> SubagentResult:
         """Run one agent invocation, optionally under a spawn contract.
@@ -873,6 +900,16 @@ class CcAgentRunner(ModeRunner):
         ):
             from .ctx_search_tool import CcxCtxSearchTool
             registry.register(CcxCtxSearchTool(content_store=self.content_store))
+
+        # Human-in-the-loop: register ask_human only when enabled (a host
+        # interaction handler is present). Off ⇒ the tool is never added, so
+        # the registry / system prompt / prompt cache stay byte-identical. The
+        # handler is reached at execute time via the v5 dispatch context.
+        _register_ask_human(
+            registry,
+            enabled=self.enable_ask_human,
+            timeout_s=self.interaction_timeout_s,
+        )
 
         # Build the cc→v5 event bridge sink. Inside a real v5 dispatch
         # the sink resolves to the dispatcher's emit callback (so cc

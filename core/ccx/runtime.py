@@ -21,7 +21,7 @@ import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from core.deepstack_v5 import (
     Budget,
@@ -87,6 +87,8 @@ def _build_cc_agent_runner(
     count_research_in_fanout: bool = False,
     enable_spawn_contract: bool = False,
     contract_check_timeout_s: float = 120.0,
+    enable_ask_human: bool = False,
+    interaction_timeout_s: float = 300.0,
 ):
     """Lazy import of CcAgentRunner so ccx works without cc's full stack
     when the lite agent runner is sufficient.
@@ -123,6 +125,8 @@ def _build_cc_agent_runner(
         count_research_in_fanout=count_research_in_fanout,
         enable_spawn_contract=enable_spawn_contract,
         contract_check_timeout_s=contract_check_timeout_s,
+        enable_ask_human=enable_ask_human,
+        interaction_timeout_s=interaction_timeout_s,
         **extra_kwargs,
     )
 
@@ -736,6 +740,8 @@ def build_runtime(
     preferred_model_overrides: Mapping[str, Any] | None = None,
     sgar_run_criterion_checks: bool = False,
     sgar_criterion_check_timeout_s: float = 120.0,
+    interaction_fn: Callable[[Any], Any] | None = None,
+    interaction_timeout_s: float = 300.0,
 ) -> CcxRuntimeBundle:
     """Build a v5 RuntimeV5 wired with ccx plan/spec/agent tools.
 
@@ -807,6 +813,10 @@ def build_runtime(
             # stay byte-equivalent until a contract is actually attached.
             enable_spawn_contract=sgar_run_criterion_checks,
             contract_check_timeout_s=sgar_criterion_check_timeout_s,
+            # Enable the ask_human tool iff a host interaction handler is
+            # present; off ⇒ the tool is never registered (byte-equivalent).
+            enable_ask_human=interaction_fn is not None,
+            interaction_timeout_s=interaction_timeout_s,
         )
         # ResearchRunner requires the cc QueryEngine path (it reuses cc's
         # Read/Grep/Glob tools). Only register ccx.research when we have
@@ -967,6 +977,7 @@ def build_runtime(
         budget=budget,
         config=cfg,
         propose_initial=propose_initial,
+        interaction_fn=interaction_fn,
     )
     if tracer is not None:
         tracer.attach_event_bus(runtime.event_bus)

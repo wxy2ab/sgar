@@ -85,6 +85,7 @@ class Dispatcher:
         on_node_finished_with_lease: LeasePersistCallback | None = None,
         on_toolcall_started_with_lease: LeasePersistCallback | None = None,
         budget_reporter: Callable[[int, float], None] | None = None,
+        interaction_fn: Callable[[Any], Any] | None = None,
     ) -> None:
         self.run_id = run_id
         self.graph = graph
@@ -98,6 +99,7 @@ class Dispatcher:
         self._on_finished_with_lease = on_node_finished_with_lease
         self._on_toolcall_started_with_lease = on_toolcall_started_with_lease
         self._budget_reporter = budget_reporter
+        self._interaction_fn = interaction_fn
 
     def dispatch_one(
         self,
@@ -292,6 +294,7 @@ class Dispatcher:
             emit=_tracking_emit,
             report_cost_fn=report_cost,
             cancel_event=cancel_event,
+            interaction_fn=self._interaction_fn,
         )
         idle_timeout_s = _node_idle_timeout_s()
         try:

@@ -4,11 +4,12 @@ import argparse
 import configparser
 from pathlib import Path
 
+from core.utils.config_setting import Config
+
 from .client_registry import ClientMetadata, get_client_metadata_map, list_client_metadata
 
 
-USER_CONFIG_DIR = ".sgar"
-USER_CONFIG_PATH = Path.home() / USER_CONFIG_DIR / "setting.ini"
+USER_CONFIG_PATH = Config._user_config_path()
 CONFIG_SECTION = "Default"
 
 

@@ -31,6 +31,18 @@ from .runtime import (
 )
 from .services import SteerInbox
 
+# Skill subsystem — defined in core.cc (cc owns the tool registry the ccx modes
+# drive), re-exported here for ergonomics so sgar/ccx callers can
+# ``from core.ccx import load_skill_registry, SkillRegistry`` and register skills
+# dynamically. Skills already work in every ccx mode via the cc tool wiring.
+from core.cc.skills import (
+    SkillDefinition,
+    SkillRegistry,
+    load_skill_registry,
+    skill_roots,
+)
+from core.cc.tools.skill import SkillTool
+
 __all__ = [
     "AgentRunRequest",
     "AgentRunResult",
@@ -40,7 +52,12 @@ __all__ = [
     "CodeBuildRequest",
     "ContentStoreOptions",
     "MemoryOptions",
+    "SkillDefinition",
+    "SkillRegistry",
+    "SkillTool",
     "SteerInbox",
     "build_runtime",
+    "load_skill_registry",
     "root_node_for",
+    "skill_roots",
 ]

@@ -1278,6 +1278,7 @@ class EngineV5:
             on_node_finished_with_lease=persist_under_lease,
             on_toolcall_started_with_lease=persist_under_lease,
             budget_reporter=report_cost,
+            interaction_fn=self._rt.interaction_fn,
         )
 
     def _mark_worker_lost(

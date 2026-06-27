@@ -93,6 +93,11 @@ class CCConfig:
     # both off the model's tool schema and the loop's control flow are
     # unchanged. ---
     run_tests_tool_enabled: bool = False
+    # Multi-root skill loading (repo ``skills/`` + user ``~/.<root>/skills/`` +
+    # project ``.skills/``). Default ON: the ``skill`` tool self-hides when no
+    # skills are discovered, so a zero-skill checkout's tool schema is unchanged.
+    # Set False to disable skill discovery/exposure entirely.
+    skills_enabled: bool = True
     auto_post_edit_verify: bool = False
     post_edit_verify_command: str | None = None
     post_edit_verify_timeout_ms: int = 120_000
@@ -522,6 +527,10 @@ def load_cc_config(
     values.setdefault(
         "run_tests_tool_enabled",
         _coerce_bool(settings.get("cc_run_tests_tool_enabled"), defaults.run_tests_tool_enabled),
+    )
+    values.setdefault(
+        "skills_enabled",
+        _coerce_bool(settings.get("cc_skills_enabled"), defaults.skills_enabled),
     )
     values.setdefault(
         "auto_post_edit_verify",

@@ -52,6 +52,12 @@ DEFAULT_READ_ONLY_WHITELIST: frozenset[str] = frozenset({
     # schema via ``is_enabled=False``. Both are genuinely read-only.
     "memory_search",
     "memory_status",
+    # The ``skill`` tool only returns a discovered skill's instructions
+    # (``is_read_only=True``); loading a skill performs no writes, so it is
+    # safe — and useful — in read-only research / doc / ask modes. Listed
+    # explicitly (like file_read / glob / grep) so the allowlist stays the
+    # authoritative contract even though spec.is_read_only would also keep it.
+    "skill",
 })
 
 # Read actions of the unified ``memory`` tool (mirrors
