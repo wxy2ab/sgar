@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from ..agents.agent_tool import AgentTool
 from ..agents.runtime_registry import (
     InProcessRuntimeRegistry,
@@ -8,6 +10,7 @@ from ..agents.runtime_registry import (
 from ..config import CCConfig
 from ..llm import LLMClientProvider
 from ..memory import MemoryRuntime
+from ..skills import SkillRegistry, load_skill_registry
 from .enter_plan_mode import EnterPlanModeTool
 from .enter_spec_mode import EnterSpecModeTool
 from .exit_plan_mode import ExitPlanModeTool
@@ -28,6 +31,7 @@ from .registry import ToolRegistry
 from .run_tests import RunTestsTool
 from .send_message import SendMessageTool
 from .shell import ShellTool
+from .skill import SkillTool
 from .spec_artifact_write import SpecArtifactWriteTool
 from .task_stop import TaskStopTool
 from .todo_write import TodoWriteTool
@@ -40,6 +44,7 @@ def build_builtin_tool_registry(
     llm_client_provider: LLMClientProvider | None = None,
     runtime_registry: InProcessRuntimeRegistry | None = None,
     memory_runtime: MemoryRuntime | None = None,
+    cwd: str | Path | None = None,
 ) -> ToolRegistry:
     resolved_config = config or CCConfig()
     registry_handle = runtime_registry or get_in_process_runtime_registry(resolved_config.runtime_root_path())
@@ -74,6 +79,16 @@ def build_builtin_tool_registry(
     # name resolvable for in-process callers/tests while ``is_enabled`` gates
     # its visibility, so the exported schema is byte-identical when off.
     registry.register(RunTestsTool())
+    # Skills are discovered once here (the session cwd is known at build time) and
+    # the resulting registry is captured by SkillTool. Default-ON, but the tool
+    # self-hides via ``is_enabled`` when zero skills are found, so the exported
+    # schema is byte-identical in a checkout with no skill files. When the
+    # operator clears ``skills_enabled`` we skip the disk scan entirely (a true
+    # off-switch) while keeping the tool registered/resolvable by name.
+    skill_registry = (
+        load_skill_registry(cwd) if resolved_config.skills_enabled else SkillRegistry()
+    )
+    registry.register(SkillTool(skill_registry))
     registry.register(AgentTool(llm_client_provider=llm_client_provider, runtime_registry=registry_handle))
     registry.register(SendMessageTool(runtime_registry=registry_handle))
     registry.register(TaskStopTool(runtime_registry=registry_handle))

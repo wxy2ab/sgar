@@ -51,6 +51,7 @@ class RuntimeV5:
         db: SQLiteRuntimeDB,
         budget: BudgetTracker,
         controller: Controller,
+        interaction_fn: Callable[[Any], Any] | None = None,
     ) -> None:
         self.capabilities = dict(capabilities)
         self.workspace = workspace
@@ -58,6 +59,10 @@ class RuntimeV5:
         self.db = db
         self.budget = budget
         self.controller = controller
+        # Optional host callback for human-in-the-loop interaction, threaded
+        # onto every per-call DispatchContext by the engine/harness so the
+        # ccx ``ask_human`` tool can reach a human. ``None`` ⇒ fully autonomous.
+        self.interaction_fn = interaction_fn
 
         # Stores (always SQLite-backed; in-memory backend is for tests
         # and bypasses RuntimeV5).
@@ -142,6 +147,7 @@ class RuntimeV5:
         llm_client: Any | None = None,
         event_hooks: Sequence[EventHook] | None = None,
         worker_count: int = 1,
+        interaction_fn: Callable[[Any], Any] | None = None,
     ) -> "RuntimeV5":
         cfg = config or ConfigV5()
         if worker_count > 1:
@@ -182,6 +188,7 @@ class RuntimeV5:
             db=db,
             budget=budget_tracker,
             controller=controller,
+            interaction_fn=interaction_fn,
         )
 
         if event_hooks:

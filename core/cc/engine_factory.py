@@ -75,6 +75,7 @@ class EngineFactory:
             llm_client_provider=provider,
             runtime_registry=runtime_registry,
             memory_runtime=memory_runtime,
+            cwd=resolved_cwd,
         )
         orchestrator = ToolOrchestrator(registry)
         context_assembler = ContextAssembler(environment=self.environment)

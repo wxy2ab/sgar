@@ -47,6 +47,12 @@ class DispatchContext:
     report_cost_fn: Callable[[int, float], None] | None = None
     cancel_event: Event | None = None
     attempt_ordinal: int = 1
+    # Optional host callback for human-in-the-loop interaction. A tool that
+    # wants to ask a human a question (the ccx ``ask_human`` tool) reads this
+    # and calls it. ``None`` (the default) means no human is reachable, so the
+    # autonomous agent proceeds without asking. Plumbed exactly like
+    # ``report_cost_fn``: the dispatcher threads it onto every per-call context.
+    interaction_fn: Callable[[Any], Any] | None = None
 
     def is_cancelled(self) -> bool:
         return self.cancel_event is not None and self.cancel_event.is_set()
@@ -55,6 +61,16 @@ class DispatchContext:
         """Report token/cost usage against the active run budget."""
         if self.report_cost_fn is not None:
             self.report_cost_fn(int(tokens or 0), float(cost or 0.0))
+
+    def request_interaction(self, request: Any) -> Any:
+        """Forward a human-interaction request to the host callback.
+
+        Returns ``None`` when no handler is installed (the autonomous
+        default); the caller treats that as "no human available".
+        """
+        if self.interaction_fn is None:
+            return None
+        return self.interaction_fn(request)
 
 
 _current: ContextVar[DispatchContext | None] = ContextVar(

@@ -15,7 +15,6 @@ class Singleton(type):
 
 class Config(metaclass=Singleton):
     DEFAULT_PATH = "setting.ini"
-    USER_CONFIG_DIR = ".sgar"
 
     @classmethod
     def _singleton_key(cls, path="setting.ini"):
@@ -40,11 +39,11 @@ class Config(metaclass=Singleton):
 
     @classmethod
     def _root_dir_name(cls) -> str:
-        return cls.USER_CONFIG_DIR.lstrip(".")
+        return cls._project_root().name
 
     @classmethod
     def _user_config_path(cls) -> Path:
-        return Path.home() / cls.USER_CONFIG_DIR / cls.DEFAULT_PATH
+        return Path.home() / f".{cls._root_dir_name()}" / cls.DEFAULT_PATH
 
     def _requested_path_obj(self) -> Path:
         return Path(self.requested_path).expanduser()

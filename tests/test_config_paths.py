@@ -4,7 +4,7 @@ from pathlib import Path
 from core.utils.config_setting import Config
 
 
-def test_user_config_path_does_not_derive_from_package_root(monkeypatch, tmp_path):
+def test_user_config_path_uses_runtime_root_name(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setattr(
         Config,
@@ -12,7 +12,7 @@ def test_user_config_path_does_not_derive_from_package_root(monkeypatch, tmp_pat
         classmethod(lambda cls: Path("/tmp/site-packages")),
     )
 
-    assert Config._user_config_path() == tmp_path / ".sgar" / "setting.ini"
+    assert Config._user_config_path() == tmp_path / ".site-packages" / "setting.ini"
 
 
 def test_config_cli_uses_runtime_user_config_path(monkeypatch, tmp_path):

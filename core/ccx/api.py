@@ -95,6 +95,7 @@ from .runtime import (
     root_node_for,
 )
 from .services import SteerInbox
+from .services.interaction import InteractionHandler
 from .agents.governed_run import (
     CCX_RUN_CONTRACT_METADATA_KEY,
     parse_run_audit_contract,
@@ -530,6 +531,8 @@ class CodeAgent:
         run_audit_check_timeout_s: float = 120.0,
         goal_llm_timeout_s: float = 600.0,
         goal_check_timeout_s: float = 120.0,
+        interaction_handler: "InteractionHandler | None" = None,
+        interaction_timeout_s: float = 300.0,
     ) -> None:
         self.config = config
         self.llm_client_provider = llm_client_provider or (
@@ -611,8 +614,36 @@ class CodeAgent:
         self._steer_inbox = SteerInbox()
         self._steer_lock = threading.Lock()
         self._active_steer_inboxes: dict[str, SteerInbox] = {}
+        # Human-in-the-loop (default OFF). When a handler is registered, the
+        # cc_query_loop agent gains an ``ask_human`` tool that bridges to it
+        # (threaded onto the v5 dispatch context). No handler ⇒ the tool is
+        # never registered, so every default run is byte-identical. Guarded by
+        # its own lock so a handler can be (re)wired after construction, e.g.
+        # once a UI is ready — mirrors the steer thread-safety discipline.
+        self._interaction_lock = threading.Lock()
+        self._interaction_handler = interaction_handler
+        self._interaction_timeout_s = interaction_timeout_s
 
     # -- public API ---------------------------------------------------------
+
+    def register_interaction_handler(
+        self, handler: "InteractionHandler | None"
+    ) -> None:
+        """Install (or clear) the human-interaction handler for this agent.
+
+        Thread-safe. Hosts often build the ``CodeAgent`` before their UI /
+        prompt channel exists, so this allows wiring the callback after
+        construction. Passing ``None`` reverts to fully-autonomous behaviour
+        (the ``ask_human`` tool is not offered on subsequent runs). Takes
+        effect on the next ``run`` — the handler is read when ``build_runtime``
+        constructs the per-run runtime.
+        """
+        with self._interaction_lock:
+            self._interaction_handler = handler
+
+    def _current_interaction_handler(self) -> "InteractionHandler | None":
+        with self._interaction_lock:
+            return self._interaction_handler
 
     def push_steer(self, text: str, *, run_id: str | None = None) -> None:
         """Inject mid-turn supplemental guidance for this agent.
@@ -1559,6 +1590,8 @@ class CodeAgent:
                 sgar_criterion_check_timeout_s=(
                     self._sgar_criterion_check_timeout_s
                 ),
+                interaction_fn=self._current_interaction_handler(),
+                interaction_timeout_s=self._interaction_timeout_s,
             )
         except BaseException as exc:
             self._unregister_steer_run(None, run_steer_inbox)
@@ -1922,6 +1955,8 @@ class CodeAgent:
                 sgar_criterion_check_timeout_s=(
                     self._sgar_criterion_check_timeout_s
                 ),
+                interaction_fn=self._current_interaction_handler(),
+                interaction_timeout_s=self._interaction_timeout_s,
             )
         except BaseException as exc:
             self._unregister_steer_run(None, run_steer_inbox)
