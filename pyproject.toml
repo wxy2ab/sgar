@@ -66,7 +66,7 @@ dependencies = [
 "Documentation (EN) / English Docs" = "https://github.com/wxy2ab/sgar/blob/main/README.en.md"
 "Core Idea (ZH): 审计工程" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.zh-CN.md"
 "Core Idea (EN): Audit Engineering" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/audit-engineering.md"
-"Core Idea (ZH): 状态治理代理体制" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.zh-CN.md"
+"Core Idea (ZH): 状态治理agent模式" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.zh-CN.md"
 "Core Idea (EN): State-Governed Agent Regime" = "https://github.com/wxy2ab/against-llm-mediocrity/blob/main/docs/state-governed-agent-regime.md"
 
 [project.optional-dependencies]

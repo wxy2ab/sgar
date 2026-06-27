@@ -1,4 +1,4 @@
-# sgar: State-Governed Agent Regime / 状态治理代理体制
+# sgar: State-Governed Agent Regime / 状态治理agent模式
 
 [中文版本](./README.md)
 
