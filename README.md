@@ -71,6 +71,15 @@ sgar --help
 python -m sgar --help
 ```
 
+## 文档导航
+
+如果你希望把首页当成产品概览，把更完整的说明下沉到 `docs/`，建议从下面几份文档继续：
+
+- [构架文档](./docs/architecture.md)
+- [使用文档](./docs/usage.md)
+- [API 文档](./docs/api.md)
+- [集成文档](./docs/integration.md)
+
 ## 配置
 
 ### 方式一：使用 `sgar config`
@@ -132,6 +141,8 @@ deepseek_model = deepseek-v4-pro
 也就是说，只要环境变量里存在同名键，例如 `DEEPSEEK_API_KEY`，它会覆盖文件中的值。
 
 ## 使用方法
+
+更完整的命令路径、工作区说明与典型任务流，建议直接阅读 [使用文档](./docs/usage.md)。下面保留的是首页级概览。
 
 ### 最简单的用法
 
@@ -245,6 +256,8 @@ sgar mission list
 ```
 
 ## 集成到代码
+
+如果你正在评估如何把 `sgar` 接进平台、服务、流水线或机器人，建议先阅读 [集成文档](./docs/integration.md)。下面保留的是首页级示例。
 
 `sgar` 提供两类集成方式：
 
