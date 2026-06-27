@@ -81,6 +81,15 @@ sgar --help
 python -m sgar --help
 ```
 
+## Documentation
+
+If you want the README to stay a product landing page and move the deeper material into `docs/`, continue with:
+
+- [Architecture](./docs/architecture.en.md)
+- [Usage](./docs/usage.en.md)
+- [API](./docs/api.en.md)
+- [Integration](./docs/integration.en.md)
+
 ## Configuration
 
 ### Option 1: Use `sgar config`
@@ -144,6 +153,8 @@ So if an environment variable such as `DEEPSEEK_API_KEY` is present, it
 overrides the file value.
 
 ## Usage
+
+For the full command paths, workspace behavior, and task flows, read [usage.en.md](./docs/usage.en.md). The section below stays at README depth.
 
 ### Simplest Path
 
@@ -257,6 +268,8 @@ sgar mission list
 ```
 
 ## Embedding In Code
+
+If you are evaluating how to plug `sgar` into a platform, service, pipeline, or bot, start with [integration.en.md](./docs/integration.en.md). The section below keeps only landing-page-level examples.
 
 `sgar` supports two integration styles:
 
