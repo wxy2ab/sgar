@@ -37,6 +37,13 @@ REGRESSION_CAPTURE_ENV = "CCX_REGRESSION_CAPTURE"
 #: ``agent_mode="debug"`` degrades to a plain goal loop, byte-equivalent.
 DEBUG_MODE_ENV = "CCX_DEBUG_MODE"
 
+#: Master switch for the hard-feedback audit agent (design
+#: ``docs/audit_agent_design_2026-06-28.md``). Default OFF ⇒ ``agent_mode="audit"``
+#: degrades to a plain goal loop, byte-equivalent, and the post-gate
+#: claim↔evidence fidelity enrichment never fires. INFORM-only when on: audit
+#: output is a snapshot side-channel, never a term in the goal ``met`` gate.
+AUDIT_MODE_ENV = "CCX_AUDIT_MODE"
+
 _TRUTHY = frozenset({"1", "true", "on", "yes", "all"})
 
 
@@ -72,6 +79,18 @@ def debug_mode_enabled() -> bool:
     return _flag_enabled(DEBUG_MODE_ENV)
 
 
+def audit_mode_enabled() -> bool:
+    """Whether the hard-feedback audit agent's enrichment is enabled (default OFF).
+
+    Unset ⇒ ``agent_mode="audit"`` behaves byte-equivalently to a plain goal loop
+    (no post-gate claim↔evidence fidelity audit, no advisory channel); the mode is
+    still accepted so a flag-off audit request never silently falls through to the
+    cc fallback. When on, the audit is INFORM-only — it writes
+    ``snapshot['audit_advisories']`` and never enters the ``met`` gate (design §4).
+    """
+    return _flag_enabled(AUDIT_MODE_ENV)
+
+
 def build_code_task_contract(shape: str = "contract", **kwargs: Any) -> Any:
     """Lazy proxy to :func:`core.ccx.audit.contract.build_code_task_contract`.
 
@@ -88,8 +107,10 @@ __all__ = [
     "CODE_TASK_TEST_CMD_ENV",
     "REGRESSION_CAPTURE_ENV",
     "DEBUG_MODE_ENV",
+    "AUDIT_MODE_ENV",
     "build_code_task_contract",
     "code_task_audit_enabled",
     "regression_capture_enabled",
     "debug_mode_enabled",
+    "audit_mode_enabled",
 ]

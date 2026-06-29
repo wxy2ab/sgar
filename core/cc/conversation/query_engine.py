@@ -14,6 +14,7 @@ from ..observability import EventRecord, JsonlAuditLogger
 from .prompt_builder import SystemPromptBuilder
 from .query_loop import run_single_turn
 from .session import QuerySession, TurnState
+from ..tools.todo_store import load_todos
 from .turn_pipeline import (
     SessionStatePreparer,
     TurnPersistenceCoordinator,
@@ -193,6 +194,27 @@ class QueryEngine:
 
     async def restore_from_disk(self) -> None:
         await self.message_store.load_from_disk()
+        self._restore_todos_from_disk()
+
+    def _restore_todos_from_disk(self) -> None:
+        """Replay the per-session todo ledger into ``metadata.state`` so the
+        agent's fine-grained progress survives across runs/restart. The ledger
+        is the authoritative (immediately-flushed) record; it wins over any
+        coarser todos carried in from the reconstructed session."""
+        if not self.session.config.persist_sessions:
+            return
+        todos = load_todos(self.session.session_dir)
+        if not todos:
+            return
+        state = self.session.metadata.state
+        merged = {
+            t["content"]: t
+            for t in state.get("todos", [])
+            if isinstance(t, dict) and t.get("content")
+        }
+        for item in todos:
+            merged[item["content"]] = item
+        state["todos"] = list(merged.values())
 
     def export_session_snapshot(self) -> dict[str, object]:
         return {

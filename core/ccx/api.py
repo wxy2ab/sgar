@@ -129,13 +129,18 @@ MEMORY_RECALL_MODES = {"plan", "spec", "agent", "doc", "ask"}
 # mode) — do not merge them.
 SUPPORTED_AGENT_MODES = frozenset(
     {"plan", "spec", "agent", "doc", "ask", "blueprint", "sgar", "sgarx", "goal",
-     "debug"}
+     "debug", "audit"}
 )
 
 #: Operator params for ``agent_mode="debug"`` (route / max_iters / heavy_stimulus
 #: / docs_output_path), read from ``request.metadata``. Distinct from the goal
 #: key so a caller can carry both; the producer/DAG never writes it.
 CCX_DEBUG_REQUEST_METADATA_KEY = "ccx_debug"
+
+#: Operator params for ``agent_mode="audit"`` (route / max_iters /
+#: docs_output_path), read from ``request.metadata``. Mirrors the debug key; the
+#: producer/DAG never writes it.
+CCX_AUDIT_REQUEST_METADATA_KEY = "ccx_audit"
 
 
 def _debug_advisories(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -808,6 +813,19 @@ class CodeAgent:
             await self._maybe_emit_governance_verdict(request, result)
             return result
 
+        # Audit mode → the goal loop plus a POST-GATE, INFORM-only
+        # narrative-fidelity audit (claim↔evidence consistency oracle). Same
+        # orchestration, same authoritative [check:] floor; ``_run_audit_loop``
+        # adds, only when ``CCX_AUDIT_MODE`` is on, a read-only audit turn whose
+        # findings ride ``snapshot['audit_advisories']`` and NEVER touch ``met``
+        # / ``goal_verdict``. ``"audit"`` is permanently in SUPPORTED_AGENT_MODES
+        # so a flag-off audit request degrades to a plain goal loop here instead
+        # of silently falling through to cc.
+        if mode == "audit":
+            result = await self._run_audit_loop(request, config)
+            await self._maybe_emit_governance_verdict(request, result)
+            return result
+
         # Code-task definition-of-done auto-injection (default OFF). When
         # ``CCX_CODE_TASK_AUDIT`` is enabled and the caller supplied no run-audit
         # contract of their own, synthesize one whose single ``[check:]`` is the
@@ -1102,6 +1120,186 @@ class CodeAgent:
         snapshot["debug_advisories"] = _debug_advisories(snapshot)
 
         return _replace(result, session_snapshot=snapshot)
+
+    async def _run_audit_loop(
+        self, request: AgentRunRequest, config: CCConfig,
+    ) -> AgentRunResult:
+        """Drive ``agent_mode="audit"`` — the goal loop plus a POST-GATE,
+        INFORM-only narrative-fidelity audit (design audit_agent §1.5).
+
+        The loop machinery is REUSED verbatim (``run_goal_loop``): same
+        authoritative ``[check:]`` floor, same ``max_iters`` clamp, same LLM
+        timeout. When ``CCX_AUDIT_MODE`` is on we add, AROUND the loop, one
+        read-only audit turn that constructs the *consistency oracle* (the run's
+        report text vs the machine ground-truth already in the snapshot) and
+        queries it: every LLM-proposed claim↔evidence mismatch is re-checked
+        DETERMINISTICALLY (``consistency.recheck_consistency_claim``); confirmed
+        ones become ``track='audit-agent'`` findings and ride
+        ``snapshot['audit_advisories']``.
+
+        Trust-root (design §4): INFORM-only. Unlike ``_run_debug_loop`` it does
+        NOT downgrade ``goal_verdict`` — it never touches ``met`` or
+        ``goal_verdict`` in any direction. Flag-off ⇒ byte-equivalent to a plain
+        goal run.
+        """
+        from dataclasses import replace as _replace
+
+        from .audit import audit_mode_enabled
+
+        meta = dict(request.metadata or {})
+        params = meta.get(CCX_AUDIT_REQUEST_METADATA_KEY)
+        params = params if isinstance(params, dict) else {}
+        route_override = str(params.get("route") or "auto").strip().lower()
+        if route_override not in {"auto", "explicit", "plan"}:
+            route_override = "auto"
+        raw_max_iters = params.get("max_iters")
+        try:
+            max_iters = int(raw_max_iters) if raw_max_iters else _DEFAULT_GOAL_MAX_ITERS_API
+        except (TypeError, ValueError):
+            max_iters = _DEFAULT_GOAL_MAX_ITERS_API
+        docs_output_path = str(meta.get("docs_output_path") or "").strip() or None
+
+        llm = self._resolve_llm(config)
+        cwd_resolved = str(Path(request.cwd or ".").resolve())
+        result = await run_goal_loop(
+            self._drive_run_once,
+            request,
+            llm=llm,
+            language=config.prompt_language if config else "en",
+            cwd=cwd_resolved,
+            check_timeout_s=self._goal_check_timeout_s,
+            llm_timeout_s=self._goal_llm_timeout_s,
+            route_override=route_override,
+            max_iters=max_iters,
+            docs_output_path=docs_output_path,
+            log=lambda message: logger.info("ccx audit: %s", message),
+        )
+
+        # Flag-off: audit ≡ goal, byte-equivalent.
+        if not audit_mode_enabled():
+            return result
+
+        snapshot = dict(result.session_snapshot or {})
+        advisories = await self._audit_enrich(result, snapshot, config, cwd_resolved)
+        # INFORM-only side-channel — never a term in ``met`` / ``goal_verdict``.
+        snapshot["audit_advisories"] = advisories
+        return _replace(result, session_snapshot=snapshot)
+
+    async def _audit_enrich(
+        self, result: AgentRunResult, snapshot: dict[str, Any],
+        config: CCConfig, cwd: str,
+    ) -> list[dict[str, Any]]:
+        """Construct + query the consistency oracle; write confirmed findings.
+
+        Best-effort and fully isolated: any failure yields no advisories and
+        never disturbs the (already-computed) verdict. Returns the advisory list
+        attached to the snapshot (INFORM-only). Only teeth-verified (confirmed)
+        mismatches are written to the persistent ``audit-agent`` ledger; rejected
+        candidates appear as ``uncertain`` advisories only (keeps the ledger
+        clean for Phase-2 ``ledger_stats``).
+        """
+        try:
+            from .audit.consistency import (
+                assemble_ground_truth, recheck_consistency_claim,
+            )
+            from .audit.corrective import default_audit_findings_path
+            from .audit.finding_ledger import append_finding
+
+            report_text = str(getattr(result, "final_text", "") or "")
+            ground_truth = assemble_ground_truth(snapshot)
+            candidates = await self._audit_propose_candidates(
+                report_text=report_text, ground_truth=ground_truth,
+                config=config, cwd=cwd,
+            )
+            if not candidates:
+                return []
+
+            ledger_path = default_audit_findings_path(cwd)
+            ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+            advisories: list[dict[str, Any]] = []
+            for cand in candidates:
+                v = recheck_consistency_claim(
+                    cand, report_text=report_text, ground_truth=ground_truth,
+                )
+                claim_text = str(cand.get("claim_text") or "")
+                advisory: dict[str, Any] = {
+                    "rule": "narrative_fidelity",
+                    "mismatch_kind": v.mismatch_kind,
+                    "severity": "warn",
+                    "verdict": "confirmed" if v.confirmed else "uncertain",
+                    "claim_text": claim_text,
+                    "reason": v.reason,
+                    "evidence": v.evidence,
+                }
+                if v.confirmed:
+                    corrective = {
+                        "claim": claim_text,
+                        "evidence_check": (
+                            f"re-read machine ground-truth ({v.mismatch_kind}); "
+                            f"{v.reason}"
+                        ),
+                        "corrective_answer": (
+                            "correct the report so its narrative matches the "
+                            "machine ground-truth (or fix the underlying defect so "
+                            "the ground-truth matches the claim)"
+                        ),
+                        "oracle": "consistency",
+                        "fix_status": "UNVERIFIED (advisory; the evidence_check "
+                        "re-read is the teeth-verified part)",
+                    }
+                    rec = append_finding(
+                        track="audit-agent",
+                        hypothesis=(
+                            f"narrative claim contradicted by machine ground-truth "
+                            f"({v.mismatch_kind}): {claim_text!r}"
+                        ),
+                        expected=(
+                            "report narrative consistent with goal_verdict / "
+                            "check_evidence / node states"
+                        ),
+                        observed=v.reason,
+                        verdict="confirmed",
+                        repro=corrective["evidence_check"],
+                        path=ledger_path,
+                        evidence={
+                            "mismatch_kind": v.mismatch_kind,
+                            "consistency_evidence": v.evidence,
+                            "corrective_requirement": corrective,
+                        },
+                    )
+                    advisory["finding_id"] = rec.get("id")
+                advisories.append(advisory)
+            return advisories
+        except Exception:
+            logger.warning("ccx audit: enrichment failed; no advisories", exc_info=True)
+            return []
+
+    async def _audit_propose_candidates(
+        self, *, report_text: str, ground_truth: dict[str, Any],
+        config: CCConfig, cwd: str,
+    ) -> list[dict[str, Any]]:
+        """Run the bounded read-only audit LLM turn → candidate mismatches.
+
+        Seam: tests monkeypatch this to inject canned candidates without an
+        engine/LLM. Returns ``[]`` when no provider is configured (the audit is
+        opt-in enrichment, never required). The bounded wrapper runs the turn on
+        a daemon thread with a hard timeout (never ``ThreadPoolExecutor``).
+        """
+        if self.llm_client_provider is None:
+            logger.info("ccx audit: no llm_client_provider; auditor skipped")
+            return []
+        from .agents.audit_runner import AuditRunner, propose_candidates_bounded
+
+        runner = AuditRunner(
+            cc_config=config, llm_provider=self.llm_client_provider, cwd=cwd,
+            max_tool_rounds=4,
+        )
+        return await asyncio.to_thread(
+            propose_candidates_bounded, runner,
+            report_text=report_text, ground_truth=ground_truth,
+            timeout_s=self._goal_llm_timeout_s,
+        )
 
     async def _maybe_emit_governance_verdict(
         self, request: AgentRunRequest, result: AgentRunResult,

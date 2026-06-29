@@ -105,6 +105,16 @@ class StageRecord:
     status: str = StageStatus.PLANNED.value
     started_at: str | None = None
     closed_at: str | None = None
+    # Repair-loop control-state (autobuild). Persisted so a process killed
+    # mid-stage RESUMES the bounded-repair loop deterministically instead of
+    # cold-restarting it: ``repair_attempts`` is the cumulative attempts
+    # consumed for this stage (the budget continues, it is not silently
+    # refilled every restart), and ``last_failure_detail`` is the previous
+    # verify/close refusal's failing-``[check:]`` evidence to re-feed the next
+    # implement attempt (the Implementer contract). Both default to the
+    # never-attempted state so pre-existing state.json rows load unchanged.
+    repair_attempts: int = 0
+    last_failure_detail: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -116,6 +126,11 @@ class StageRecord:
             status=str(data.get("status") or StageStatus.PLANNED.value),
             started_at=data.get("started_at"),
             closed_at=data.get("closed_at"),
+            repair_attempts=int(data.get("repair_attempts") or 0),
+            last_failure_detail=(
+                str(data["last_failure_detail"])
+                if data.get("last_failure_detail") is not None else None
+            ),
         )
 
 
