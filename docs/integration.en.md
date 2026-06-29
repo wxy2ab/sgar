@@ -2,6 +2,8 @@
 
 This document is not about how to type each command. It is about where `sgar` fits in your system and how to wire it in cleanly.
 
+From the product point of view, the goal is not merely to expose a coding-agent API. The goal is to let each project grow an embedded agent inside the deployment environment, close to real business data, so it can keep doing `auto research`, `self-improving`, and `self-operation` instead of being invoked only once during offline development.
+
 If you only want quick hands-on usage, start with [usage.en.md](./usage.en.md). If you want the full interface inventory, read [api.en.md](./api.en.md).
 
 ## Build the right mental model first
@@ -23,6 +25,12 @@ What exactly are you trying to embed?
 - a code-editing or auto-repair capability
 
 Different answers lead to different integration choices.
+
+If you already know you want a true project-embedded agent, make the target more concrete:
+
+- let the agent see business context, not only repository files
+- let the agent keep running in the deployment environment, not only as a one-shot task
+- let research, improvement, and operation all leave governance state and audit traces
 
 ## Integration scenarios
 
