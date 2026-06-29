@@ -17,6 +17,10 @@
 `sgar` 不只是“调用一次 LLM 写点代码”，而是把代码编辑、状态治理、阶段推进、审计验证和
 运行痕迹组合成一个可长期运行的 agent 模型。
 
+## 架构总览
+
+![sgar / ccx 架构总览](./docs/images/architecture-overview.zh.png)
+
 ## 核心思想
 
 `sgar` 的设计建立在两篇核心文档之上：
