@@ -21,7 +21,13 @@ Drives a multi-stage SGAR project to completion from a project plan
   the spec author opts a criterion into hard gating by adding a check.
 * **Resumable.** State lives on disk under ``.sgar/``; re-running picks up from
   the current state (already-closed stages skipped, a started-but-unclosed
-  stage resumes its repair loop).
+  stage resumes its repair loop). "Resumes" is literal: the repair budget and
+  the last refusal's failing-``[check:]`` evidence are persisted on the stage
+  record, so a process killed mid-stage CONTINUES from the consumed budget with
+  the prior evidence re-fed — it does not cold-restart with a refilled
+  ``max_verify_attempts`` (the cost-amplifier that defeated "bounded repair").
+  A stage that has already exhausted its budget is not silently granted more on
+  re-run; raise ``max_verify_attempts`` to deliberately extend it.
 
 This module has no LLM or task.py dependency — it's pure orchestration over
 ``SgarRuntime`` + a callback, so it is unit-testable with a stub implementer.
@@ -33,9 +39,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .models import CriterionResult, SgarError
+from .models import CriterionResult, SgarError, StageRecord
 from .runtime import SgarRuntime
 from .validation import parse_exit_criteria
+
+
+# Cap on the persisted failure detail so a long, repeatedly-refused stage cannot
+# bloat state.json. The [check:] evidence tail is already bounded in
+# checks.py (~2k chars); this is a belt-and-suspenders ceiling on the whole
+# SgarError text.
+_FAILURE_DETAIL_MAX_CHARS = 2000
 
 
 @dataclass(slots=True)
@@ -153,12 +166,26 @@ def _drive_stage(
         runtime.validate_stage_spec(stage.stage_id).require_ok()
         runtime.start_stage(stage.stage_id)
         log(f"{stage.stage_id}: started")
+        prior_attempts = 0
+        detail: str | None = None
     else:
-        log(f"{stage.stage_id}: resuming current stage")
+        # Resume a started-but-unclosed stage. The repair-loop budget and the
+        # last refusal's evidence live on the stage record (persisted on every
+        # refusal below), so we CONTINUE the loop from where the killed run left
+        # off — the budget is consumed, not silently refilled with a fresh
+        # max_attempts every restart — and re-feed the failing-[check:] detail
+        # the Implementer contract promises (previously both were lost: attempt
+        # reset to 1, detail to None).
+        record = state.stages.get(stage.stage_id)
+        prior_attempts = record.repair_attempts if record else 0
+        detail = record.last_failure_detail if record else None
+        log(
+            f"{stage.stage_id}: resuming current stage "
+            f"(repair attempt {prior_attempts + 1}/{max_attempts})"
+        )
 
     criteria = parse_exit_criteria(stage.spec_text)
-    detail: str | None = None
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(prior_attempts + 1, max_attempts + 1):
         implement(stage, attempt, detail)
         try:
             runtime.record_verification(
@@ -169,14 +196,43 @@ def _drive_stage(
                 ],
             )
             runtime.close_stage(stage.stage_id)
+            # Closed: clear the pending failure evidence (a closed stage has no
+            # outstanding refusal) but keep the attempt count as history.
+            _persist_repair_progress(runtime, stage.stage_id, attempt, None)
             log(f"{stage.stage_id}: closed on attempt {attempt}")
             return StageReport(stage.stage_id, closed=True, attempts=attempt)
         except SgarError as exc:
             detail = str(exc)
+            _persist_repair_progress(runtime, stage.stage_id, attempt, detail)
             log(f"{stage.stage_id}: attempt {attempt} refused: {detail}")
+    # Budget exhausted (this run, or already-exhausted on entry → empty loop).
     return StageReport(
-        stage.stage_id, closed=False, attempts=max_attempts, last_error=detail,
+        stage.stage_id,
+        closed=False,
+        attempts=max(prior_attempts, max_attempts),
+        last_error=detail,
     )
+
+
+def _persist_repair_progress(
+    runtime: SgarRuntime,
+    stage_id: str,
+    attempts: int,
+    detail: str | None,
+) -> None:
+    """Persist the repair-loop control-state (cumulative attempts consumed +
+    last refusal evidence) onto the stage record so a mid-stage process kill
+    resumes deterministically. ``detail=None`` clears the pending evidence (the
+    stage closed). Turnkey autobuild is the single writer of ``.sgar/`` here, so
+    a plain atomic ``write_state`` is sufficient — no CAS needed."""
+    state = runtime.store.load_state()
+    record = state.stages.get(stage_id) or StageRecord(stage_id=stage_id)
+    record.repair_attempts = attempts
+    record.last_failure_detail = (
+        detail[:_FAILURE_DETAIL_MAX_CHARS] if detail is not None else None
+    )
+    state.stages[stage_id] = record
+    runtime.store.write_state(state)
 
 
 __all__ = [

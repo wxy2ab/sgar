@@ -5,6 +5,7 @@ from typing import Any
 
 from .base import BaseTool, ToolCall, ToolResult, ToolSpec, ValidationResult
 from .context import ToolUseContext
+from .todo_store import append_todos
 
 
 @dataclass(slots=True)
@@ -73,6 +74,14 @@ class TodoWriteTool(BaseTool):
         for item in incoming_dicts:
             merged_preview[item["content"]] = item
         merged_todos = list(merged_preview.values())
+
+        # Flush the agent's fine-grained progress to disk immediately so it
+        # survives a process kill mid-drive and can be replayed on resume
+        # (QueryEngine.restore_from_disk). Gated on the same flag as the rest of
+        # session persistence; best-effort, never raises.
+        if ctx.config.persist_sessions:
+            session_dir = ctx.config.session_root_path(ctx.cwd) / ctx.session_id
+            append_todos(session_dir, merged_todos)
 
         return ToolResult(
             tool_use_id=tool_call.tool_use_id,
