@@ -23,7 +23,12 @@ from .models import (
 from .runtime import SgarRuntime, result_to_text
 from .store import SgarStore
 from .missions import mission_staleness
-from .tracing import TRACE_FILENAME, read_failed_trace, read_trace
+from .tracing import (
+    TRACE_FILENAME,
+    fsm_recovery_stats,
+    read_failed_trace,
+    read_trace,
+)
 
 __all__ = [
     "AutobuildReport",
@@ -45,6 +50,7 @@ __all__ = [
     "ValidationResult",
     "VerificationReport",
     "autobuild",
+    "fsm_recovery_stats",
     "mission_staleness",
     "read_failed_trace",
     "read_trace",

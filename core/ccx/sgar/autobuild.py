@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .checks import stop_on_unrunnable_enabled
 from .models import CriterionResult, SgarError, StageRecord
 from .runtime import SgarRuntime
 from .validation import parse_exit_criteria
@@ -49,6 +50,37 @@ from .validation import parse_exit_criteria
 # checks.py (~2k chars); this is a belt-and-suspenders ceiling on the whole
 # SgarError text.
 _FAILURE_DETAIL_MAX_CHARS = 2000
+
+
+# A failing ``[check:]`` whose evidence carries one of these markers did not
+# legitimately fail — it could not EXECUTE (a harness defect: missing binary,
+# timeout, or an unparseable command). These are exactly the signatures
+# ``CheckOutcome.evidence_line()`` emits (see ``sgar/checks.py``) and the basis
+# of the ``check_unrunnable`` predicate the three governed loops act on.
+# autobuild cannot consult that predicate directly: ``record_verification`` /
+# ``close_stage`` SHORT-CIRCUIT and raise the first failing criterion's outcome
+# as a flat ``SgarError`` string, so a sound "every failure is unrunnable"
+# decision is impossible from here without reworking that pinned refusal path.
+# We therefore scan the string and use it ONLY to LABEL the refusal — never to
+# change control flow. The bounded repair budget still does all the stopping.
+_UNRUNNABLE_MARKERS = ("(TIMEOUT)", "(ERROR:", "(exit=127)")
+
+
+def _looks_unrunnable(detail: str | None) -> bool:
+    """Best-effort: does this refusal's text look like an unrunnable ``[check:]``
+    (a harness defect) rather than a candidate that legitimately failed the gate?
+
+    Conservative — mirrors ``checks.check_unrunnable``'s notion over the
+    flattened ``SgarError`` string (the structured ``CheckOutcome`` is not
+    reachable here; see ``_UNRUNNABLE_MARKERS``). A check that ran and exited
+    non-zero for a real reason (e.g. ``exit=1``) is NOT flagged.
+    """
+    if not detail:
+        return False
+    if any(marker in detail for marker in _UNRUNNABLE_MARKERS):
+        return True
+    # rc=2 + "syntax error" in the captured tail == the shell could not parse it.
+    return "(exit=2)" in detail and "syntax error" in detail.lower()
 
 
 @dataclass(slots=True)
@@ -70,6 +102,15 @@ class StageReport:
     closed: bool
     attempts: int
     last_error: str | None = None
+    harness_defect_suspected: bool = False
+    """Advisory, observability-only. Set True only when ``CCX_STOP_ON_UNRUNNABLE``
+    is enabled AND the final refusal looks like an exit-criterion ``[check:]``
+    that could not execute (missing binary / timeout / unparseable) rather than a
+    candidate that legitimately failed the gate. It disambiguates the two SGAR
+    failure modes — a broken/insufficient-fidelity gate vs candidate-family
+    exhaustion — in the report. It does NOT change the repair loop, the budget,
+    or whether the stage closes. Default False ⇒ byte-identical output when the
+    flag is unset."""
 
 
 @dataclass(slots=True)
@@ -128,10 +169,18 @@ def autobuild(
         report = _drive_stage(runtime, stage, implement, max_verify_attempts, log)
         reports.append(report)
         if not report.closed:
+            if report.harness_defect_suspected:
+                reason = (
+                    f"{stage.stage_id} not closed (harness_defect suspected — the "
+                    f"exit-criterion check could not execute, not a candidate "
+                    f"failure): {report.last_error}"
+                )
+            else:
+                reason = f"{stage.stage_id} not closed: {report.last_error}"
             return AutobuildReport(
                 success=False,
                 stages=reports,
-                reason=f"{stage.stage_id} not closed: {report.last_error}",
+                reason=reason,
             )
     return AutobuildReport(success=True, stages=reports, reason="all stages closed")
 
@@ -205,12 +254,23 @@ def _drive_stage(
             detail = str(exc)
             _persist_repair_progress(runtime, stage.stage_id, attempt, detail)
             log(f"{stage.stage_id}: attempt {attempt} refused: {detail}")
+            if stop_on_unrunnable_enabled() and _looks_unrunnable(detail):
+                log(
+                    f"{stage.stage_id}: attempt {attempt} refusal looks like a "
+                    "harness defect (the exit-criterion check could not execute), "
+                    "not a candidate failure — the repair budget cannot fix this"
+                )
     # Budget exhausted (this run, or already-exhausted on entry → empty loop).
+    # Advisory label (opt-in, default off): distinguish a broken gate (harness
+    # defect) from genuine candidate-family exhaustion. Observability only — the
+    # budget above already did the stopping.
+    suspected = stop_on_unrunnable_enabled() and _looks_unrunnable(detail)
     return StageReport(
         stage.stage_id,
         closed=False,
         attempts=max(prior_attempts, max_attempts),
         last_error=detail,
+        harness_defect_suspected=suspected,
     )
 
 
