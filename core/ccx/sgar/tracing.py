@@ -10,7 +10,7 @@ from time import perf_counter
 from typing import Any, Iterator
 from uuid import uuid4
 
-from .models import ProjectState
+from .models import ProjectState, SgarError
 from .store import SgarStore, utc_now
 
 
@@ -177,6 +177,73 @@ def read_failed_trace(store: SgarStore) -> list[dict[str, Any]]:
     return [r for r in read_trace(store) if r.get("status") == "failed"]
 
 
+def fsm_recovery_stats(store: SgarStore) -> dict[str, Any]:
+    """Reduce the append-only trace + persisted state into the SGAR ratchet /
+    recovery metrics the oracle framework names (ratchet *regression rate*,
+    abandon rate, repair rounds), mapped to the agent-governance FSM.
+
+    Pure, read-only, call-on-demand: it opens nothing the runtime does not
+    already write (``trace.jsonl`` + ``state.json``), emits no new event, and
+    persists no new state. Nothing in the runtime calls it — it exists for an
+    operator / dashboard to answer "is this workspace's ratchet actually
+    preventing regression, or is it re-opening / abandoning a lot?" — distinct
+    from the audit finding-ledger's reopen count (that counts defect-family
+    recurrence, not FSM stage recovery).
+
+    Counts only ``status == "completed"`` operations: every op also writes a
+    ``started`` record, so counting completions both avoids double-counting and
+    ignores refusals (``failed``). Returns:
+
+    * ``closes`` / ``reopens`` / ``abandons`` — completed-op counts.
+    * ``regression_rate`` = ``reopens / max(closes, 1)`` — the doc's "ratchet
+      regression rate": fraction of closed stages later re-opened (the ratchet
+      should have held).
+    * ``abandon_rate`` = ``abandons / max(closes + abandons, 1)`` — fraction of
+      terminal stage outcomes that gave up rather than closed.
+    * ``mean_repair_attempts`` — mean ``StageRecord.repair_attempts`` over
+      stages that recorded any (autobuild's bounded-repair rounds-to-outcome);
+      ``0.0`` when none.
+    * ``stages_with_repair_data`` — how many stages backed that mean.
+    """
+    closes = reopens = abandons = 0
+    for record in read_trace(store):
+        if record.get("status") != "completed":
+            continue
+        operation = record.get("operation")
+        if operation == "close_stage":
+            closes += 1
+        elif operation == "reopen_stage":
+            reopens += 1
+        elif operation == "abandon_stage":
+            abandons += 1
+
+    repair_counts: list[int] = []
+    if store.state_path.exists():
+        try:
+            state = store.load_state()
+        except SgarError:
+            # Corrupt/unreadable state.json: the trace counts above are still
+            # valid; degrade the repair metric to "no data" rather than raise.
+            state = None
+        if state is not None:
+            repair_counts = [
+                rec.repair_attempts
+                for rec in state.stages.values()
+                if rec.repair_attempts > 0
+            ]
+
+    mean_repair = sum(repair_counts) / len(repair_counts) if repair_counts else 0.0
+    return {
+        "closes": closes,
+        "reopens": reopens,
+        "abandons": abandons,
+        "regression_rate": reopens / max(closes, 1),
+        "abandon_rate": abandons / max(closes + abandons, 1),
+        "mean_repair_attempts": mean_repair,
+        "stages_with_repair_data": len(repair_counts),
+    }
+
+
 def _state_summary(state: ProjectState) -> dict[str, Any]:
     return {
         "project_name": state.project_name,
@@ -209,4 +276,10 @@ def _relative_to(path: Path, root: Path) -> str:
         return str(path)
 
 
-__all__ = ["TRACE_FILENAME", "SgarTracer", "read_failed_trace", "read_trace"]
+__all__ = [
+    "TRACE_FILENAME",
+    "SgarTracer",
+    "fsm_recovery_stats",
+    "read_failed_trace",
+    "read_trace",
+]
