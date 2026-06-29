@@ -21,6 +21,10 @@ It is simultaneously:
 state governance, staged execution, audit, verification, and persistent traces
 into a long-running agent model.
 
+## Architecture Overview
+
+![sgar / ccx architecture overview](./docs/images/architecture-overview.en.png)
+
 ## Core Ideas
 
 The design of `sgar` is grounded in two core documents:
