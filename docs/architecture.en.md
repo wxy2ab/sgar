@@ -2,6 +2,8 @@
 
 `sgar` is not a single CLI script. It is a layered long-range coding-agent system that combines a product entrypoint, state governance, multi-mode execution, and a lower-level runtime engine. That is what makes automated repair, automated operations, and long-range code editing usable both as a standalone tool and as an embeddable subsystem.
 
+More importantly, `sgar` is not trying to justify one more CLI. It is trying to make it practical for every serious project to own an embedded agent inside the deployment environment. That agent should keep doing `auto research`, `self-improving`, and `self-operation` around real business data, and `sgar` provides the governance scaffold and execution kernel for that role.
+
 ## Architecture Overview
 
 You can think of `sgar` as four layers:

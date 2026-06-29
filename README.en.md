@@ -5,6 +5,11 @@
 `sgar` is an embedded coding agent for automated repair, automated operations,
 and long-range code editing inside your own systems.
 
+We believe nearly every serious project eventually needs an embedded agent, not
+just something invoked once from a developer laptop, but something deployed near
+real business data to keep doing `auto research`, `self-improving`, and
+`self-operation`.
+
 It is simultaneously:
 
 - a skill that gives OpenClaw a stable long-range coding agent
@@ -40,7 +45,8 @@ You can think of `sgar` as one package with three layers:
   convergence directly from the command line
 
 This means `sgar` works both as a standalone tool and as an internal component
-inside your own system.
+inside your own system, eventually growing into an embedded agent inside the
+deployment environment.
 
 ## Advantages
 
@@ -51,8 +57,10 @@ The main advantages of `sgar` are:
    convergence, and long-horizon operation.
 
 2. Modern code editing embedded into your system  
-   You can integrate `sgar` into your own stack so your system gains low-cost
-   self-update, self-repair, and self-maintenance capabilities.
+   You can integrate `sgar` into your own stack and deployment environment so
+   the system keeps doing `auto research`, `self-improving`, and
+   `self-operation` around real business data instead of generating code once
+   in isolation.
 
 3. Audit-based reliable iteration  
    `sgar` treats verification, evidence, traceability, and reviewability as
@@ -368,6 +376,8 @@ print(result.final_text)
 
 - integrate a coding agent into an engineering platform, internal tool, bot, or
   ops workflow
+- give each project an embedded agent in the deployment environment that keeps
+  researching, improving, and operating from business data
 - run a long-range code editing workflow with auditability inside a repository
 - add state governance, staged progress, evidence, and traceability to
   automated repair
