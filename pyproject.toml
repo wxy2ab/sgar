@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sgar"
-version = "0.1.17"
+version = "0.1.18"
 description = "Embedded coding agent for long-range code editing, automated repair, and state-governed operations."
 readme = "README.md"
 requires-python = ">=3.12"
