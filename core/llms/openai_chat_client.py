@@ -1,6 +1,7 @@
 from typing import Iterator, List, Dict, Any, Optional, Union
 from openai import OpenAI
 import json
+import base64
 import httpx
 from ._llm_api_client import LLMApiClient
 from ..utils.config_setting import Config
@@ -9,30 +10,58 @@ from ratelimit import limits, sleep_and_retry
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 
-class MoonShotClient(LLMApiClient):
-    supports_structured_output = True
-    MODEL_CONFIG_KEYS = ("moonshot_model",)
+class OpenAIChatClient(LLMApiClient):
+    """Chat-Completions-based OpenAI client.
 
-    def __init__(self, api_key: str = "", base_url: str = "https://api.moonshot.cn/v1",
-                 # NOTE: intentionally unused — kept only so existing call sites
-                 # that pass max_tokens=... don't break. Do NOT wire this into
-                 # self or into request kwargs; a prior change did that and was
-                 # reverted (see completion_max_tokens below for the real knob).
+    The constructor mirrors :class:`~core.llms.moonshot_client.MoonShotClient`
+    parameter-for-parameter (same names/order/defaults for the first ten
+    args) so this class can later serve as a drop-in replacement / new base
+    class for MoonShotClient and its OpenAI-compatible subclasses
+    (VolcCodingClient, GLMOpenAIClient, PPioOpenAIClient, ...): existing
+    ``super().__init__(api_key, base_url, max_tokens=..., enable_thinking=...)``
+    -style calls keep working without a ``TypeError``. This is a
+    call-signature guarantee, not a promise that every individual
+    parameter's request-time semantics are byte-identical to whatever
+    MoonShotClient does with it internally — e.g. here ``max_tokens`` is
+    wired live into every request (the standard, expected behavior for a
+    ``max_tokens`` constructor arg), which may or may not match
+    MoonShotClient's current internal handling of that same argument.
+    New parameters are appended after ``reasoning_effort``.
+    """
+
+    supports_structured_output = True
+    MODEL_CONFIG_KEYS = ("openai_chat_model", "openai_model")
+    DEFAULT_MODEL = "gpt-5.5"
+
+    def __init__(self, api_key: str = "", base_url: str = "https://api.openai.com/v1",
                  max_tokens: Optional[int] = None, temperature: float = 1, top_p: Optional[float] = None,
-                 presence_penalty: Optional[float] = 0, frequency_penalty: Optional[float] = 0, stop: Optional[Union[str, List[str]]] = None,
-                 enable_thinking: Optional[bool] = None, reasoning_effort: Optional[str] = "high"
+                 presence_penalty: Optional[float] = 0, frequency_penalty: Optional[float] = 0,
+                 stop: Optional[Union[str, List[str]]] = None,
+                 enable_thinking: Optional[bool] = None, reasoning_effort: Optional[str] = "high",
+                 model: Optional[str] = None, verbosity: Optional[str] = None,
+                 parallel_tool_calls: Optional[bool] = None, seed: Optional[int] = None,
+                 service_tier: Optional[str] = None, extra_body: Optional[Dict[str, Any]] = None,
+                 context_window_tokens: Optional[int] = None,
                  ):
         config = Config()
-        if api_key == "" and config.has_key("moonshot_api_key"):
-            api_key = config.get("moonshot_api_key")
-            
+        if api_key == "" and config.has_key("openai_api_key"):
+            api_key = config.get("openai_api_key")
+
         http_client = httpx.Client(
             limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
             timeout=httpx.Timeout(timeout=600.0, connect=60.0, read=600.0, write=120.0)
         )
-            
+
         self.client = OpenAI(
-            api_key=api_key, 
+            # The openai SDK itself raises openai.OpenAIError at construction
+            # time when api_key is falsy and neither OPENAI_API_KEY nor
+            # OPENAI_ADMIN_KEY is set in the environment. Every other client
+            # in this codebase defers a missing/unconfigured key to the first
+            # real API call instead of crashing at construction (e.g.
+            # SimpleDeepSeekClient) — substituting a non-empty placeholder
+            # here preserves that behavior; a genuinely missing key still
+            # fails naturally as a 401 on first use.
+            api_key=api_key or "not-configured",
             base_url=base_url,
             http_client=http_client,
             max_retries=5
@@ -41,12 +70,24 @@ class MoonShotClient(LLMApiClient):
         self.token_count = 0
         self.prompt_token_count = 0
         self.completion_token_count = 0
+        # Cached-prompt / reasoning-token accounting surfaced by the latest
+        # OpenAI usage payloads (usage.prompt_tokens_details.cached_tokens,
+        # usage.completion_tokens_details.reasoning_tokens). Cache hits bill
+        # at a steep discount and reasoning tokens are billed as output but
+        # invisible in the response text, so both are worth tracking
+        # separately — mirrors SimpleDeepSeekClient's accounting.
+        self.cached_prompt_token_count = 0
+        self.reasoning_token_count = 0
+        self.truncated_count = 0
+        self._last_finish_reason: Optional[str] = None
+        self._last_reasoning_content: Optional[str] = None
         self.history = []
-        self._model_list = ["moonshot-v1-128k", "moonshot-v1-8k", "moonshot-v1-32k"]
-        self.model = config.get_with_fallback(
+        self.model = config.resolve_value(
+            model,
             self.MODEL_CONFIG_KEYS,
-            self._model_list[0],
+            self.DEFAULT_MODEL,
         )
+        self.max_tokens = max_tokens
         self.temperature = temperature
         self.top_p = top_p
         self.presence_penalty = presence_penalty
@@ -54,15 +95,21 @@ class MoonShotClient(LLMApiClient):
         self.stop = stop
         self.enable_thinking = enable_thinking
         self.reasoning_effort = reasoning_effort
+        self.verbosity = verbosity
+        self.parallel_tool_calls = parallel_tool_calls
+        self.seed = seed
+        self.service_tier = service_tier
+        self.extra_body = dict(extra_body) if extra_body else {}
         self._response_format: Optional[Dict[str, Any]] = None
-        # The actual output-token cap sent to the API as `max_tokens` in the
-        # request body — distinct from the dead `max_tokens` ctor param above.
-        # None (default) sends no cap, matching pre-existing behavior for every
-        # client that doesn't set this. A reasoning-enabled subclass whose
-        # provider's implicit completion budget is too small for the hidden
-        # reasoning trace (thinking can otherwise consume the entire budget,
-        # leaving 0 tokens for the visible answer) should set this explicitly.
-        self.completion_max_tokens: Optional[int] = None
+        # Total context window (tokens) — cc's query_loop reads this via
+        # getattr(llm_client, "context_window_tokens", None) to drive
+        # token-budget-aware conversation compaction instead of a fixed
+        # message-count trim (see query_loop.py's _COMPACT_TRIGGER_RATIO).
+        # That mechanism was written against SimpleDeepSeekClient (which sets
+        # this unconditionally) but is client-agnostic by design; None here
+        # (the default, matching every subclass that doesn't pass it) falls
+        # back to the legacy message-count trim, so this is purely additive.
+        self.context_window_tokens = context_window_tokens
 
     def set_system_message(self, system_message: str = "你是一个智能助手,擅长把复杂问题清晰明白通俗易懂地解答出来"):
         self.history = [{"role": "system", "content": system_message}]
@@ -95,8 +142,51 @@ class MoonShotClient(LLMApiClient):
         if is_stream:
             return self._unified_tool_stream(self.history, tools, function_module)
         else:
-            response = self._create_chat_completion(self.history, is_stream, tools)
+            response = self._create_chat_completion(self.history, is_stream, tools, raw_response=True)
             return self._process_tool_response(response, tools, function_module)
+
+    def image_chat(self, message: str, image_path_or_url: str, is_stream: bool = False) -> Union[str, Iterator[str]]:
+        if not self.history:
+            self.set_system_message()
+
+        if image_path_or_url.startswith("http://") or image_path_or_url.startswith("https://"):
+            image_content = {"type": "image_url", "image_url": {"url": image_path_or_url}}
+        else:
+            image_content = {"type": "image_url", "image_url": {"url": self._encode_image_to_base64(image_path_or_url)}}
+
+        self.history.append({
+            "role": "user",
+            "content": [{"type": "text", "text": message}, image_content],
+        })
+        return self._create_chat_completion(self.history, is_stream)
+
+    def audio_chat(self, message: str, audio_path: str, is_stream: bool = False) -> Union[str, Iterator[str]]:
+        if not self.history:
+            self.set_system_message()
+
+        lower_path = audio_path.lower()
+        audio_format = "mp3" if lower_path.endswith(".mp3") else "wav"
+        with open(audio_path, "rb") as audio_file:
+            audio_b64 = base64.b64encode(audio_file.read()).decode("utf-8")
+
+        self.history.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": message},
+                {"type": "input_audio", "input_audio": {"data": audio_b64, "format": audio_format}},
+            ],
+        })
+        return self._create_chat_completion(self.history, is_stream)
+
+    def video_chat(self, message: str, video_path: str) -> str:
+        raise NotImplementedError("OpenAI Chat Completions API does not support video input.")
+
+    def _encode_image_to_base64(self, image_path: str) -> str:
+        ext = image_path.rsplit(".", 1)[-1].lower() if "." in image_path else "jpeg"
+        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif", "webp": "webp"}.get(ext, "jpeg")
+        with open(image_path, "rb") as image_file:
+            base64_image = base64.b64encode(image_file.read()).decode("utf-8")
+            return f"data:image/{mime};base64,{base64_image}"
 
     def _unified_tool_stream(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]], function_module: Any) -> Iterator[str]:
         try:
@@ -131,13 +221,13 @@ class MoonShotClient(LLMApiClient):
                     result = f"工具 {tool_output['tool_call_id']} 返回结果: {tool_output['content']}"
                     tool_results.append(result)
                     yield result + "\n"
-                
+
                 tool_result_message = "\n".join(tool_results)
                 messages.append({"role": "assistant", "content": f"{full_response}\n\n工具调用结果:\n{tool_result_message}"})
-                
+
                 explanation_request = "请解释上述工具调用的结果，并提供一个简洁明了的回答。"
                 messages.append({"role": "user", "content": explanation_request})
-                
+
                 explanation_stream = self._create_chat_completion(messages, True, tools, raw_response=True)
                 for chunk in explanation_stream:
                     if isinstance(chunk, str):
@@ -166,15 +256,16 @@ class MoonShotClient(LLMApiClient):
         }
         if is_stream:
             kwargs["stream_options"] = {"include_usage": True}
-        if self.completion_max_tokens is not None:
-            kwargs["max_tokens"] = self.completion_max_tokens
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
 
-        # 构建 extra_body
-        extra_body = {}
+        extra_body = dict(self.extra_body) if self.extra_body else {}
         if self.enable_thinking is not None:
             extra_body["enable_thinking"] = self.enable_thinking
         if self.reasoning_effort is not None:
             kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.verbosity is not None:
+            kwargs["verbosity"] = self.verbosity
 
         if extra_body:
             kwargs["extra_body"] = extra_body
@@ -187,13 +278,18 @@ class MoonShotClient(LLMApiClient):
             kwargs["frequency_penalty"] = self.frequency_penalty
         if self.stop is not None:
             kwargs["stop"] = self.stop
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        if self.service_tier is not None:
+            kwargs["service_tier"] = self.service_tier
         if tools:
             kwargs["tools"] = tools
+            if self.parallel_tool_calls is not None:
+                kwargs["parallel_tool_calls"] = self.parallel_tool_calls
         # Skip JSON mode when tools are present: OpenAI-compatible APIs treat
         # the tools + response_format={"type":"json_object"} combination as
         # ambiguous (tool_calls may not respect the JSON envelope; structured
-        # outputs can conflict with tool schemas). See
-        # core/ccx/docs/role_based_llm_routing.md §7.
+        # outputs can conflict with tool schemas). Mirrors MoonShotClient.
         if self._response_format and not tools:
             kwargs["response_format"] = self._response_format
 
@@ -205,19 +301,25 @@ class MoonShotClient(LLMApiClient):
                 return completion
             if not completion.choices:
                 raise RuntimeError("LLM API returned empty choices")
-            response = completion.choices[0].message.content
+            choice = completion.choices[0]
+            self._last_finish_reason = getattr(choice, "finish_reason", None)
+            if self._last_finish_reason == "length":
+                self.truncated_count += 1
+            self._last_reasoning_content = getattr(choice.message, "reasoning_content", None)
+            response = choice.message.content
             self._update_stats(completion.usage)
             return response
 
     @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
     def tool_invoke(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Unlike one_chat (above), this had no retry at all until this decorator
-        # was added: a single transient httpx.RemoteProtocolError / APIConnectionError
-        # (observed against the Volc coding endpoint — a long silent "thinking" gap
-        # on this stream=False request gets idle-closed by an intermediary proxy,
-        # the same root cause already diagnosed for DeepSeek reasoning clients
-        # elsewhere in this project) used to burn an entire ccx doc-mode
-        # investigator dimension's tool-call budget for one bad connection.
+        # Unlike one_chat (above), this had no retry until this decorator was
+        # added: a single transient httpx.RemoteProtocolError / APIConnectionError
+        # (observed against the Volc coding endpoint — a long silent "thinking"
+        # gap on this stream=False request can get idle-closed by an
+        # intermediary proxy, the same root cause already diagnosed for
+        # DeepSeek reasoning clients elsewhere in this project) used to burn an
+        # entire ccx doc-mode investigator dimension's tool-call budget for one
+        # bad connection. Mirrors the identical fix in MoonShotClient.tool_invoke.
         kwargs = {
             "model": self.model,
             "messages": messages,
@@ -226,13 +328,15 @@ class MoonShotClient(LLMApiClient):
             "timeout": 600,
             "tools": tools,
         }
-        if self.completion_max_tokens is not None:
-            kwargs["max_tokens"] = self.completion_max_tokens
-        extra_body = {}
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+        extra_body = dict(self.extra_body) if self.extra_body else {}
         if self.enable_thinking is not None:
             extra_body["enable_thinking"] = self.enable_thinking
         if self.reasoning_effort is not None:
             kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.verbosity is not None:
+            kwargs["verbosity"] = self.verbosity
         if extra_body:
             kwargs["extra_body"] = extra_body
         if self.top_p is not None:
@@ -243,6 +347,12 @@ class MoonShotClient(LLMApiClient):
             kwargs["frequency_penalty"] = self.frequency_penalty
         if self.stop is not None:
             kwargs["stop"] = self.stop
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        if self.service_tier is not None:
+            kwargs["service_tier"] = self.service_tier
+        if self.parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = self.parallel_tool_calls
         # No response_format on tool paths — see _create_chat_completion gate
         # for rationale.
 
@@ -280,6 +390,7 @@ class MoonShotClient(LLMApiClient):
 
     def _process_stream(self, stream) -> Iterator[str]:
         full_response = ""
+        reasoning_response = ""
         usage_updated = False
         for chunk in stream:
             usage = getattr(chunk, 'usage', None)
@@ -288,9 +399,14 @@ class MoonShotClient(LLMApiClient):
                 usage_updated = True
             if hasattr(chunk, 'choices') and chunk.choices:
                 delta = chunk.choices[0].delta
+                reasoning_delta = getattr(delta, 'reasoning_content', None)
+                if reasoning_delta:
+                    reasoning_response += reasoning_delta
                 if hasattr(delta, 'content') and delta.content:
                     full_response += delta.content
                     yield delta.content
+        if reasoning_response:
+            self._last_reasoning_content = reasoning_response
         if not usage_updated:
             self._update_stats(None)
         self.history.append({"role": "assistant", "content": full_response})
@@ -336,6 +452,8 @@ class MoonShotClient(LLMApiClient):
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
         }
         if usage is None:
             return normalized_usage
@@ -349,7 +467,7 @@ class MoonShotClient(LLMApiClient):
                 "total_tokens": getattr(usage, "total_tokens", 0),
             }
 
-        for key in normalized_usage:
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             value = usage.get(key, 0) if isinstance(usage, dict) else 0
             try:
                 normalized_usage[key] = int(value or 0)
@@ -362,6 +480,20 @@ class MoonShotClient(LLMApiClient):
                 normalized_usage["completion_tokens"]
             )
 
+        prompt_details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else None
+        if isinstance(prompt_details, dict):
+            try:
+                normalized_usage["cached_tokens"] = int(prompt_details.get("cached_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
+        completion_details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+        if isinstance(completion_details, dict):
+            try:
+                normalized_usage["reasoning_tokens"] = int(completion_details.get("reasoning_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
         return normalized_usage
 
     def _update_stats(self, usage: Any):
@@ -370,6 +502,8 @@ class MoonShotClient(LLMApiClient):
         self.prompt_token_count += usage_counts["prompt_tokens"]
         self.completion_token_count += usage_counts["completion_tokens"]
         self.token_count += usage_counts["total_tokens"]
+        self.cached_prompt_token_count += usage_counts["cached_tokens"]
+        self.reasoning_token_count += usage_counts["reasoning_tokens"]
 
     def get_stats(self) -> Dict[str, Any]:
         return {
@@ -377,16 +511,10 @@ class MoonShotClient(LLMApiClient):
             "total_tokens": self.token_count,
             "prompt_tokens": self.prompt_token_count,
             "completion_tokens": self.completion_token_count,
+            "cached_prompt_tokens": self.cached_prompt_token_count,
+            "reasoning_tokens": self.reasoning_token_count,
+            "truncated_count": self.truncated_count,
         }
 
     def clear_chat(self) -> None:
         self.history = []
-
-    def image_chat(self, message: str, image_path: str) -> str:
-        raise NotImplementedError("MoonShot API does not support image chat.")
-
-    def audio_chat(self, message: str, audio_path: str) -> str:
-        raise NotImplementedError("MoonShot API does not support audio chat.")
-
-    def video_chat(self, message: str, video_path: str) -> str:
-        raise NotImplementedError("MoonShot API does not support video chat.")

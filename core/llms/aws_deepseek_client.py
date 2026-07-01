@@ -1,4 +1,4 @@
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
@@ -6,13 +6,13 @@ class AWSDeepSeekClient(LLMApiClient):
     pass
 
 
-class AWSDeepSeekClient(MoonShotClient):
+class AWSDeepSeekClient(OpenAIChatClient):
     def __init__(self, model: str = ""):
         base_url = "https://api.siliconflow.cn/v1"
         config = Config()
 
         api_key = config.get("aws_sf_key")
-        super().__init__(api_key, base_url, max_tokens=8192)
+        super().__init__(api_key, base_url, max_tokens=None)
         self.model = config.resolve_value(
             model,
             ("aws_deepseek_client_model",),

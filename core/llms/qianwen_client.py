@@ -61,14 +61,21 @@ class QianWenClient(LLMApiClient):
             else:
                 self.history.pop()
                 self.logger.error(f"Error: Failed to get response from the model. {response.code} - {response.message}")
-                raise "Error: Failed to get response from the model."
+                raise RuntimeError("Error: Failed to get response from the model.")
 
     @sleep_and_retry
     @limits(calls=20, period=1)
     @retry(stop=stop_after_attempt(12), wait=wait_fixed(5))
-    def one_chat(self, message: str, is_stream: bool = False) -> Union[str, Iterator[str]]:
-        messages = self.history.copy()
-        messages.append({'role': 'user', 'content': message})
+    def one_chat(self, message: Union[str, List[Union[str, Any]]], is_stream: bool = False) -> Union[str, Iterator[str]]:
+        if isinstance(message, str):
+            messages = self.history.copy()
+            messages.append({'role': 'user', 'content': message})
+        else:
+            # cc/ccx-style [{"role":..., "content":...}, ...] messages list
+            # (e.g. core/ccx/sgar/cli.py's _default_llm_callable) — use it
+            # directly as the turn sequence instead of nesting the whole
+            # list into a single user turn's content.
+            messages = list(message)
         if is_stream:
             return self._stream_response(messages)
         else:
@@ -78,7 +85,7 @@ class QianWenClient(LLMApiClient):
                 return assistant_message['content']
             else:
                 self.logger.error(f"Error: Failed to get response from the model. {response.code} - {response.message}")
-                raise "Error: Failed to get response from the model."
+                raise RuntimeError("Error: Failed to get response from the model.")
 
     def tool_chat(self, user_message: str, tools: List[Dict[str, Any]], function_module: Any, is_stream: bool = False) -> Union[str, Iterator[str]]:
         self.history.append({"role": "user", "content": user_message})

@@ -161,30 +161,48 @@ class ClaudeAwsClient(LLMApiClient):
             self._update_usage_stats(response)
             return assistant_message
 
+    def _split_system_from_messages(self, messages: List[Dict[str, Any]]) -> "tuple[Optional[str], List[Dict[str, Any]]]":
+        """Anthropic's Messages API does not accept role="system" inside
+        `messages` — the system prompt is a separate top-level `system`
+        param. Pull any such entries out instead of forwarding them as-is
+        (mirrors ClaudeClient._split_system_from_messages)."""
+        system_parts = []
+        remaining = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content")
+                system_parts.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+            else:
+                remaining.append(msg)
+        combined = "\n\n".join(part for part in system_parts if part)
+        return (combined or None), remaining
+
     def one_chat(self,
                  message: Union[str, List[Union[str, Any]]],
                  max_tokens: Optional[ int] = None,
                  is_stream: bool = False) -> Union[str, Iterator[str]]:
-        msg = None
+        system_param = None
         if isinstance(message, list):
-            msg = message
+            system_param, msg = self._split_system_from_messages(message)
         else:
             msg = [{"role": "user", "content": message}]
 
         if is_stream:
-            return self._stream_one_response(msg, max_tokens)
+            return self._stream_one_response(msg, max_tokens, system=system_param)
         else:
 
             @retry(3)
             def send_message():
-                response = self.client.messages.create(model=self.model,
-                                                       messages=msg,
-                                            max_tokens=max_tokens or self.max_tokens,
-                                            temperature=self.temperature,
-                                            top_p=self.top_p,
-                                            top_k=self.top_k,
-                                            stop_sequences=self.stop_sequences
-                                                       )
+                kwargs = dict(model=self.model,
+                               messages=msg,
+                               max_tokens=max_tokens or self.max_tokens,
+                               temperature=self.temperature,
+                               top_p=self.top_p,
+                               top_k=self.top_k,
+                               stop_sequences=self.stop_sequences)
+                if system_param:
+                    kwargs["system"] = system_param
+                response = self.client.messages.create(**kwargs)
                 return response
 
             response = send_message()
@@ -194,15 +212,19 @@ class ClaudeAwsClient(LLMApiClient):
             return assistant_message
 
     def _stream_one_response(self, msg: List[Dict[str, str]],
-                             max_tokens: int) -> Generator[str, None, None]:
-        response = self.client.messages.create(model=self.model,
-                                               messages=msg,
-                                            max_tokens=max_tokens or self.max_tokens,
-                                            temperature=self.temperature,
-                                            top_p=self.top_p,
-                                            top_k=self.top_k,
-                                            stop_sequences=self.stop_sequences,
-                                               stream=True)
+                             max_tokens: int,
+                             system: Optional[str] = None) -> Generator[str, None, None]:
+        kwargs = dict(model=self.model,
+                       messages=msg,
+                       max_tokens=max_tokens or self.max_tokens,
+                       temperature=self.temperature,
+                       top_p=self.top_p,
+                       top_k=self.top_k,
+                       stop_sequences=self.stop_sequences,
+                       stream=True)
+        if system:
+            kwargs["system"] = system
+        response = self.client.messages.create(**kwargs)
         for event in response:
             if isinstance(event, ContentBlockDeltaEvent) and event.delta.text:
                 yield event.delta.text

@@ -1,5 +1,5 @@
 
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
@@ -9,7 +9,7 @@ class KimiClient(LLMApiClient):
     pass
 
 
-class KimiClient(MoonShotClient):
+class KimiClient(OpenAIChatClient):
     def __init__(self, model: str = "", thinking: bool = True):
         base_url = "https://api.moonshot.cn/v1"
         config = Config()

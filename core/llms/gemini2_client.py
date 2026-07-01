@@ -9,7 +9,6 @@ from PIL import Image
 import queue
 import threading
 
-from ratelimit import ratelimit, sleep_and_retry
 from ..utils.log import logger as logging
 from ..utils.handle_max_tokens import handle_max_tokens
 from ..utils.config_setting import Config
@@ -115,6 +114,22 @@ class Gemini2Client(LLMApiClient ):
                     return self._create_stream_iterator(response)
                 else:
                     response = temp_model.generate_content(message)
+                    return response.text
+            elif isinstance(message, list) and message and all(
+                isinstance(part, dict) and "role" in part and "content" in part
+                for part in message
+            ):
+                # cc/ccx-style [{"role": ..., "content": ...}, ...] chat
+                # messages (e.g. core/ccx/sgar/cli.py's _default_llm_callable)
+                # rather than a Gemini multimodal parts list — this SDK has no
+                # separate system-role concept for generate_content, so flatten
+                # into one text prompt via the base class's message merger.
+                prompt_text = self._messages_to_prompt(message)
+                if is_stream:
+                    response = temp_model.generate_content(prompt_text, stream=True)
+                    return self._create_stream_iterator(response)
+                else:
+                    response = temp_model.generate_content(prompt_text)
                     return response.text
             elif isinstance(message, list):
                 # Process list of content (text, images, etc.)

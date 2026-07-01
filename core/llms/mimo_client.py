@@ -1,11 +1,11 @@
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
 class MimoClient(LLMApiClient):
     pass
 
-class MimoClient(MoonShotClient):
+class MimoClient(OpenAIChatClient):
     def __init__(self, model: str = ""):
         base_url = "https://token-plan-cn.xiaomimimo.com/v1"
         config = Config()

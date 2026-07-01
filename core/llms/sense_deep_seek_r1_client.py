@@ -1,4 +1,4 @@
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
@@ -8,7 +8,7 @@ class SenseDeepSeekR1Client(LLMApiClient):
 
 
 
-class SenseDeepSeekR1Client(MoonShotClient):
+class SenseDeepSeekR1Client(OpenAIChatClient):
     def __init__(self, model: str = ""):
         base_url = "https://api.sensenova.cn/compatible-mode/v1/"
 
@@ -16,7 +16,7 @@ class SenseDeepSeekR1Client(MoonShotClient):
         config = Config()
 
         api_key = config.get("sense_api_key")
-        super().__init__(api_key, base_url, max_tokens=8196,presence_penalty=None,frequency_penalty=None,top_p=None)
+        super().__init__(api_key, base_url, max_tokens=None,presence_penalty=None,frequency_penalty=None,top_p=None)
         self.model = config.resolve_value(
             model,
             ("sense_deep_seek_r1_client_model",),

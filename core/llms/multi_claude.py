@@ -184,11 +184,32 @@ class MultiRegionClaudeClient(LLMApiClient):
             self.history.append({"role": "assistant", "content": assistant_message})
             return assistant_message
 
+    def _split_system_from_messages(self, messages: List[Dict[str, Any]]) -> "tuple[Optional[str], List[Dict[str, Any]]]":
+        """Anthropic's Messages API does not accept role="system" inside
+        `messages` — the system prompt is a separate top-level `system`
+        param. Pull any such entries out instead of forwarding them as-is
+        (mirrors ClaudeClient._split_system_from_messages)."""
+        system_parts = []
+        remaining = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content")
+                system_parts.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+            else:
+                remaining.append(msg)
+        combined = "\n\n".join(part for part in system_parts if part)
+        return (combined or None), remaining
+
     @retry(retry=retry_if_exception(Exception),wait=wait_fixed(5),stop=stop_after_attempt(3) )
     def one_chat(self, message: Union[str, List[Union[str, Any]]], max_tokens: Optional[int] = None, is_stream: bool = False) -> Union[str, Iterator[str]]:
         client, region = self.client_pool.get_available_client()
-        messages = [{"role": "user", "content": message}] if isinstance(message, str) else message
-        
+        if isinstance(message, str):
+            messages = [{"role": "user", "content": message}]
+            system_param = self.system_message
+        else:
+            system_override, messages = self._split_system_from_messages(message)
+            system_param = system_override or self.system_message
+
         response = client.messages.create(
             model=self.model,
             max_tokens=max_tokens or self.max_tokens,
@@ -198,7 +219,7 @@ class MultiRegionClaudeClient(LLMApiClient):
             top_p=self.top_p,
             top_k=self.top_k,
             stop_sequences=self.stop_sequences,
-            system=self.system_message
+            system=system_param
         )
 
         self._update_stats(response, region)
@@ -453,6 +474,12 @@ class MultiRegionClaudeClient(LLMApiClient):
 
     def clear_chat(self) -> None:
         self.history.clear()
+
+    def audio_chat(self, message: str, audio_path: str) -> str:
+        raise NotImplementedError("Audio chat is not supported in this version of Claude API client.")
+
+    def video_chat(self, message: str, video_path: str) -> str:
+        raise NotImplementedError("Video chat is not supported in this version of Claude API client.")
 
     @property
     def stop(self):
