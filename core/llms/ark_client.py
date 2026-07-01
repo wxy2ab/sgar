@@ -1,11 +1,11 @@
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
 class ArkClient(LLMApiClient):
     pass
 
-class ArkClient(MoonShotClient):
+class ArkClient(OpenAIChatClient):
     def __init__(self, model: str = ""):
         base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
         config = Config()

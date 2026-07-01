@@ -1,5 +1,5 @@
 
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
@@ -9,7 +9,7 @@ class MiClient(LLMApiClient):
     pass
 
 
-class MiClient(MoonShotClient):
+class MiClient(OpenAIChatClient):
     def __init__(self, model: str = "",thinking: bool = True):
         base_url = "https://api.xiaomimimo.com/v1/chat/completions"
         config = Config()

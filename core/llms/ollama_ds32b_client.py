@@ -1,4 +1,4 @@
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
@@ -7,7 +7,7 @@ class OllamaDS32bClient(LLMApiClient):
 
 
 
-class OllamaDS32bClient(MoonShotClient):
+class OllamaDS32bClient(OpenAIChatClient):
     def __init__(self, model: str = ""):
         
         config = Config()
@@ -15,7 +15,7 @@ class OllamaDS32bClient(MoonShotClient):
         ollama_url = config.get("ollama_url")
         base_url = ollama_url
         api_key='ollama'
-        super().__init__(api_key, base_url, max_tokens=8196)
+        super().__init__(api_key, base_url, max_tokens=None)
         self.model = config.resolve_value(
             model,
             ("ollama_ds32b_client_model",),

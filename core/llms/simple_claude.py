@@ -324,10 +324,31 @@ class SimpleClaudeAwsClient(LLMApiClient):
             return f"*首轮消息：*{assistant_message}\n*使用工具：*{[tool_call.function.name for tool_call in tool_calls]}\n*最终结果：*{final_assistant_message}"
         else:
             return assistant_message
-    @rate_limit(20)    
+    def _split_system_from_messages(self, messages: List[Dict[str, Any]]) -> "tuple[Optional[str], List[Dict[str, Any]]]":
+        """Anthropic's Messages API does not accept role="system" inside
+        `messages` — the system prompt is a separate top-level `system`
+        param. Pull any such entries out instead of forwarding them as-is
+        (mirrors ClaudeClient._split_system_from_messages)."""
+        system_parts = []
+        remaining = []
+        for msg in messages:
+            if msg.get("role") == "system":
+                content = msg.get("content")
+                system_parts.append(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+            else:
+                remaining.append(msg)
+        combined = "\n\n".join(part for part in system_parts if part)
+        return (combined or None), remaining
+
+    @rate_limit(20)
     @retry(retry=retry_if_exception(Exception),wait=wait_fixed(10),stop=stop_after_attempt(3) )
     def one_chat(self, message: Union[str, List[Union[str, Any]]], max_tokens: Optional[ int ]= None, is_stream: bool = False) -> Union[str, Iterator[str]]:
-        messages = [{"role": "user", "content": message}] if isinstance(message, str) else message
+        if isinstance(message, str):
+            messages = [{"role": "user", "content": message}]
+            system_param = self.system_message
+        else:
+            system_override, messages = self._split_system_from_messages(message)
+            system_param = system_override or self.system_message
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens or self.max_tokens,
@@ -337,7 +358,7 @@ class SimpleClaudeAwsClient(LLMApiClient):
             top_p=self.top_p,
             top_k=self.top_k,
             stop_sequences=self.stop_sequences,
-            system=self.system_message  # 添加system prompt
+            system=system_param  # 添加system prompt
         )
 
         self._update_stats(response)

@@ -194,9 +194,24 @@ class HunyuanClient(LLMApiClient):
         self.history = []
         
         try:
+            if isinstance(message, str):
+                normalized_messages = [{"Role": "user", "Content": message}]
+            else:
+                # Tencent's Message model deserializes exact-case "Role"/
+                # "Content" keys only (see tool_invoke's identical
+                # normalization above); a cc/ccx-style lowercase
+                # {"role":..., "content":...} list would otherwise silently
+                # deserialize to Role=None/Content=None.
+                normalized_messages = [
+                    {
+                        "Role": item.get("Role") or item.get("role", "user"),
+                        "Content": item.get("Content") or item.get("content", ""),
+                    }
+                    for item in message
+                ]
             req = models.ChatCompletionsRequest()
             params = {
-                "Messages": [{"Role": "user", "Content": message}] if isinstance(message, str) else message,
+                "Messages": normalized_messages,
                 "Stream": is_stream,
                 "Model": self.model
             }

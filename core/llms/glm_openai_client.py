@@ -1,4 +1,4 @@
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
@@ -7,7 +7,7 @@ class GLMOpenAIClient(LLMApiClient):
     pass
 
 
-class GLMOpenAIClient(MoonShotClient):
+class GLMOpenAIClient(OpenAIChatClient):
     def __init__(self, model: str = ""):
         base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
         config = Config()

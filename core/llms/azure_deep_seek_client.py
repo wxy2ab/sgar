@@ -16,10 +16,9 @@ class AzureDeepSeekClient(LLMApiClient):
     def __init__(self):
         # 获取API密钥并初始化Azure客户端
         config = Config()
-        api_key = config.get("AZURE_DEEPSEEK_API_KEY")
-        if not api_key:
-            raise Exception("A key should be provided to invoke the endpoint")
-        
+        # 与本文件其它客户端保持一致：缺失的 key 不在构造时报错，而是留到
+        # 真正调用时让请求自然失败（AzureKeyCredential 接受空字符串）。
+        api_key = config.get("AZURE_DEEPSEEK_API_KEY") or ""
 
         self.client = ChatCompletionsClient(
             endpoint='https://DeepSeek-R1-wxy2ab.eastus.models.ai.azure.com',
@@ -36,35 +35,50 @@ class AzureDeepSeekClient(LLMApiClient):
 
 
 
+    def _to_azure_messages(self, message: Union[str, List[Union[str, Any]]]) -> List[Any]:
+        if isinstance(message, str):
+            return [UserMessage(content=message)]
+        azure_messages = []
+        for item in message:
+            if isinstance(item, dict):
+                role = item.get("role", "user")
+                content = item.get("content", "")
+                if role == "system":
+                    azure_messages.append(SystemMessage(content=content))
+                elif role == "assistant":
+                    azure_messages.append(AssistantMessage(content=content))
+                else:
+                    azure_messages.append(UserMessage(content=content))
+            else:
+                azure_messages.append(UserMessage(content=item))
+        return azure_messages
+
+    def _iterate_stream(self, response) -> Iterator[str]:
+        for update in response:
+            if update.choices:
+                content = update.choices[0].delta.content
+                if content:
+                    yield content
+
     def one_chat(self, message: Union[str, List[Union[str, Any]]], is_stream: bool = False) -> Union[str, Iterator[str]]:
-        """执行单次聊天交互，不记录聊天历史"""
-        # 构建用户消息
-        self.history.append(UserMessage(content=message))
-        
-        # 准备请求体
-        payload = {
-            "messages": self.history,
-            "max_tokens": self.max_tokens,
-            "model": self.model_name
-        }
-        
+        """执行单次聊天交互，不使用或存储聊天历史记录。"""
+        request_messages = self._to_azure_messages(message)
+
         if is_stream:
-            # 流式响应
             response = self.client.complete(
-                stream=True, 
-                messages=self.history, 
-                max_tokens=self.max_tokens, 
+                stream=True,
+                messages=request_messages,
+                max_tokens=self.max_tokens,
                 model=self.model_name
             )
-
-            # 处理流式响应并返回每段内容
-            for update in response:
-                if update.choices:
-                    print(update.choices[0].delta.content or "", end="")
+            return self._iterate_stream(response)
         else:
-            # 非流式响应，返回完整结果
-            response = self.client.complete(payload)
-            print(response.choices[0].message.content)
+            response = self.client.complete(
+                messages=request_messages,
+                max_tokens=self.max_tokens,
+                model=self.model_name
+            )
+            return response.choices[0].message.content
 
 
     def text_chat(self, message: str, is_stream: bool = False) -> Union[str, Iterator[str]]:

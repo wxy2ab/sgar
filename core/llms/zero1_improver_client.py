@@ -1,12 +1,12 @@
 
-from .moonshot_client import MoonShotClient
+from .openai_chat_client import OpenAIChatClient
 from ..utils.config_setting import Config
 from ._llm_api_client import LLMApiClient
 
 class Zero1LLamaImproverClient(LLMApiClient):
     pass
 
-class Zero1LLamaImproverClient(MoonShotClient):
+class Zero1LLamaImproverClient(OpenAIChatClient):
     DEFAULT_MODEL = "yi-lightning"
 
     def __init__(self, model: str = ""):
