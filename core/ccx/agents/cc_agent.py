@@ -689,6 +689,11 @@ class CcAgentRunner(ModeRunner):
     # alongside ordinary spawn modes (they are exempt by default). Only takes
     # effect on mixed turns that also enqueue spawn modes — see CcxUnifiedTool.
     count_research_in_fanout: bool = False
+    # When True, refuse an ordinary-spawn entry whose obligation — (mode,
+    # normalized-goal, contract [check:] set) — repeats one already queued this
+    # turn (redundant lateral re-spawn). Default OFF ⇒ byte-identical. Enforced
+    # inside CcxUnifiedTool; scoped to a single turn's spawn_buffer.
+    dedup_spawns: bool = False
     spawn_buffer: Any | None = None  # see ccx_spawn_tool
     research_buffer: Any | None = None  # see ccx_research_tool
     sgar_buffer: Any | None = None  # see ccx_sgar_tool
@@ -873,6 +878,7 @@ class CcAgentRunner(ModeRunner):
                     spawn_unavailable_reason=spawn_refusal_reason,
                     max_fanout=self.max_spawn_fanout,
                     count_research_in_fanout=self.count_research_in_fanout,
+                    dedup_spawns=self.dedup_spawns,
                 )
             )
             # Register the legacy ``ccx_research`` and ``ccx_sgar`` wire

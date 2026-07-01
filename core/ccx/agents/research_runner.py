@@ -138,6 +138,28 @@ confidence="low", and explain in `limits`.
 """
 
 
+#: Optional stance directives (deliberation mode). Default behaviour (no stance)
+#: is byte-equivalent neutral research — the directive is only appended when a
+#: caller sets ``ResearchRunner.stance``. The stance steers WHICH direction the
+#: worker hunts for grounded evidence; it never relaxes the "cite only real code,
+#: do not fabricate" rules above.
+_STANCE_DIRECTIVES: dict[str, str] = {
+    "support": (
+        "DELIBERATION STANCE — SUPPORT: hunt for the STRONGEST real evidence "
+        "that SUPPORTS the claim (answers 'yes'). Cite only real code; never "
+        "fabricate. If you genuinely find no supporting evidence, say so and set "
+        "confidence='low' with an empty evidence list — do not invent support."
+    ),
+    "refute": (
+        "DELIBERATION STANCE — REFUTE: hunt for the STRONGEST real evidence that "
+        "REFUTES / contradicts the claim (answers 'no'). Cite only real code; "
+        "never fabricate. If you genuinely find no refuting evidence, say so and "
+        "set confidence='low' with an empty evidence list — do not invent "
+        "objections."
+    ),
+}
+
+
 def _restrict_tool_registry(engine: Any) -> int:
     """Back-compat shim around ``restrict_tool_registry``.
 
@@ -218,6 +240,10 @@ class ResearchRunner(ModeRunner):
     cwd: str
     max_tool_rounds: int | None = None
     mode_name: str = "research"
+    stance: str | None = None
+    """Optional deliberation stance (``"support"`` / ``"refute"``). ``None``
+    (default) ⇒ neutral research, byte-equivalent to the pre-deliberation
+    behaviour. See ``_STANCE_DIRECTIVES``."""
 
     def run(self, invocation: SubagentInvocation) -> SubagentResult:
         context: _LLMProviderInvocationContext | None = None
@@ -287,8 +313,16 @@ class ResearchRunner(ModeRunner):
         # For maximum compatibility we wrap in a single submit_message
         # call and rely on the LLMCallable adapter to surface the system
         # part.
+        # Default-None stance ⇒ empty directive ⇒ identical system block ⇒
+        # byte-equivalent to neutral research. Only deliberation sets a stance.
+        stance_directive = _STANCE_DIRECTIVES.get(self.stance or "", "")
+        system_block = (
+            _RESEARCH_SYSTEM_PROMPT
+            if not stance_directive
+            else f"{_RESEARCH_SYSTEM_PROMPT}\n\n{stance_directive}"
+        )
         framed_goal = (
-            f"<system>\n{_RESEARCH_SYSTEM_PROMPT}\n</system>\n\n{user_prompt}"
+            f"<system>\n{system_block}\n</system>\n\n{user_prompt}"
         )
         try:
             async for event in engine.submit_message(

@@ -246,6 +246,39 @@ def _validate_payload(mode: str, payload: dict[str, Any]) -> str | None:
     return f"unknown mode: {mode!r}"
 
 
+def _normalise_goal(goal: Any) -> str:
+    """Collapse whitespace + lowercase a spawn goal for obligation matching.
+
+    Two spawns whose goals differ only in casing / whitespace describe the
+    same obligation. Kept intentionally simple — semantic near-duplicates
+    (paraphrases) are NOT collapsed; the dedup guard only refuses *exact*
+    re-spawns, so a genuinely different sub-task is never blocked.
+    """
+    return " ".join(str(goal or "").split()).lower()
+
+
+def _spawn_obligation_key(mode: str, payload: dict[str, Any]) -> tuple[Any, ...]:
+    """Obligation identity of a spawn-mode entry: (mode, goal, check-set).
+
+    The ``[check:]`` set of an attached ``ccx_contract`` is folded in so two
+    same-goal spawns carrying *different* acceptance contracts stay distinct
+    obligations (they discharge different work); same goal + same checks (or
+    both contract-less) collapse to one obligation.
+    """
+    goal = _normalise_goal(payload.get("goal"))
+    contract = (payload.get("metadata") or {}).get("ccx_contract")
+    checks: tuple[str, ...] = ()
+    if isinstance(contract, dict):
+        acceptance = contract.get("acceptance")
+        if isinstance(acceptance, list):
+            checks = tuple(sorted(
+                str(c.get("check")).strip()
+                for c in acceptance
+                if isinstance(c, dict) and c.get("check")
+            ))
+    return (mode, goal, checks)
+
+
 class CcxUnifiedTool(BaseTool):
     """Unified ccx_spawn tool — routes by ``mode`` to one of three buffers.
 
@@ -263,6 +296,7 @@ class CcxUnifiedTool(BaseTool):
         spawn_unavailable_reason: str | None = None,
         max_fanout: int | None = None,
         count_research_in_fanout: bool = False,
+        dedup_spawns: bool = False,
     ) -> None:
         super().__init__(
             spec=CcToolSpec(
@@ -297,6 +331,14 @@ class CcxUnifiedTool(BaseTool):
         # sgarx stay exempt regardless. Only affects mixed turns that also
         # enqueue spawn modes (the guard below is gated on spawn_buffer).
         self.count_research_in_fanout = count_research_in_fanout
+        # Opt-in (default OFF): refuse an ordinary-spawn entry whose obligation
+        # — (mode, normalized-goal, contract [check:] set) — already matches one
+        # buffered earlier this turn or emitted earlier in this same call. Kills
+        # redundant lateral expansion (spawn A to verify X, then spawn A again
+        # to "double-check") that no depth/width/budget cap catches, because a
+        # count cap penalizes ALL expansion uniformly while this penalizes only
+        # the exact duplicate. research/sgar are terminal and never deduped.
+        self.dedup_spawns = dedup_spawns
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         del arguments
@@ -428,6 +470,21 @@ class CcxUnifiedTool(BaseTool):
                 len(self.spawn_buffer) + pending_spawns > self.max_fanout
             ):
                 fanout_over_limit = True
+        # Obligation-dedup guard (opt-in, default OFF). Seed the seen-set with
+        # the obligations already buffered this turn (earlier ccx_spawn calls),
+        # then refuse any spawn-mode entry whose obligation repeats — whether it
+        # collides with the buffer or with an earlier entry in THIS call. Off ⇒
+        # the set stays empty, the per-entry check below is skipped, and control
+        # flow is byte-identical.
+        dup_refused: list[str] = []
+        seen_obligations: set[tuple[Any, ...]] = set()
+        if self.dedup_spawns and self.spawn_buffer is not None:
+            for r in self.spawn_buffer.snapshot():
+                seen_obligations.add(
+                    _spawn_obligation_key(
+                        r.mode, {"goal": r.goal, "metadata": r.metadata}
+                    )
+                )
         for i, (mode, payload) in enumerate(entries):
             if mode == "research":
                 if self.research_buffer is None:
@@ -474,6 +531,12 @@ class CcxUnifiedTool(BaseTool):
                 if fanout_over_limit:
                     fanout_refused.append(f"spawns[{i}] mode={mode}")
                     continue
+                if self.dedup_spawns:
+                    key = _spawn_obligation_key(mode, payload)
+                    if key in seen_obligations:
+                        dup_refused.append(f"spawns[{i}] mode={mode}")
+                        continue
+                    seen_obligations.add(key)
                 self.spawn_buffer.append(
                     SpawnRequest(
                         goal=str(payload.get("goal") or ""),
@@ -522,6 +585,23 @@ class CcxUnifiedTool(BaseTool):
                 },
                 error_code="TL1009",
             )
+        if dup_refused:
+            return ToolResult(
+                tool_use_id=tool_call.tool_use_id,
+                tool_name=tool_call.tool_name,
+                success=False,
+                content=(
+                    f"ccx_spawn refused ({', '.join(dup_refused)}): duplicate "
+                    f"obligation — a spawn with the same goal + mode (+ contract "
+                    f"checks) is already queued this turn. Redundant re-spawns "
+                    f"(e.g. delegating the same sub-task twice to 'double-check') "
+                    f"are dropped; vary the goal for a genuinely different "
+                    f"sub-task, or complete the re-check yourself. Non-duplicate "
+                    f"entries on this call were still queued."
+                ),
+                data={"queued": queued, "dup_refused": dup_refused},
+                error_code="TL1010",
+            )
         if missing_buffer:
             return ToolResult(
                 tool_use_id=tool_call.tool_use_id,
@@ -554,6 +634,7 @@ def make_ccx_unified_tool(
     sgar_buffer: SgarBuffer | None = None,
     spawn_unavailable_reason: str | None = None,
     max_fanout: int | None = None,
+    dedup_spawns: bool = False,
 ) -> CcxUnifiedTool:
     """Factory returning the unified ccx tool wired to the given buffers."""
     return CcxUnifiedTool(
@@ -562,6 +643,7 @@ def make_ccx_unified_tool(
         sgar_buffer=sgar_buffer,
         spawn_unavailable_reason=spawn_unavailable_reason,
         max_fanout=max_fanout,
+        dedup_spawns=dedup_spawns,
     )
 
 

@@ -118,6 +118,7 @@ class CCConfig:
     ccx_max_spawn_fanout: int | None = None        # per-turn spawn WIDTH cap
     ccx_max_spawn_depth: int | None = None         # recursive spawn DEPTH cap
     ccx_count_research_in_fanout: bool = False      # count ccx_research toward width
+    ccx_dedup_spawns: bool = False                 # refuse duplicate-obligation spawns per turn
     # When True, structured / tool-driving purposes route to a fast client via
     # RECOMMENDED_ROLE_LLM_CLIENTS, unless an explicit role_llm_clients entry
     # overrides them. Default False → routing is byte-identical.
@@ -580,6 +581,10 @@ def load_cc_config(
     values.setdefault(
         "ccx_count_research_in_fanout",
         _coerce_bool(settings.get("cc_ccx_count_research_in_fanout"), defaults.ccx_count_research_in_fanout),
+    )
+    values.setdefault(
+        "ccx_dedup_spawns",
+        _coerce_bool(settings.get("cc_ccx_dedup_spawns"), defaults.ccx_dedup_spawns),
     )
     values.setdefault(
         "cc_use_recommended_routing",
