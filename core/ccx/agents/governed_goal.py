@@ -93,6 +93,7 @@ from ..sgar.checks import (
 )
 from ..sgar.models import ExitCriterion
 from . import goal_prompts
+from .progress import EverPassedTracker, monotone_progress_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -1106,6 +1107,14 @@ async def run_goal_loop(
     last_check_ev: list[dict[str, Any]] = []
     last_judge: dict[str, Any] | None = None
     warned_redrive = False
+    # Progress signal (default OFF ⇒ count-delta, byte-identical). Under
+    # CCX_MONOTONE_PROGRESS a round is progress iff a check passed that had
+    # never passed before, so an oscillating check set cannot keep the goal
+    # loop re-driving past no_progress_stop. The judge phase (all checks green)
+    # never grows the ever-passed set, so it stays bounded by no_progress_stop
+    # exactly as before. See progress.py.
+    monotone = monotone_progress_enabled()
+    progress_tracker = EverPassedTracker() if monotone else None
 
     for attempt in range(1, max_iters + 1):
         # Live surfacing of the documented re-drive limitation (additive): the
@@ -1206,7 +1215,20 @@ async def run_goal_loop(
         #    check-fix.
         # (``n_failing_checks`` / ``outstanding`` were computed above, before the
         # per-iteration ledger write.)
-        if prev_failing_checks is None:
+        if monotone:
+            # Monotone measure (opt-in): a round is progress iff it passed a
+            # check that had never passed before. Clearing the last failing
+            # check newly-passes it → progress (entering the judge phase, same
+            # as the count-delta path). Re-passing a check that regressed does
+            # NOT grow the ever-passed set → not scored as progress, which is
+            # exactly the oscillation the count-delta path fails to stop.
+            newly = progress_tracker.observe(
+                ev.get("criterion_id") for ev in check_ev if ev.get("passed")
+            )
+            # First round is always the baseline (never a stall on its own),
+            # matching the count-delta branch below.
+            progressed = prev_failing_checks is None or newly
+        elif prev_failing_checks is None:
             progressed = True  # first round = baseline
         elif n_failing_checks < prev_failing_checks:
             # Objective check set shrank. This ALSO covers clearing the last

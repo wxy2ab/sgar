@@ -85,6 +85,7 @@ def _build_cc_agent_runner(
     max_spawn_depth: int | None = None,
     max_spawn_fanout: int | None = None,
     count_research_in_fanout: bool = False,
+    dedup_spawns: bool = False,
     enable_spawn_contract: bool = False,
     contract_check_timeout_s: float = 120.0,
     enable_ask_human: bool = False,
@@ -123,6 +124,7 @@ def _build_cc_agent_runner(
         max_tool_rounds=max_tool_rounds,
         content_store=content_store,
         count_research_in_fanout=count_research_in_fanout,
+        dedup_spawns=dedup_spawns,
         enable_spawn_contract=enable_spawn_contract,
         contract_check_timeout_s=contract_check_timeout_s,
         enable_ask_human=enable_ask_human,
@@ -727,6 +729,7 @@ def build_runtime(
     cc_max_spawn_depth: int | None = None,
     cc_max_spawn_fanout: int | None = None,
     cc_count_research_in_fanout: bool = False,
+    cc_dedup_spawns: bool = False,
     artifact_cwd: str | None = None,
     artifact_root: str | None = None,
     docs_artifact_root: str | None = None,
@@ -770,6 +773,11 @@ def build_runtime(
     ccx_spawn calls; see ``CcAgentRunner.max_spawn_fanout``). ``None`` keeps
     the runner's default (``DEFAULT_MAX_SPAWN_FANOUT``, currently 32). Pass a
     runner with ``max_spawn_fanout=None`` to disable the cap entirely.
+
+    `cc_dedup_spawns` (default False) refuses an ordinary-spawn child whose
+    obligation — (mode, normalized-goal, contract ``[check:]`` set) — repeats
+    one already queued in the same turn, killing redundant lateral re-spawn.
+    Off ⇒ byte-identical (see ``CcAgentRunner.dedup_spawns``).
     """
     if llm is None and llm_client_provider is None:
         raise ValueError(
@@ -806,6 +814,7 @@ def build_runtime(
             max_spawn_depth=cc_max_spawn_depth,
             max_spawn_fanout=cc_max_spawn_fanout,
             count_research_in_fanout=cc_count_research_in_fanout,
+            dedup_spawns=cc_dedup_spawns,
             # Reuse the SGAR machine-check opt-in as the single operator
             # switch for "ccx may run [check:] commands". The spawn contract
             # only engages when this is True AND the invocation carries a

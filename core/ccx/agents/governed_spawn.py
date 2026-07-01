@@ -73,6 +73,7 @@ from ..sgar.checks import (
     stop_on_unrunnable_enabled,
 )
 from ..sgar.models import ExitCriterion
+from .progress import EverPassedTracker, monotone_progress_enabled
 from .subagent import SubagentInvocation, SubagentResult
 
 logger = logging.getLogger(__name__)
@@ -272,6 +273,12 @@ def run_governed_spawn(
     no_progress = 0
     last_result: SubagentResult | None = None
     last_evidence: list[dict[str, Any]] = []
+    # Progress signal (default OFF ⇒ count-delta, byte-identical). Under
+    # CCX_MONOTONE_PROGRESS the ever-passed set replaces the count delta so an
+    # oscillating repair (a check that re-fails after passing) can no longer
+    # keep the loop alive past no_progress_stop. See progress.py.
+    monotone = monotone_progress_enabled()
+    progress_tracker = EverPassedTracker() if monotone else None
 
     for attempt in range(1, contract.max_iters + 1):
         inv = invocation if detail is None else _augment_goal(
@@ -346,8 +353,17 @@ def run_governed_spawn(
                 })
 
         # Progress = the failing-check count went DOWN versus the previous
-        # round. The first failing round just records the baseline.
-        if prev_failing is not None:
+        # round. The first failing round just records the baseline. Under
+        # CCX_MONOTONE_PROGRESS, "progress" instead means a check passed that
+        # had never passed before (a strictly-monotone measure oscillation
+        # cannot reset); the OFF branch below is the unchanged count-delta.
+        if monotone:
+            newly = progress_tracker.observe(
+                o.criterion_id for o in outcomes if o.passed
+            )
+            if prev_failing is not None:
+                no_progress = 0 if newly else no_progress + 1
+        elif prev_failing is not None:
             if len(failing) >= prev_failing:
                 no_progress += 1
             else:

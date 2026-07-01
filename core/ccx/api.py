@@ -129,7 +129,7 @@ MEMORY_RECALL_MODES = {"plan", "spec", "agent", "doc", "ask"}
 # mode) — do not merge them.
 SUPPORTED_AGENT_MODES = frozenset(
     {"plan", "spec", "agent", "doc", "ask", "blueprint", "sgar", "sgarx", "goal",
-     "debug", "audit"}
+     "debug", "audit", "deliberate"}
 )
 
 #: Operator params for ``agent_mode="debug"`` (route / max_iters / heavy_stimulus
@@ -428,6 +428,11 @@ def _spawn_policy_from_config(config: CCConfig | None) -> dict[str, Any]:
             _resolve_policy_knob(
                 config, "ccx_count_research_in_fanout",
                 "CCX_COUNT_RESEARCH_FANOUT", _env_truthy,
+            )
+        ),
+        "cc_dedup_spawns": bool(
+            _resolve_policy_knob(
+                config, "ccx_dedup_spawns", "CCX_DEDUP_SPAWNS", _env_truthy,
             )
         ),
     }
@@ -825,6 +830,17 @@ class CodeAgent:
             result = await self._run_audit_loop(request, config)
             await self._maybe_emit_governance_verdict(request, result)
             return result
+
+        # Deliberate mode → adversarial PROPOSAL deliberation (NOT a task). This
+        # is analysis-only / INFORM-only like ``structured``: it does not run the
+        # goal loop, has no ``[check:]`` floor and no ``goal_verdict`` to emit —
+        # it decomposes a proposal, gathers stance-committed for/against evidence,
+        # and returns an evidence-weighted report on ``snapshot['deliberation']``.
+        # ``"deliberate"`` is permanently in SUPPORTED_AGENT_MODES so a flag-off
+        # request degrades to a cheap "disabled" result here instead of silently
+        # falling through to cc. (No governance verdict — there is none.)
+        if mode == "deliberate":
+            return await self._run_deliberate_loop(request, config)
 
         # Code-task definition-of-done auto-injection (default OFF). When
         # ``CCX_CODE_TASK_AUDIT`` is enabled and the caller supplied no run-audit
@@ -1301,6 +1317,102 @@ class CodeAgent:
             timeout_s=self._goal_llm_timeout_s,
         )
 
+    async def _run_deliberate_loop(
+        self, request: AgentRunRequest, config: CCConfig,
+    ) -> AgentRunResult:
+        """Drive ``agent_mode="deliberate"`` — adversarial PROPOSAL deliberation.
+
+        Analysis-only / INFORM-only (design ``deliberate_mode_design_2026-06-30``):
+        decompose the proposal → per sub-claim run support/refute read-only
+        research → deterministic cite-or-discount arbitration → evidence-weighted
+        report on ``snapshot['deliberation']``. NEVER a gate term; no
+        ``goal_verdict`` / ``met`` is produced.
+
+        Default OFF: with ``CCX_DELIBERATE_MODE`` unset this returns a cheap
+        "disabled" result WITHOUT spinning up any LLM or research worker (the mode
+        is still accepted so the request never falls through to cc).
+        """
+        from core.deepstack_v5 import new_id
+
+        from .deliberate import (
+            CCX_DELIBERATE_REQUEST_METADATA_KEY, deliberate_mode_enabled,
+        )
+
+        proposal = request.instruction or ""
+        try:
+            resolved_cwd = str(Path(request.cwd or ".").resolve())
+        except (OSError, ValueError):
+            resolved_cwd = request.cwd or ""
+
+        # Flag OFF ⇒ inert, no LLM/research spun up.
+        if not deliberate_mode_enabled():
+            return AgentRunResult(
+                final_text=(
+                    "agent_mode='deliberate' is disabled. Set CCX_DELIBERATE_MODE=1 "
+                    "to enable adversarial proposal deliberation."
+                ),
+                session_id=new_id("run"), turn_id=None, cwd=resolved_cwd,
+                session_snapshot={"deliberation": None, "deliberate_enabled": False},
+                failed=False,
+            )
+
+        # Research workers need the provider (an LLMClientProvider). Without one,
+        # there is no way to gather evidence — fail loud rather than emit an
+        # evidence-free "uncertain" that reads like a real deliberation.
+        if self.llm_client_provider is None:
+            return AgentRunResult(
+                final_text=(
+                    "agent_mode='deliberate' requires an llm_client_provider for "
+                    "its read-only research workers; none is configured."
+                ),
+                session_id=new_id("run"), turn_id=None, cwd=resolved_cwd,
+                session_snapshot={"deliberation": None, "deliberate_enabled": True},
+                failed=True, error_code="DLB1001",
+                error_message="no llm_client_provider for deliberation research workers",
+            )
+
+        from .agents.deliberate_runner import (
+            DeliberateRunner, render_deliberation_report,
+        )
+
+        meta = dict(request.metadata or {})
+        params = meta.get(CCX_DELIBERATE_REQUEST_METADATA_KEY)
+        params = params if isinstance(params, dict) else {}
+        raw_max = params.get("max_subclaims")
+        try:
+            max_subclaims = int(raw_max) if raw_max else 5
+        except (TypeError, ValueError):
+            max_subclaims = 5
+        max_subclaims = max(1, min(max_subclaims, 12))
+        raw_rounds = params.get("max_rounds")
+        try:
+            max_rounds = int(raw_rounds) if raw_rounds else 2
+        except (TypeError, ValueError):
+            max_rounds = 2
+        max_rounds = max(1, min(max_rounds, 4))
+        scope = str(params.get("scope") or "").strip()
+
+        runner = DeliberateRunner(
+            cc_config=config,
+            llm_provider=self.llm_client_provider,
+            llm=self._resolve_llm(config),
+            cwd=resolved_cwd,
+            language=config.prompt_language if config else "en",
+            max_subclaims=max_subclaims,
+            max_rounds=max_rounds,
+            llm_timeout_s=self._goal_llm_timeout_s,
+            research_timeout_s=self._goal_llm_timeout_s,
+            scope=scope,
+        )
+        deliberation = await asyncio.to_thread(runner.deliberate, proposal)
+        report = render_deliberation_report(deliberation)
+        return AgentRunResult(
+            final_text=report,
+            session_id=new_id("run"), turn_id=None, cwd=resolved_cwd,
+            session_snapshot={"deliberation": deliberation, "deliberate_enabled": True},
+            failed=False,
+        )
+
     async def _maybe_emit_governance_verdict(
         self, request: AgentRunRequest, result: AgentRunResult,
     ) -> None:
@@ -1700,6 +1812,13 @@ class CodeAgent:
             raise NotImplementedError(
                 "ccx.CodeAgent does not support streaming for agent_mode='goal'; "
                 "use run()/run_sync() (goal mode is a non-streaming loop)"
+            )
+        # Deliberate is an analysis-only meta-pipeline (decompose → adversarial
+        # research → arbitrate); like goal it has no single streaming chain.
+        if mode == "deliberate":
+            raise NotImplementedError(
+                "ccx.CodeAgent does not support streaming for "
+                "agent_mode='deliberate'; use run()/run_sync()"
             )
         llm = self._resolve_llm(config)
         workspace = self._resolve_workspace(request)

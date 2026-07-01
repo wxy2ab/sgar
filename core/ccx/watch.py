@@ -1046,6 +1046,189 @@ def _format_bytes(n: int) -> str:
     return f"{n / (1024 * 1024):.1f} MB"
 
 
+# --------------------------------------------------------------------------- #
+# Cross-run failure patterns
+# --------------------------------------------------------------------------- #
+
+
+#: Node states that count as a failure for cross-run aggregation. ``abandoned``
+#: is the reachable terminal failure in v5 (``failed`` is not in
+#: ``TERMINAL_NODE_STATES`` — see :func:`degraded_completion`); ``failed`` is
+#: included as harmless defence-in-depth against a partial / crashed DB write.
+_FAILURE_STATES: tuple[str, ...] = ("failed", "abandoned")
+
+
+def compute_failure_patterns(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str | None = None,
+    limit_runs: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate failed / abandoned nodes ACROSS runs by failure kind.
+
+    ``compute_run_stats`` and ``report.py`` are per-run; this is the cross-run
+    view an operator needs after an unattended scheduler campaign: which
+    failure KINDS recur, how often, in which tools, across how many runs, and
+    when they first / last appeared. It reads the typed ``nodes.failure_json``
+    (the same ``Failure`` dict ``list_nodes`` parses — ``kind`` / ``message``)
+    — no log scraping — and is read-only.
+
+    Scope: all runs by default. ``run_id`` restricts to one run; ``limit_runs``
+    restricts to the most recent N runs (by ``runs.updated_at_ms``), handy when
+    a long campaign has accrued many runs. ``run_id`` takes precedence.
+
+    Returns a dict shaped for :func:`render_failure_patterns_text` / JSON::
+
+        {
+          "scope": "all-runs",
+          "kinds": [
+            {"kind": "tool_error", "count": 7, "runs": 4,
+             "run_sample": [...], "tools": [{"tool": "Bash", "count": 5}, ...],
+             "states": {"abandoned": 7}, "first_seen_ms": ..., "last_seen_ms": ...,
+             "sample_node": "run-3/n2", "sample_message": "..."},
+            ...
+          ],
+          "totals": {"failures": 9, "kinds": 2, "runs_affected": 4}
+        }
+    """
+    allowed_runs: set[str] | None = None
+    if run_id is not None:
+        allowed_runs = {run_id}
+    elif limit_runs is not None and limit_runs > 0:
+        recent = _query(
+            conn,
+            "SELECT run_id FROM runs ORDER BY updated_at_ms DESC LIMIT ?",
+            (limit_runs,),
+        )
+        allowed_runs = {_row_get(r, "run_id", "") for r in recent}
+
+    placeholders = ",".join("?" * len(_FAILURE_STATES))
+    rows = _query(
+        conn,
+        "SELECT run_id, node_id, state, spec_json, failure_json, updated_at_ms "
+        f"FROM nodes WHERE state IN ({placeholders}) ORDER BY updated_at_ms ASC",
+        _FAILURE_STATES,
+    )
+
+    by_kind: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        rid = _row_get(r, "run_id", "") or ""
+        if allowed_runs is not None and rid not in allowed_runs:
+            continue
+        failure = _loads(_row_get(r, "failure_json")) or {}
+        kind = (failure.get("kind") if isinstance(failure, dict) else "") or "unknown"
+        message = (
+            failure.get("message") if isinstance(failure, dict) else ""
+        ) or ""
+        spec = _loads(_row_get(r, "spec_json")) or {}
+        tool = (spec.get("tool") if isinstance(spec, dict) else "") or "(none)"
+        state = _row_get(r, "state", "") or ""
+        ts = _row_get(r, "updated_at_ms") or 0
+
+        b = by_kind.get(kind)
+        if b is None:
+            b = by_kind[kind] = {
+                "runs": set(),
+                "tools": {},
+                "states": {},
+                "count": 0,
+                "first_seen_ms": ts or None,
+                "last_seen_ms": ts or None,
+                "sample_message": "",
+                "sample_node": "",
+            }
+        b["count"] += 1
+        b["runs"].add(rid)
+        b["tools"][tool] = b["tools"].get(tool, 0) + 1
+        b["states"][state] = b["states"].get(state, 0) + 1
+        if ts:
+            b["first_seen_ms"] = min(b["first_seen_ms"] or ts, ts)
+            b["last_seen_ms"] = max(b["last_seen_ms"] or ts, ts)
+        if not b["sample_message"] and message:
+            b["sample_message"] = message
+            b["sample_node"] = f"{rid}/{_row_get(r, 'node_id', '')}"
+
+    kinds: list[dict[str, Any]] = []
+    for kind, b in by_kind.items():
+        top_tools = sorted(b["tools"].items(), key=lambda kv: (-kv[1], kv[0]))
+        kinds.append({
+            "kind": kind,
+            "count": b["count"],
+            "runs": len(b["runs"]),
+            "run_sample": sorted(b["runs"])[:3],
+            "tools": [{"tool": t, "count": c} for t, c in top_tools[:5]],
+            "states": b["states"],
+            "first_seen_ms": b["first_seen_ms"],
+            "last_seen_ms": b["last_seen_ms"],
+            "sample_node": b["sample_node"],
+            "sample_message": b["sample_message"],
+        })
+    kinds.sort(key=lambda k: (-k["count"], k["kind"]))
+
+    runs_affected = {rid for b in by_kind.values() for rid in b["runs"]}
+    if run_id is not None:
+        scope = run_id
+    elif limit_runs:
+        scope = f"recent-{limit_runs}"
+    else:
+        scope = "all-runs"
+    return {
+        "scope": scope,
+        "kinds": kinds,
+        "totals": {
+            "failures": sum(k["count"] for k in kinds),
+            "kinds": len(kinds),
+            "runs_affected": len(runs_affected),
+        },
+    }
+
+
+def render_failure_patterns_text(report: dict[str, Any]) -> str:
+    """Format :func:`compute_failure_patterns` output as a fixed-width table."""
+    kinds = report.get("kinds") or []
+    scope = report.get("scope", "?")
+    if not kinds:
+        return (
+            f"=== Failure patterns ({scope}) ===\n"
+            "(no failed / abandoned nodes)"
+        )
+
+    lines = [f"=== Failure patterns ({scope}) ==="]
+    header = (
+        f"{'kind':<18} {'count':>6} {'runs':>5} "
+        f"{'top tool':<16} {'last seen':<15}"
+    )
+    lines.append(header)
+    lines.append("-" * len(header))
+    for k in kinds:
+        top_tool = k["tools"][0]["tool"] if k.get("tools") else "-"
+        lines.append(
+            f"{_truncate(k['kind'], 18):<18} "
+            f"{k['count']:>6} "
+            f"{k['runs']:>5} "
+            f"{_truncate(top_tool, 16):<16} "
+            f"{_ms_to_iso(k.get('last_seen_ms')):<15}"
+        )
+    lines.append("-" * len(header))
+    tot = report["totals"]
+    lines.append(
+        f"{'TOTAL':<18} {tot['failures']:>6} {tot['runs_affected']:>5} "
+        f"{_truncate(str(tot['kinds']) + ' kind(s)', 16):<16}"
+    )
+
+    # The human-actionable bit: a sample message per top kind for drill-down.
+    samples = [k for k in kinds[:5] if k.get("sample_message")]
+    if samples:
+        lines.append("")
+        for k in samples:
+            lines.append(
+                f"• {k['kind']} ({k['count']}×, {k['runs']} run(s)) "
+                f"e.g. {k['sample_node']}: "
+                f"{_truncate(k['sample_message'], 100)}"
+            )
+    return "\n".join(lines)
+
+
 def render_snapshot_text(snap: dict[str, Any]) -> str:
     view = snap.get("view")
     if view == "runs":
@@ -1156,6 +1339,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "enabled."
         ),
     )
+    p.add_argument(
+        "--failures",
+        action="store_true",
+        help=(
+            "One-shot CROSS-RUN failure-pattern report: aggregates "
+            "failed/abandoned nodes across all runs by failure kind, with "
+            "per-kind counts, run coverage, top tools and a sample message. "
+            "Unlike --stats (per-run) this is the campaign-triage view. "
+            "Defaults to all runs; scope with --run-id (one run) or "
+            "--limit-runs N (most recent N runs)."
+        ),
+    )
+    p.add_argument(
+        "--limit-runs",
+        type=int,
+        default=None,
+        metavar="N",
+        help="With --failures: restrict to the most recent N runs.",
+    )
     return p
 
 
@@ -1263,6 +1465,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.tail or args.follow:
             raise SystemExit("--stats is a one-shot report; can't combine "
                              "with --tail or --follow")
+    if args.failures:
+        if args.stats:
+            raise SystemExit("--failures and --stats are separate reports; "
+                             "pick one")
+        if args.tail or args.follow:
+            raise SystemExit("--failures is a one-shot report; can't combine "
+                             "with --tail or --follow")
 
     db_path = resolve_db_path(args.cwd)
     try:
@@ -1278,6 +1487,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(stats, ensure_ascii=False, default=str))
             else:
                 print(render_stats_text(stats))
+            return 0
+
+        if args.failures:
+            report = compute_failure_patterns(
+                conn, run_id=args.run_id, limit_runs=args.limit_runs,
+            )
+            if args.format == "json":
+                print(json.dumps(report, ensure_ascii=False, default=str))
+            else:
+                print(render_failure_patterns_text(report))
             return 0
 
         if args.tail:
