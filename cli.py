@@ -6,7 +6,8 @@
 脚本就地运行时把自身所在目录加入 ``sys.path``，因此无需先 ``pip install`` 也能
 ``python cli.py``。等价入口：``python -m sgar``。
 
-作为 openclaw / Claude Code 技能调用时，技能说明见同目录 ``skill.md``。
+作为 openclaw / Claude Code 技能调用时，技能说明见同目录 ``skill.md``
+（中文）与 ``skill.en.md``（英文）。
 """
 from __future__ import annotations
 
