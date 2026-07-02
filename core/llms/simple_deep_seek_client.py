@@ -3,6 +3,11 @@ from typing import Iterator, List, Dict, Any, Literal, Optional, Union
 from openai import OpenAI
 import json
 from ._llm_api_client import LLMApiClient
+from ._empty_content_retry import (
+    DEFAULT_EMPTY_CONTENT_RETRIES,
+    is_blank,
+    reissue_completion_on_empty,
+)
 from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -420,12 +425,38 @@ class SimpleDeepSeekClient(LLMApiClient):
         else:
             if raw_response:
                 return completion
-            message = completion.choices[0].message
-            self._last_reasoning_content = getattr(message, "reasoning_content", None)
-            response = message.content
-            self._update_stats(completion.usage)
-            self._note_finish_reason(completion)
-            return response
+            response = self._extract_completion_text(completion)
+            # A reasoning model can spend the whole turn on reasoning_content and
+            # return empty visible content with finish_reason="stop" (no
+            # exception -> one_chat's @retry never fires), which surfaces to ccx
+            # as empty output. Re-issue rather than silently propagate "".
+            # enable_thinking=None: DeepSeek toggles reasoning via model name /
+            # extra_body["thinking"], not an enable_thinking flag, so the retry
+            # re-rolls the same config. Tool path untouched. See
+            # _empty_content_retry.
+            if tools or not is_blank(response):
+                return response
+            return reissue_completion_on_empty(
+                create=lambda call_kwargs: self.client.chat.completions.create(**call_kwargs),
+                extract=self._extract_completion_text,
+                kwargs=kwargs,
+                enable_thinking=None,
+                retries=self._EMPTY_CONTENT_RETRIES,
+                client_name=type(self).__name__,
+                last_finish_reason=self._last_finish_reason,
+                last_reasoning=self._last_reasoning_content or "",
+            )
+
+    _EMPTY_CONTENT_RETRIES = DEFAULT_EMPTY_CONTENT_RETRIES
+
+    def _extract_completion_text(self, completion) -> Optional[str]:
+        if not completion.choices:
+            return None
+        message = completion.choices[0].message
+        self._last_reasoning_content = getattr(message, "reasoning_content", None)
+        self._update_stats(completion.usage)
+        self._note_finish_reason(completion)
+        return message.content
 
     def tool_invoke(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         kwargs = self._build_request_kwargs(messages, False, tools)

@@ -3887,7 +3887,7 @@ class DocModeRunner(ModeRunner):
         # ``self.max_tool_rounds``: when nothing is set, ``None``
         # would mean "unlimited" to cc but in practice the LLM stops
         # itself on first emitted text. The effective value gives a
-        # real number (default 36, doubled to 72 for parallelism=1)
+        # real number (default 60, doubled to 120 for parallelism=1)
         # so the budget is observable and enforced.
         rounds_cap = self._effective_investigator_max_rounds()
         try:

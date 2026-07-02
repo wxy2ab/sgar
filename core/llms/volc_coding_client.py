@@ -90,3 +90,14 @@ class VolcCodingClient(OpenAIChatClient):
         finally:
             if saved_format is not None:
                 self.extra_body["format"] = saved_format
+
+    # NOTE on "ccx occasionally emits empty output" with this client:
+    # doubao-seed-code runs with enable_thinking=True and can spend an entire
+    # turn on hidden reasoning_content, returning empty visible content with
+    # finish_reason="stop" (no exception -> one_chat's @retry never fires). That
+    # empty propagates to ccx as an empty final_text. Setting max_tokens does NOT
+    # bound the reasoning trace on this endpoint, so the token budget in the
+    # class docstring cannot prevent it. The re-issue-on-empty guard now lives in
+    # the shared base ``OpenAIChatClient._create_chat_completion`` (see
+    # ``_empty_content_retry``), so every OpenAI-compatible client — not just
+    # this one — is covered. VolcCodingClient inherits it unchanged.

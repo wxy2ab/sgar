@@ -3,6 +3,11 @@ from openai import OpenAI
 import json
 import httpx
 from ._llm_api_client import LLMApiClient
+from ._empty_content_retry import (
+    DEFAULT_EMPTY_CONTENT_RETRIES,
+    is_blank,
+    reissue_completion_on_empty,
+)
 from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 from ratelimit import limits, sleep_and_retry
@@ -205,9 +210,29 @@ class MoonShotClient(LLMApiClient):
                 return completion
             if not completion.choices:
                 raise RuntimeError("LLM API returned empty choices")
-            response = completion.choices[0].message.content
-            self._update_stats(completion.usage)
-            return response
+            response = self._extract_completion_text(completion)
+            # A reasoning-capable model can return empty visible content
+            # (finish_reason="stop") with no exception; re-issue rather than
+            # silently propagate "". Tool path is left untouched (empty content
+            # may accompany tool_calls). See _empty_content_retry.
+            if tools or not is_blank(response):
+                return response
+            return reissue_completion_on_empty(
+                create=lambda call_kwargs: self.client.chat.completions.create(**call_kwargs),
+                extract=self._extract_completion_text,
+                kwargs=kwargs,
+                enable_thinking=self.enable_thinking,
+                retries=self._EMPTY_CONTENT_RETRIES,
+                client_name=type(self).__name__,
+            )
+
+    _EMPTY_CONTENT_RETRIES = DEFAULT_EMPTY_CONTENT_RETRIES
+
+    def _extract_completion_text(self, completion) -> Optional[str]:
+        if not completion.choices:
+            return None
+        self._update_stats(completion.usage)
+        return completion.choices[0].message.content
 
     @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
     def tool_invoke(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
