@@ -17,7 +17,25 @@ Design notes:
   unit-tested with frozen ``datetime`` values. Two kinds ship: ``interval``
   (every N seconds) and ``daily`` (one or more local ``HH:MM`` points, with an
   optional weekday filter). A future ``cron`` kind can be added behind the same
-  seam without touching the loop.
+  seam without touching the loop — the seam is purely *time-based* (it returns
+  the next fire *instant*). An *event/condition* trigger ("fire when a check
+  fails / data goes stale") is NOT a ``next_fire_at`` variant: it has no clock
+  value to return, so its predicate must live in the run loop between wake and
+  drive, not behind this seam. ``run_schedule(fire_gate=...)`` is exactly that
+  loop-level hook: after each timed wake a caller-supplied predicate decides
+  whether this cycle should drive the agent, turning "run every N" into "check
+  every N, act only on a condition" — wiring an existing detector (e.g. the
+  cross-run failure-pattern aggregator, via ``make_failure_pattern_gate``) to
+  the executor with no new detection logic in the loop.
+* Total-resource safety for an unattended daemon: ``StopConditions`` bounds the
+  schedule's *total* footprint, not just per-tick. ``max_total_wallclock_s`` is
+  a circuit-breaker on cumulative **active** agent compute (summed per-tick
+  execution, excluding the idle sleep between ticks) so a forever-schedule can't
+  burn unbounded compute. Per-tick *cost* is bounded by the existing run budget
+  (set ``CCX_MAX_COST_USD`` / ``ccx_max_cost_usd``); a cross-tick cost breaker is
+  deliberately NOT provided because token-only reasoning clients accrue
+  ``consumed_cost=0`` without a configured price, which would make a cost ceiling
+  silently never trip (false safety).
 * The sleep *between* ticks is sliced (``_interruptible_sleep_until``) so an
   interrupt lands within ~1s **while the supervisor is waiting** — mirroring
   ``watch.py``'s follow loop and ``llm_monitor.run_monitor``'s injectable
@@ -235,6 +253,18 @@ class StopConditions:
     deadline / max-activations / agent-signal stop still returns 0). ``None``
     (default) ⇒ never trip — keep watching through any number of failures.
 
+    ``max_total_wallclock_s`` is a *resource* circuit-breaker for an unattended
+    daemon: it caps the cumulative **active** agent compute across ticks — the
+    sum of each tick's ``run_sync`` execution wall-clock, *excluding* the idle
+    sleep between ticks (calendar-time deadlines are ``until``'s job). When the
+    running total reaches the cap the loop stops with a **non-zero** return code
+    (like ``max_consecutive_failures``: monitoring was cut short to protect a
+    resource, not a clean completion). Measured off the injected ``wall_clock``
+    so it is deterministic in tests and unit-agnostic to the LLM client — unlike
+    a cost cap, which token-only reasoning clients would leave permanently at
+    zero. ``None`` (default) ⇒ no total-compute limit. Per-tick cost is bounded
+    separately by the run budget (``CCX_MAX_COST_USD`` / ``ccx_max_cost_usd``).
+
     ``stop_on_signal`` controls only the *agent in-band* stop channel
     (``[[SCHEDULE_STOP]]`` / ``ccx_schedule_stop`` tag), not OS signals.
     """
@@ -243,6 +273,7 @@ class StopConditions:
     until: datetime | None = None
     stop_on_signal: bool = True
     max_consecutive_failures: int | None = None
+    max_total_wallclock_s: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_activations is not None and self.max_activations < 1:
@@ -253,6 +284,13 @@ class StopConditions:
         ):
             raise ValueError(
                 "StopConditions: max_consecutive_failures must be >= 1 (or None)"
+            )
+        if (
+            self.max_total_wallclock_s is not None
+            and self.max_total_wallclock_s <= 0
+        ):
+            raise ValueError(
+                "StopConditions: max_total_wallclock_s must be > 0 (or None)"
             )
 
 
@@ -434,16 +472,19 @@ def run_schedule(
     bridge: str = "memory",
     sink: Any = None,
     fire_immediately: bool = False,
+    fire_gate: Callable[[], bool] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     wall_clock: Callable[[], datetime] = _now_local,
 ) -> int:
     """Drive a fresh bounded ``agent.run_sync`` per scheduled tick.
 
     Returns 0 on a clean stop (deadline / max activations / agent signal /
-    ``KeyboardInterrupt``) and a **non-zero** code only when the
-    ``max_consecutive_failures`` circuit-breaker trips (monitoring aborted on
-    repeated failure). ``agent`` need only expose ``run_sync(request)`` returning
-    an object with ``session_id`` / ``final_text`` / ``failed``.
+    ``KeyboardInterrupt``) and a **non-zero** code when a protective
+    circuit-breaker trips: ``max_consecutive_failures`` (monitoring aborted on
+    repeated failure) or ``max_total_wallclock_s`` (cumulative active compute cap
+    reached — the schedule was cut short to protect a resource). ``agent`` need
+    only expose ``run_sync(request)`` returning an object with ``session_id`` /
+    ``final_text`` / ``failed``.
 
     A single tick that *raises* (e.g. a fail-loud ``CancelledError`` or a
     teardown hiccup escaping ``run_sync``) is isolated: the loop emits a
@@ -456,6 +497,17 @@ def run_schedule(
     resume metadata), or ``both``. ``fire_immediately`` makes the *first* tick
     fire at once (used by ``--once`` smoke tests); the steady-state cadence is
     unchanged.
+
+    ``fire_gate`` (default ``None`` ⇒ every timed wake drives, byte-identical to
+    before) is the *condition* hook: a predicate consulted after each wake. When
+    it returns falsy the agent is NOT driven this cycle (a ``tick_skipped`` event
+    is emitted and the loop waits for the next wake); a skipped poll drives
+    nothing, so it does not count toward ``max_activations`` (which bounds agent
+    RUNS) or ``max_total_wallclock_s`` (which sums run execution). A gate that
+    raises fails SAFE — the poll is skipped and surfaced as a ``warn`` event —
+    because a broken sensor must never spin the agent. Use it to wire an existing
+    detector to the executor (see ``make_failure_pattern_gate``); keep gate
+    predicates cheap and side-effect-free.
     """
     if bridge not in ("memory", "resume", "both"):
         raise ValueError(f"run_schedule: unknown bridge {bridge!r}")
@@ -464,7 +516,9 @@ def run_schedule(
     previous_run_id: str | None = None
     last_fire: datetime | None = None
     activation = 0
+    polls = 0
     consecutive_failures = 0
+    total_active_s = 0.0
 
     try:
         while True:
@@ -472,7 +526,11 @@ def run_schedule(
             if stop.until is not None and now >= stop.until:
                 _emit(sink, "info", "stop", {"reason": "deadline", "activation": activation})
                 return 0
-            if fire_immediately and activation == 0:
+            # ``polls`` (wake opportunities), not ``activation`` (drives), gates
+            # the immediate first fire: a ``fire_gate`` that skips the first wake
+            # leaves ``activation`` at 0, which would otherwise re-trigger
+            # ``fire_immediately`` forever in a tight no-sleep loop.
+            if fire_immediately and polls == 0:
                 wake_at = now
             else:
                 wake_at = schedule.next_fire_at(now, last_fire)
@@ -484,6 +542,34 @@ def run_schedule(
 
             _interruptible_sleep_until(wake_at, sleeper, wall_clock)
             last_fire = wake_at
+            polls += 1
+
+            # Condition gate: decide whether THIS wake drives the agent. Runs
+            # between wake and drive so a skip costs nothing but the poll. A
+            # skipped poll increments no drive counter (``activation`` /
+            # ``total_active_s`` untouched) and leaves ``previous_run_id`` intact.
+            if fire_gate is not None:
+                try:
+                    should_fire = bool(fire_gate())
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as exc:  # noqa: BLE001 — sensor must not crash the loop
+                    logger.warning(
+                        "schedule: fire_gate raised %s at poll %d; skipping this "
+                        "cycle (fail-safe)", type(exc).__name__, polls, exc_info=True,
+                    )
+                    _emit(sink, "warn", "tick_skipped", {
+                        "poll": polls, "reason": "gate_error",
+                        "error": type(exc).__name__,
+                    })
+                    continue
+                if not should_fire:
+                    _emit(sink, "info", "tick_skipped", {
+                        "poll": polls, "reason": "condition_false",
+                        "wake_at": wake_at.isoformat(),
+                    })
+                    continue
+
             activation += 1
 
             request = _build_tick_request(
@@ -502,6 +588,7 @@ def run_schedule(
             # monitoring loop must survive one bad tick, so isolate it and treat
             # it like a failed tick. KeyboardInterrupt/SystemExit propagate.
             result: Any = None
+            tick_t0 = wall_clock()
             try:
                 result = agent.run_sync(request)
             except (KeyboardInterrupt, SystemExit):
@@ -528,10 +615,18 @@ def run_schedule(
                     "failed": tick_failed,
                 })
 
+            # Accumulate this tick's ACTIVE compute (its ``run_sync`` execution
+            # wall-clock, excluding the idle sleep between ticks) for the
+            # total-compute circuit-breaker. Captured for both the success and
+            # the isolated-raise paths; clamped at 0 so a non-monotone test clock
+            # can never subtract from the running total.
+            total_active_s += max(0.0, (wall_clock() - tick_t0).total_seconds())
+
             consecutive_failures = consecutive_failures + 1 if tick_failed else 0
 
             # Stop checks: agent in-band signal (only meaningful with a result),
-            # then the failure circuit-breaker (abnormal abort), then the planned
+            # then the failure circuit-breaker (abnormal abort), then the
+            # total-compute circuit-breaker (resource cap), then the planned
             # max-activations completion.
             if (
                 result is not None
@@ -550,6 +645,16 @@ def run_schedule(
                     "reason": "max_consecutive_failures",
                     "activation": activation,
                     "consecutive_failures": consecutive_failures,
+                })
+                return 1
+            if (
+                stop.max_total_wallclock_s is not None
+                and total_active_s >= stop.max_total_wallclock_s
+            ):
+                _emit(sink, "warn", "stop", {
+                    "reason": "max_total_wallclock",
+                    "activation": activation,
+                    "total_active_s": total_active_s,
                 })
                 return 1
             if (
@@ -572,6 +677,59 @@ def _emit(sink: Any, severity: str, source: str, payload: dict[str, Any]) -> Non
         sink.emit(severity, source, payload)
     except Exception:  # noqa: BLE001 — logging must never break the loop
         logger.debug("schedule: sink.emit failed", exc_info=True)
+
+
+# --------------------------------------------------------------------------- #
+# Condition gates (wire an existing detector to run_schedule.fire_gate)
+# --------------------------------------------------------------------------- #
+
+def make_failure_pattern_gate(
+    cwd: str | Path,
+    *,
+    limit_runs: int = 5,
+    min_failures: int = 1,
+) -> Callable[[], bool]:
+    """A ``fire_gate`` that fires when recent runs show failure patterns.
+
+    Thin adapter over the landed cross-run aggregator
+    ``watch.compute_failure_patterns`` (read-only, over
+    ``<cwd>/.ccx/runtime/runtime.db``): the returned predicate is True when the
+    most recent ``limit_runs`` runs contain at least ``min_failures`` failed /
+    abandoned nodes — i.e. "something has been going wrong; wake the agent to
+    look". There is NO new detection logic here; it only adapts an existing
+    sensor to the scheduler's ``fire_gate`` seam.
+
+    Re-fire semantics: the gate stays True while those failures remain in the
+    DB, so it keeps firing until an agent-driven run resolves them (or the P1
+    ``max_total_wallclock_s`` / ``max_consecutive_failures`` breakers stop the
+    schedule). That is intentional "keep trying until resolved" MONITORING,
+    bounded by those breakers — it is NOT an apply-mode auto-fixer, which must
+    wait until the re-drive idempotency gap is closed.
+
+    Fail-safe: a missing DB (no runs yet) or any read error ⇒ False (never spin
+    the agent on an absent/broken sensor).
+    """
+    from .watch import compute_failure_patterns, connect_ro, resolve_db_path
+
+    def _gate() -> bool:
+        try:
+            db_path = resolve_db_path(cwd)
+            if not Path(db_path).exists():
+                return False
+            conn = connect_ro(db_path)
+            try:
+                report = compute_failure_patterns(conn, limit_runs=limit_runs)
+            finally:
+                conn.close()
+            totals = report.get("totals") or {}
+            return int(totals.get("failures", 0)) >= min_failures
+        except Exception:  # noqa: BLE001 — sensor failure must not spin the agent
+            logger.debug(
+                "schedule: failure-pattern gate read failed", exc_info=True,
+            )
+            return False
+
+    return _gate
 
 
 # --------------------------------------------------------------------------- #
@@ -608,6 +766,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="state bridge between ticks (default 'memory')",
     )
     p.add_argument("--max-activations", type=int, default=None, help="stop after N ticks")
+    p.add_argument(
+        "--max-total-wallclock-s", type=float, default=None, metavar="SECONDS",
+        help=(
+            "circuit-breaker: stop (rc 1) once cumulative ACTIVE agent compute "
+            "across ticks reaches this many seconds (excludes idle sleep between "
+            "ticks; for calendar deadlines use --until). Per-tick cost is capped "
+            "separately via the CCX_MAX_COST_USD env / ccx_max_cost_usd config."
+        ),
+    )
     p.add_argument(
         "--until", default=None,
         help=(
@@ -652,6 +819,8 @@ def _validate_cli_combo(args: argparse.Namespace) -> str | None:
         return "--catch-up only applies to --interval schedules"
     if args.max_activations is not None and args.max_activations < 1:
         return "--max-activations must be >= 1"
+    if args.max_total_wallclock_s is not None and args.max_total_wallclock_s <= 0:
+        return "--max-total-wallclock-s must be > 0"
     return None
 
 
@@ -711,10 +880,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_activations = 1
 
     try:
-        stop = StopConditions(max_activations=max_activations, until=until)
+        stop = StopConditions(
+            max_activations=max_activations,
+            until=until,
+            max_total_wallclock_s=args.max_total_wallclock_s,
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    # Unattended-safety nudge: a daemon with no completion (--max-activations),
+    # no deadline (--until), and no compute cap (--max-total-wallclock-s) runs
+    # forever with unbounded total footprint. That is a legitimate choice, but
+    # it should be deliberate, so surface it loudly (always — this is a safety
+    # notice, not per-tick info, so --quiet does not suppress it).
+    if (
+        stop.max_activations is None
+        and stop.until is None
+        and stop.max_total_wallclock_s is None
+    ):
+        print(
+            "warning: schedule is fully unbounded (no --max-activations, "
+            "--until, or --max-total-wallclock-s). It will run until stopped by "
+            "the agent, a signal, or the failure breaker. Set a bound and/or "
+            "CCX_MAX_COST_USD for an unattended daemon.",
+            file=sys.stderr,
+        )
 
     # Lazy import so importing this module (and unit-testing the pure pieces)
     # never pulls the full agent/LLM stack.
@@ -756,6 +947,7 @@ __all__ = [
     "ScheduleSpec",
     "StopConditions",
     "run_schedule",
+    "make_failure_pattern_gate",
     "schedule_enabled",
     "SCHEDULE_STOP_TAG",
     "SCHEDULE_STOP_SENTINEL",

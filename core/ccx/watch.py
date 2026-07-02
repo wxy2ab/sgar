@@ -1229,6 +1229,180 @@ def render_failure_patterns_text(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def compute_governance_patterns(
+    conn: sqlite3.Connection,
+    *,
+    run_id: str | None = None,
+    limit_runs: int | None = None,
+) -> dict[str, Any]:
+    """Aggregate run-level governance NOT-PASSED verdicts ACROSS runs.
+
+    The cross-run twin of :func:`compute_failure_patterns`, but over the
+    run-boundary ``ccx.governance.verdict`` event (opt-in via
+    ``CCX_EMIT_GOVERNANCE_EVENTS``) instead of node failures. It surfaces the
+    self-improvement signal a node-level view misses: runs whose nodes all went
+    green but whose RUN-level verdict said NO (performative completion), and
+    which governance gate + ``stop_reason`` recurs across a campaign.
+
+    Reads the typed event payload (``passed`` + the three sub-verdicts, each
+    carrying ``passed`` / ``stop_reason``); no log scraping; read-only. When the
+    emit flag was never on there are no such events and the report is empty
+    (``totals.not_passed == 0``, ``runs_evaluated == 0``) — harmless.
+
+    Grouping: one pattern per failing sub-verdict, keyed ``<gate>:<stop_reason>``
+    (gate ∈ ``contract`` / ``run_audit`` / ``goal``), plus a
+    ``degraded:abandoned_warning`` pattern for partial/degraded completions. A
+    run tripping several gates counts once per gate. The LATEST governance event
+    per run wins (a re-driven run supersedes its earlier verdict).
+
+    Scope: all runs by default; ``run_id`` one run; ``limit_runs`` the most
+    recent N (by ``runs.updated_at_ms``). ``run_id`` takes precedence.
+    """
+    from core.ccx.services.governance_events import GOVERNANCE_VERDICT_EVENT_KIND
+
+    allowed_runs: set[str] | None = None
+    if run_id is not None:
+        allowed_runs = {run_id}
+    elif limit_runs is not None and limit_runs > 0:
+        recent = _query(
+            conn,
+            "SELECT run_id FROM runs ORDER BY updated_at_ms DESC LIMIT ?",
+            (limit_runs,),
+        )
+        allowed_runs = {_row_get(r, "run_id", "") for r in recent}
+
+    rows = _query(
+        conn,
+        "SELECT run_id, payload_json, created_at_ms FROM events "
+        "WHERE kind = ? ORDER BY sequence ASC",
+        (GOVERNANCE_VERDICT_EVENT_KIND,),
+    )
+    # Latest governance verdict per run (ascending order ⇒ last wins).
+    latest: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        rid = _row_get(r, "run_id", "") or ""
+        if allowed_runs is not None and rid not in allowed_runs:
+            continue
+        payload = _loads(_row_get(r, "payload_json"))
+        if not isinstance(payload, dict):
+            continue
+        latest[rid] = {"payload": payload, "ts": _row_get(r, "created_at_ms") or 0}
+
+    by_key: dict[str, dict[str, Any]] = {}
+
+    def _bump(key: str, rid: str, ts: int, sample: str) -> None:
+        b = by_key.get(key)
+        if b is None:
+            b = by_key[key] = {
+                "runs": set(), "count": 0,
+                "first_seen_ms": ts or None, "last_seen_ms": ts or None,
+                "sample_run": "", "sample_detail": "",
+            }
+        b["count"] += 1
+        b["runs"].add(rid)
+        if ts:
+            b["first_seen_ms"] = min(b["first_seen_ms"] or ts, ts)
+            b["last_seen_ms"] = max(b["last_seen_ms"] or ts, ts)
+        if not b["sample_run"]:
+            b["sample_run"] = rid
+            b["sample_detail"] = sample
+
+    for rid, entry in latest.items():
+        payload = entry["payload"]
+        ts = entry["ts"]
+        matched = False
+        for source in ("contract_verdict", "run_audit_verdict", "goal_verdict"):
+            sub = payload.get(source)
+            if isinstance(sub, dict) and sub.get("passed") is False:
+                reason = sub.get("stop_reason") or sub.get("status") or "unknown"
+                gate = source.replace("_verdict", "")
+                _bump(f"{gate}:{reason}", rid, ts, f"status={payload.get('status')}")
+                matched = True
+        # Overall not-passed but no sub-verdict explicitly False (edge case).
+        if payload.get("passed") is False and not matched:
+            _bump("unknown:not_passed", rid, ts, f"status={payload.get('status')}")
+        if payload.get("abandoned_warning"):
+            _bump(
+                "degraded:abandoned_warning", rid, ts,
+                f"abandoned={payload.get('abandoned')}",
+            )
+
+    kinds: list[dict[str, Any]] = []
+    for key, b in by_key.items():
+        kinds.append({
+            "kind": key,
+            "count": b["count"],
+            "runs": len(b["runs"]),
+            "run_sample": sorted(b["runs"])[:3],
+            "first_seen_ms": b["first_seen_ms"],
+            "last_seen_ms": b["last_seen_ms"],
+            "sample_run": b["sample_run"],
+            "sample_detail": b["sample_detail"],
+        })
+    kinds.sort(key=lambda k: (-k["count"], k["kind"]))
+
+    runs_affected = {rid for b in by_key.values() for rid in b["runs"]}
+    if run_id is not None:
+        scope = run_id
+    elif limit_runs:
+        scope = f"recent-{limit_runs}"
+    else:
+        scope = "all-runs"
+    return {
+        "scope": scope,
+        "kinds": kinds,
+        "totals": {
+            "not_passed": sum(k["count"] for k in kinds),
+            "kinds": len(kinds),
+            "runs_affected": len(runs_affected),
+            "runs_evaluated": len(latest),
+        },
+    }
+
+
+def render_governance_patterns_text(report: dict[str, Any]) -> str:
+    """Format :func:`compute_governance_patterns` output as a fixed-width table."""
+    kinds = report.get("kinds") or []
+    scope = report.get("scope", "?")
+    tot = report.get("totals") or {}
+    evaluated = int(tot.get("runs_evaluated", 0) or 0)
+    if not kinds:
+        note = (
+            "(no not-passed governance verdicts)"
+            if evaluated
+            else "(no ccx.governance.verdict events — set "
+                 "CCX_EMIT_GOVERNANCE_EVENTS=1 to record them)"
+        )
+        return f"=== Governance patterns ({scope}) ===\n{note}"
+
+    lines = [f"=== Governance patterns ({scope}) ==="]
+    header = f"{'gate:reason':<28} {'count':>6} {'runs':>5} {'last seen':<15}"
+    lines.append(header)
+    lines.append("-" * len(header))
+    for k in kinds:
+        lines.append(
+            f"{_truncate(k['kind'], 28):<28} "
+            f"{k['count']:>6} {k['runs']:>5} "
+            f"{_ms_to_iso(k.get('last_seen_ms')):<15}"
+        )
+    lines.append("-" * len(header))
+    lines.append(
+        f"{'TOTAL':<28} {tot.get('not_passed', 0):>6} "
+        f"{tot.get('runs_affected', 0):>5}  "
+        f"({tot.get('kinds', 0)} kind(s) / {evaluated} governed run(s))"
+    )
+
+    samples = [k for k in kinds[:5] if k.get("sample_run")]
+    if samples:
+        lines.append("")
+        for k in samples:
+            lines.append(
+                f"• {k['kind']} ({k['count']}×, {k['runs']} run(s)) "
+                f"e.g. {k['sample_run']}: {_truncate(k.get('sample_detail', ''), 80)}"
+            )
+    return "\n".join(lines)
+
+
 def render_snapshot_text(snap: dict[str, Any]) -> str:
     view = snap.get("view")
     if view == "runs":
@@ -1352,11 +1526,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--governance",
+        action="store_true",
+        help=(
+            "One-shot CROSS-RUN governance-verdict report: aggregates "
+            "run-level NOT-PASSED verdicts (the ccx.governance.verdict event, "
+            "opt-in via CCX_EMIT_GOVERNANCE_EVENTS) by gate:stop_reason — the "
+            "performative-completion / recurring-gate view a node-level report "
+            "misses. Defaults to all runs; scope with --run-id or "
+            "--limit-runs N."
+        ),
+    )
+    p.add_argument(
         "--limit-runs",
         type=int,
         default=None,
         metavar="N",
-        help="With --failures: restrict to the most recent N runs.",
+        help="With --failures / --governance: restrict to the most recent N runs.",
     )
     return p
 
@@ -1472,6 +1658,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.tail or args.follow:
             raise SystemExit("--failures is a one-shot report; can't combine "
                              "with --tail or --follow")
+    if args.governance:
+        if args.stats or args.failures:
+            raise SystemExit("--governance, --failures and --stats are "
+                             "separate reports; pick one")
+        if args.tail or args.follow:
+            raise SystemExit("--governance is a one-shot report; can't combine "
+                             "with --tail or --follow")
 
     db_path = resolve_db_path(args.cwd)
     try:
@@ -1497,6 +1690,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps(report, ensure_ascii=False, default=str))
             else:
                 print(render_failure_patterns_text(report))
+            return 0
+
+        if args.governance:
+            report = compute_governance_patterns(
+                conn, run_id=args.run_id, limit_runs=args.limit_runs,
+            )
+            if args.format == "json":
+                print(json.dumps(report, ensure_ascii=False, default=str))
+            else:
+                print(render_governance_patterns_text(report))
             return 0
 
         if args.tail:

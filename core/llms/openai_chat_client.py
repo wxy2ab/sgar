@@ -4,6 +4,11 @@ import json
 import base64
 import httpx
 from ._llm_api_client import LLMApiClient
+from ._empty_content_retry import (
+    DEFAULT_EMPTY_CONTENT_RETRIES,
+    is_blank,
+    reissue_completion_on_empty,
+)
 from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 from ratelimit import limits, sleep_and_retry
@@ -301,14 +306,44 @@ class OpenAIChatClient(LLMApiClient):
                 return completion
             if not completion.choices:
                 raise RuntimeError("LLM API returned empty choices")
-            choice = completion.choices[0]
-            self._last_finish_reason = getattr(choice, "finish_reason", None)
-            if self._last_finish_reason == "length":
-                self.truncated_count += 1
-            self._last_reasoning_content = getattr(choice.message, "reasoning_content", None)
-            response = choice.message.content
-            self._update_stats(completion.usage)
-            return response
+            response = self._extract_completion_text(completion)
+            # A reasoning-capable model can spend the whole turn on hidden
+            # reasoning_content and return empty visible content with
+            # finish_reason="stop" (no exception, so one_chat's @retry never
+            # fires). Only the plain text path can be silently empty — the
+            # tool path may legitimately carry empty content alongside
+            # tool_calls, so it is left untouched. See _empty_content_retry.
+            if tools or not is_blank(response):
+                return response
+            return reissue_completion_on_empty(
+                create=lambda call_kwargs: self.client.chat.completions.create(**call_kwargs),
+                extract=self._extract_completion_text,
+                kwargs=kwargs,
+                enable_thinking=self.enable_thinking,
+                retries=self._EMPTY_CONTENT_RETRIES,
+                client_name=type(self).__name__,
+                last_finish_reason=self._last_finish_reason,
+                last_reasoning=self._last_reasoning_content or "",
+            )
+
+    #: Re-issues after an empty visible content (last attempt disables
+    #: thinking). Subclasses may override; VolcCodingClient relies on this.
+    _EMPTY_CONTENT_RETRIES = DEFAULT_EMPTY_CONTENT_RETRIES
+
+    def _extract_completion_text(self, completion) -> Optional[str]:
+        """Pull visible content from a non-stream completion, recording
+        finish_reason / truncation / reasoning / usage as a side effect.
+        Returns None when the completion carries no choices (treated as empty
+        by the retry loop)."""
+        if not completion.choices:
+            return None
+        choice = completion.choices[0]
+        self._last_finish_reason = getattr(choice, "finish_reason", None)
+        if self._last_finish_reason == "length":
+            self.truncated_count += 1
+        self._last_reasoning_content = getattr(choice.message, "reasoning_content", None)
+        self._update_stats(completion.usage)
+        return choice.message.content
 
     @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
     def tool_invoke(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
