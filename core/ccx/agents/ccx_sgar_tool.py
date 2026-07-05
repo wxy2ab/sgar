@@ -196,12 +196,22 @@ class CcxSgarTool(BaseTool):
         self.buffer = buffer
 
     def is_enabled(self, ctx: Any) -> bool:
-        # Hidden from the LLM-facing schema; the unified ``CcxUnifiedTool``
-        # in ccx_tool.py replaces this surface. Class kept for direct
-        # instantiation by tests and for SgarBuffer/SgarRequest types
+        # Enabled so a by-name dispatch of the legacy ``ccx_sgar`` wire name
+        # still executes (older clients / fake-LLM tool_calls that hardcode it).
+        # cc's executor rejects dispatch of *disabled* tools (TL1009); hiding
+        # from the schema is expressed via ``is_hidden`` instead, so this alias
+        # stays dispatchable while the unified ``CcxUnifiedTool`` (ccx_spawn)
+        # owns the visible surface.
+        del ctx
+        return True
+
+    def is_hidden(self, ctx: Any) -> bool:
+        # Omitted from the LLM-facing schema; ``CcxUnifiedTool`` in ccx_tool.py
+        # replaces this surface. Class kept for direct instantiation by tests,
+        # for by-name back-compat dispatch, and for SgarBuffer/SgarRequest types
         # still consumed by CcAgentRunner's drain logic.
         del ctx
-        return False
+        return True
 
     def validate_input(self, arguments: dict[str, Any]) -> ValidationResult:
         if not arguments.get("instruction") and not arguments.get("instructions"):

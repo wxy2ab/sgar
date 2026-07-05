@@ -165,7 +165,8 @@ class CodeAgent:
                 self._close_engine(engine)
 
     def run_sync(self, request: AgentRunRequest) -> AgentRunResult:
-        return _run_coro_sync(self.run(request))
+        config = request.config or self.config or load_cc_config()
+        return _run_coro_sync(self.run(request), timeout_seconds=_turn_join_timeout(config))
 
     async def build_code(self, request: CodeBuildRequest) -> AgentRunResult:
         config = request.config or self.config or load_cc_config()
@@ -198,7 +199,8 @@ class CodeAgent:
         )
 
     def build_code_sync(self, request: CodeBuildRequest) -> AgentRunResult:
-        return _run_coro_sync(self.build_code(request))
+        config = request.config or self.config or load_cc_config()
+        return _run_coro_sync(self.build_code(request), timeout_seconds=_turn_join_timeout(config))
 
     async def stream_build_code(self, request: CodeBuildRequest) -> AsyncIterator[SessionEvent]:
         config = request.config or self.config or load_cc_config()
@@ -326,12 +328,31 @@ class CodeAgent:
         )
 
 
-def _run_coro_sync(coro: Any) -> Any:
+def _turn_join_timeout(config: CCConfig | None) -> float | None:
+    """Backstop join timeout for the nested-loop thread, derived from the turn
+    budget so a normal multi-minute turn does not false-trip.
+
+    A hardcoded 300s cap orphaned the daemon thread and raised on any turn
+    longer than 5 minutes, even though turns are budgeted at
+    ``max_turn_timeout_seconds`` (default 7200s). Use ``budget + margin``; if the
+    turn timeout is disabled (``None``), don't impose a shorter join cap.
+    """
+    budget = getattr(config, "max_turn_timeout_seconds", None) if config is not None else None
+    if config is None:
+        budget = 7200.0  # CCConfig default turn budget
+    if budget is None:
+        return None
+    return float(budget) + 300.0
+
+
+def _run_coro_sync(coro: Any, *, timeout_seconds: float | None = None) -> Any:
     """Compatibility sync wrapper for async-first APIs.
 
     Prefer the async methods when integrating into applications that already own
     an event loop. This helper keeps backwards compatibility for scripts and
-    simple synchronous callers.
+    simple synchronous callers. ``timeout_seconds`` bounds the nested-loop
+    thread join (``None`` waits indefinitely); callers derive it from the turn
+    budget via ``_turn_join_timeout``.
     """
 
     try:
@@ -349,9 +370,11 @@ def _run_coro_sync(coro: Any) -> Any:
 
     thread = threading.Thread(target=run_in_thread, daemon=True)
     thread.start()
-    thread.join(timeout=300)
+    thread.join(timeout=timeout_seconds)
     if thread.is_alive():
-        raise RuntimeError("_run_coro_sync timed out after 300s — possible deadlock in nested event loop")
+        raise RuntimeError(
+            f"_run_coro_sync timed out after {timeout_seconds}s — possible deadlock in nested event loop"
+        )
     if "error" in outcome:
         raise outcome["error"]
     return outcome.get("result")

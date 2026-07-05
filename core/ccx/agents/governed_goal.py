@@ -308,7 +308,12 @@ def _parse_verification(raw: Any) -> VerificationSpec:
         return VerificationSpec(checks=[], judge_rubric=None)
     checks = _criteria_from_raw(raw.get("checks"))
     rubric_raw = raw.get("judge_rubric")
-    rubric = str(rubric_raw).strip() if rubric_raw else None
+    # A rubric emitted as the STRING "null"/"none" (not JSON null) is truthy and
+    # would flip an intended-UNGATED goal into a judged run against a nonsense
+    # rubric (burning the full iteration budget re-driving). Normalise the
+    # common string spellings of "no value" to real None.
+    _rubric = str(rubric_raw).strip() if rubric_raw else ""
+    rubric = None if _rubric.lower() in {"", "null", "none"} else _rubric
     # Criteria that carry text but no runnable [check:] command cannot be
     # machine-verified. Rather than silently dropping them (which would let a
     # goal with declared-but-unverifiable acceptance criteria auto-PASS as
@@ -353,9 +358,15 @@ def _criteria_from_raw(raw: Any) -> list[ExitCriterion]:
         if not text and not check_str:
             continue
         explicit = str(item.get("id") or "").strip()
-        if explicit:
+        if explicit and explicit not in used:
             cid = explicit
         else:
+            # Either no id, OR an explicit id that COLLIDES with one already
+            # used (explicit-vs-explicit / explicit-vs-auto). A shared
+            # criterion_id would collapse downstream in the dict-keyed evidence
+            # maps (last-write-wins, silently losing a criterion), so fall back
+            # to the next free auto id — the same renumbering the no-id branch
+            # does — keeping BOTH criteria under distinct ids.
             auto_n += 1
             cid = f"V{auto_n}"
             while cid in explicit_ids or cid in used:

@@ -27,7 +27,7 @@ class Config(metaclass=Singleton):
         self.loaded_path: Optional[Path] = self._resolve_existing_path()
 
         if self.loaded_path is not None:
-            self.config.read(self.loaded_path, encoding='utf-8')
+            self.config.read(self.loaded_path, encoding='utf-8-sig')
             self.file_name = str(self.loaded_path)
             self.use_file = True
         else:

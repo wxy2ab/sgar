@@ -297,7 +297,16 @@ class WorkGraph:
     def _has_cycle(self) -> bool:
         # Iterative DFS; nodes have small fanout so this is fine.
         WHITE, GRAY, BLACK = 0, 1, 2
+        # Colour every node AND every edge target. A rehydrated node inserted
+        # via add_execution(validate_deps=False) can carry a dangling dep whose
+        # target is not in self._nodes; that dep still gets pushed onto the
+        # stack below, so it must have a colour entry or the pop-time reads
+        # (color[node_id]) KeyError — silently turning a spawn into a
+        # non-retryable failure and losing its children (defect 6).
         color: dict[str, int] = {nid: WHITE for nid in self._nodes}
+        for deps in self._edges.values():
+            for dep in deps:
+                color.setdefault(dep, WHITE)
 
         for start in self._nodes:
             if color[start] != WHITE:

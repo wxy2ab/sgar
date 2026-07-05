@@ -4253,12 +4253,19 @@ def _parse_investigator_response(
     if isinstance(issues_raw, list):
         for item in issues_raw:
             if isinstance(item, dict):
-                issues.append({
+                entry = {
                     "severity": str(item.get("severity") or "medium").lower(),
                     "title": str(item.get("title") or "").strip(),
                     "detail": str(item.get("detail") or "").strip(),
                     "where": str(item.get("where") or "").strip(),
-                })
+                }
+                # Drop an all-empty issue ({} or blank fields): severity defaults
+                # to "medium" so it alone never makes an issue "populated". An
+                # empty entry would otherwise count toward the >=1-issue
+                # depth-retry bypass and render as blank synthesizer noise —
+                # violating the "populated issues" contract.
+                if entry["title"] or entry["detail"] or entry["where"]:
+                    issues.append(entry)
     confidence = str(parsed.get("confidence") or "medium").lower()
     if confidence not in {"high", "medium", "low"}:
         confidence = "medium"

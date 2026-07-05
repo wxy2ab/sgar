@@ -22,6 +22,12 @@ class ConfigV5:
     max_loop_iterations: int = 10_000
     """Hard ceiling on engine.run() iterations to prevent runaway loops."""
 
+    budget_flush_every_n_iterations: int = 10
+    """Persist the budget snapshot to the DB every N loop iterations (plus on a
+    warning crossing). Bounds the in-flight budget delta lost to a hard
+    SIGKILL/OOM so resume cannot resurrect already-spent budget. 0 disables the
+    periodic flush (loop-boundary + warning-crossing flushes still fire)."""
+
     parallelism: int = 1
     """How many ready nodes to dispatch concurrently (in-process threads).
     Use multi-process via worker_count on RuntimeV5 instead for isolation."""
@@ -39,6 +45,14 @@ class ConfigV5:
     heartbeat_interval_ms: int = 10_000
     harness_reclaim_interval_s: float = 1.0
     """Minimum seconds between WorkerHarness expired-lease reclaim sweeps."""
+
+    expect_external_workers: bool = False
+    """Set True only when external WorkerHarness processes compete for this
+    run's leases. When False (the default single-process deployment), resume()
+    force-reclaims every RUNNING node immediately — any surviving lease must
+    belong to the dead prior process — instead of waiting out the lease TTL. A
+    genuine multi-process topology keeps the TTL slack so a still-live peer's
+    node is not yanked mid-flight."""
 
     # Compaction --------------------------------------------------------------
     compaction_max_active_claims: int = 200
@@ -84,6 +98,8 @@ class ConfigV5:
             raise ValueError("poll_interval_s must be >= 0")
         if self.max_loop_iterations < 1:
             raise ValueError("max_loop_iterations must be >= 1")
+        if self.budget_flush_every_n_iterations < 0:
+            raise ValueError("budget_flush_every_n_iterations must be >= 0")
         if self.max_replans_per_node < 1:
             raise ValueError("max_replans_per_node must be >= 1")
         if self.max_replans_per_run < 1:

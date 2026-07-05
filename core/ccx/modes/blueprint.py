@@ -45,25 +45,31 @@ class BlueprintModeRunner(ModeRunner):
         if not isinstance(request_metadata, dict):
             request_metadata = {}
         cwd = str(invocation.metadata.get("cwd") or self.cwd or ".")
-        # Resolve --session from the command text only — resume/steer
-        # context prepended to the goal must not hijack session routing.
-        _, command_text = resolve_sgar_command(
-            invocation.goal,
-            metadata=invocation.metadata,
-        )
-        session_id = (
-            _session_id(command_text)
-            or invocation.metadata.get("sgar_session")
-            or invocation.metadata.get("session_id")
-            or request_metadata.get("sgar_session")
-            or request_metadata.get("session_id")
-        )
-        runtime = SgarRuntime(
-            Path(cwd), session_id=str(session_id) if session_id else None,
-            run_criterion_checks=self.run_criterion_checks,
-            criterion_check_timeout_s=self.criterion_check_timeout_s,
-        )
         try:
+            # Resolve --session from the command text only — resume/steer
+            # context prepended to the goal must not hijack session routing.
+            # NB: resolve_sgar_command / _session_id can raise SgarError (free
+            # text, unterminated fenced block, ``--session`` with no value).
+            # They MUST sit inside the try so an unresolvable instruction
+            # returns the structured governance rejection (final_text="ERROR:.."
+            # + governance_error_extras) instead of escaping as a retryable
+            # FAILED node.
+            _, command_text = resolve_sgar_command(
+                invocation.goal,
+                metadata=invocation.metadata,
+            )
+            session_id = (
+                _session_id(command_text)
+                or invocation.metadata.get("sgar_session")
+                or invocation.metadata.get("session_id")
+                or request_metadata.get("sgar_session")
+                or request_metadata.get("session_id")
+            )
+            runtime = SgarRuntime(
+                Path(cwd), session_id=str(session_id) if session_id else None,
+                run_criterion_checks=self.run_criterion_checks,
+                criterion_check_timeout_s=self.criterion_check_timeout_s,
+            )
             text, extras = run_sgar_instruction(
                 runtime,
                 invocation.goal,

@@ -43,9 +43,16 @@ class PowerShellTool(BaseTool):
         self._impl = ShellTool()
 
     def is_enabled(self, ctx: Any) -> bool:
-        # Hidden from the LLM-facing schema; unified ShellTool replaces it.
+        # Dispatchable by its legacy wire name (routed through ShellTool with
+        # kind="powershell"); cc's executor rejects disabled tools via TL1009,
+        # so hiding from the schema is expressed via is_hidden instead.
         del ctx
-        return False
+        return True
+
+    def is_hidden(self, ctx: Any) -> bool:
+        # Hidden from the LLM-facing schema; the unified ShellTool replaces it.
+        del ctx
+        return True
 
     def validate_input(self, arguments: dict[str, Any]) -> ValidationResult:
         return self._impl.validate_input({**arguments, "kind": "powershell"})

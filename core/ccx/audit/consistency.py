@@ -66,6 +66,21 @@ _POSITIVE_ASSERTION_TOKENS = frozenset({
     "no failures", "100%", "clean",
 })
 
+#: Match each token at a WORD START (left boundary ``(?<!\w)``), not as a bare
+#: substring. This rejects the realistic false positives the substring test let
+#: through — "pass" inside "bypass" and "done" inside "abandoned" (a node STATE
+#: that reads as a success claim) — where the token is a suffix / mid-word.
+#: A left boundary is deliberately used instead of a full ``\b...\b`` so common
+#: inflections still count as assertions ("complete" → "completed", "success" →
+#: "successfully", "pass" → "passed") — existing tests pin that. ``_norm``
+#: case-folds, so no IGNORECASE is needed; tokens are sorted for a deterministic
+#: pattern.
+_POSITIVE_ASSERTION_RE = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(t) for t in sorted(_POSITIVE_ASSERTION_TOKENS))
+    + r")"
+)
+
 _WS_RE = re.compile(r"\s+")
 
 
@@ -136,7 +151,7 @@ def _claim_grounded(claim_text: str, report_text: str) -> tuple[bool, str]:
         return False, "empty claim_text"
     if ct not in _norm(report_text):
         return False, "claim_text is not a span of the report (fabricated citation)"
-    if not any(tok in ct for tok in _POSITIVE_ASSERTION_TOKENS):
+    if not _POSITIVE_ASSERTION_RE.search(ct):
         return False, "claim_text carries no positive assertion (nothing to contradict)"
     return True, ""
 

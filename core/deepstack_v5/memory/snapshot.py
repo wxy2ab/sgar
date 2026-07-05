@@ -122,14 +122,25 @@ def _row_chars(event: dict[str, Any]) -> int:
     ) + 24  # constant overhead per row (sequence, brackets, separators)
 
 
+_FAILED_KINDS = ("node.failed", "cc.tool_failed", "cc.turn_failed")
+# Kinds whose true totals the summary reports; kept in sync with the counting
+# below so build_snapshot can pass an authoritative aggregate.
+SUMMARY_COUNT_KINDS = ("node.succeeded", *_FAILED_KINDS)
+
+
 def _build_summary(
     run_id: str,
     raw_events: list[dict[str, Any]],
+    *,
+    total_succeeded: int | None = None,
+    total_failed: int | None = None,
 ) -> str:
     """One-paragraph headline derived from the event list.
 
     Surfaces:
-    * counts: node.succeeded / node.failed
+    * counts: node.succeeded / node.failed — from ``total_succeeded`` /
+      ``total_failed`` (authoritative aggregates over ALL events) when given,
+      falling back to the windowed ``raw_events`` otherwise (defect 16).
     * the most recent failure's tool_name + error_code (if any)
     * the most recent succeeded node_id (if any)
     """
@@ -141,27 +152,36 @@ def _build_summary(
         if kind == "node.succeeded":
             succeeded += 1
             last_succeeded = ev
-        elif kind in {"node.failed", "cc.tool_failed", "cc.turn_failed"}:
+        elif kind in _FAILED_KINDS:
             failed_events.append(ev)
 
+    # Authoritative totals beat the truncated window; the window is only used
+    # for the "most recent failure/success" detail below.
+    n_succeeded = total_succeeded if total_succeeded is not None else succeeded
+    n_failed = total_failed if total_failed is not None else len(failed_events)
+
     parts: list[str] = []
-    if not raw_events:
+    if not raw_events and not n_succeeded and not n_failed:
         return "(no prior activity)"
 
-    if failed_events:
+    if n_failed:
         parts.append(
-            f"{len(failed_events)} failure(s); {succeeded} node(s) succeeded"
+            f"{n_failed} failure(s); {n_succeeded} node(s) succeeded"
         )
-        last_fail = failed_events[-1]
-        fp = last_fail.get("payload") or {}
-        tool = fp.get("tool_name") or fp.get("tool") or fp.get("node_id")
-        ec = fp.get("error_code")
-        message = fp.get("message") or fp.get("reason") or fp.get("preview") or ""
-        suffix = f" - {ec}" if ec else (f" - {message[:120]}" if message else "")
-        subject = f" on {tool}" if tool else ""
-        parts.append(f"last failure: {last_fail.get('kind')}{subject}{suffix}")
+        if failed_events:
+            # Detail is only available if a failure survived into the window.
+            last_fail = failed_events[-1]
+            fp = last_fail.get("payload") or {}
+            tool = fp.get("tool_name") or fp.get("tool") or fp.get("node_id")
+            ec = fp.get("error_code")
+            message = (
+                fp.get("message") or fp.get("reason") or fp.get("preview") or ""
+            )
+            suffix = f" - {ec}" if ec else (f" - {message[:120]}" if message else "")
+            subject = f" on {tool}" if tool else ""
+            parts.append(f"last failure: {last_fail.get('kind')}{subject}{suffix}")
     else:
-        parts.append(f"{succeeded} node(s) succeeded, no failures")
+        parts.append(f"{n_succeeded} node(s) succeeded, no failures")
 
     if last_succeeded is not None:
         sp = last_succeeded.get("payload") or {}
@@ -187,7 +207,10 @@ def build_snapshot(
     ``max_events`` is the upper limit on the raw read — protects against
     a runaway run with millions of events. Default 5k is plenty for
     real ccx workloads; tune up if you ever need to snapshot a giant
-    historical run.
+    historical run. The summary's succeeded/failed COUNTS are computed via a
+    separate aggregate over ALL events (``count_kinds``) so they stay accurate
+    even when the raw read is truncated to this window; only the detail rows
+    are drawn from the window.
 
     ``max_priority4_events`` is a hard cap for critical rows so a failure
     storm cannot create an unbounded snapshot row. The newest failures win.
@@ -197,7 +220,21 @@ def build_snapshot(
     else:
         raw = event_store.read_after(0, limit=max_events, run_id=run_id)
     highwater = raw[-1]["sequence"] if raw else 0
-    summary = _build_summary(run_id, raw)
+    # Authoritative counts over ALL events so a >max_events run doesn't
+    # under-report (defect 16). Falls back to windowed counts if the store
+    # predates count_kinds.
+    total_succeeded: int | None = None
+    total_failed: int | None = None
+    counter = getattr(event_store, "count_kinds", None)
+    if counter is not None:
+        counts = counter(run_id, SUMMARY_COUNT_KINDS)
+        total_succeeded = counts.get("node.succeeded", 0)
+        total_failed = sum(counts.get(k, 0) for k in _FAILED_KINDS)
+    summary = _build_summary(
+        run_id, raw,
+        total_succeeded=total_succeeded,
+        total_failed=total_failed,
+    )
 
     # Classify and bucket by priority.
     annotated: list[tuple[int, dict[str, Any]]] = []

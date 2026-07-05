@@ -19,10 +19,16 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def list_visible(self, ctx: ToolUseContext) -> list[BaseTool]:
+        # The LLM-facing schema = enabled AND not hidden. ``is_enabled`` gates
+        # both visibility and dispatch (a disabled tool is rejected at the
+        # executor, TL1009); ``is_hidden`` gates visibility ONLY, so a hidden
+        # legacy wire-name alias stays dispatchable by name while a newer
+        # unified tool owns the visible surface.
         return [
             self._tools[name]
             for name in sorted(self._tools)
             if self._tools[name].is_enabled(ctx)
+            and not self._tools[name].is_hidden(ctx)
         ]
 
     def export_model_schemas(self, ctx: ToolUseContext) -> list[dict]:

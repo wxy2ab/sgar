@@ -421,6 +421,10 @@ class ContentStore:
         """
         chunks = chunk_markdown(content)
         if not chunks:
+            # An empty / whitespace-only write is still a valid upsert: clear
+            # any previously-indexed content for this source_id instead of
+            # early-returning and leaving stale chunks behind (defect 8).
+            self._delete_source(source_id)
             return 0
         return self._write_chunks(
             run_id=run_id,
@@ -430,6 +434,21 @@ class ContentStore:
             chunks=chunks,
             total_bytes=len(content.encode("utf-8")),
         )
+
+    def _delete_source(self, source_id: str) -> None:
+        """Remove a source's row and all its chunks in one transaction."""
+        conn = self._conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM chunks WHERE source_id = ?", (source_id,))
+            conn.execute("DELETE FROM sources WHERE source_id = ?", (source_id,))
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     def _write_chunks(
         self,

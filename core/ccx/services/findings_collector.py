@@ -4,9 +4,10 @@ ccx's doc mode decomposes a goal into N parallel investigator nodes
 plus a synthesizer node. The synthesizer's input is the union of the
 investigators' findings — but v5's dispatcher only uses ``depends_on``
 for ordering; it does NOT automatically inject completed predecessor
-results into a dependent's ``params`` (see
-``core/deepstack_v5/execution/dispatcher.py:243`` and
-``core/deepstack_v5/engine.py:402``).
+results into a dependent's ``params``. Params are passed verbatim from
+``node.spec.params`` in ``Dispatcher._run_tool`` (via ``cap.fn(**tc.params)``),
+while ``depends_on`` is consumed only for topological ordering in
+``Dispatcher._order_spawn_specs`` — neither reads a predecessor's output.
 
 So we need a sidecar: every investigator pushes its structured finding
 keyed by ``run_id`` + ``dimension_id``; the synthesizer pops the full

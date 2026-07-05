@@ -171,6 +171,7 @@ def _parse_acceptance(raw: Any) -> list[ExitCriterion]:
     if not isinstance(raw, list):
         raise ContractError("contract.acceptance must be a list")
     criteria: list[ExitCriterion] = []
+    seen: set[str] = set()
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             raise ContractError(
@@ -183,6 +184,15 @@ def _parse_acceptance(raw: Any) -> list[ExitCriterion]:
                 f"contract.acceptance[{i}] requires non-empty 'text'"
             )
         criterion_id = str(item.get("id") or f"C{i + 1}").strip() or f"C{i + 1}"
+        # Author-written contract ⇒ fail loud. Evidence is keyed by
+        # criterion_id downstream, so a duplicate (explicit-vs-explicit or
+        # explicit-vs-auto ``C{i+1}``) would collapse to last-write-wins.
+        if criterion_id in seen:
+            raise ContractError(
+                f"contract.acceptance[{i}]: duplicate criterion id "
+                f"{criterion_id!r} — acceptance ids must be unique"
+            )
+        seen.add(criterion_id)
         check = item.get("check")
         check_str = str(check).strip() if check else None
         criteria.append(ExitCriterion(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Any
 
 from ..config import CCConfig
@@ -206,7 +207,9 @@ class MemoryRuntime:
         deduped: list[MemoryHit] = []
         seen: set[tuple[str, str, str]] = set()
         for hit in hits:
-            key = (hit.wing, hit.room, hit.summary)
+            # Key on a hash of the FULL text, not the 200-char-truncated summary,
+            # so two distinct memories sharing a long prefix aren't collapsed.
+            key = (hit.wing, hit.room, hashlib.sha1(hit.text.encode("utf-8")).hexdigest())
             if key in seen:
                 continue
             seen.add(key)

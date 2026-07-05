@@ -20,12 +20,19 @@ from typing import Any, Callable
 from .persistence.db import SQLiteRuntimeDB
 from .persistence.outbox import Outbox
 from .persistence.stores import EventStore
+from .types import now_ms
 
 
 logger = logging.getLogger(__name__)
 
 
 Subscriber = Callable[[dict[str, Any]], None]
+
+# Delivered outbox rows are only a crash-recovery convenience; purge them
+# periodically so the table doesn't grow without bound (defect 17). Keep a
+# generous retention window so a prompt reset_pending()/replay still works.
+_OUTBOX_PURGE_INTERVAL = 512
+_OUTBOX_RETENTION_MS = 3_600_000  # 1 hour
 
 
 class EventBus:
@@ -45,6 +52,8 @@ class EventBus:
         # only). Lets operators/tests distinguish "no db configured" (seq == 0)
         # from "persistence failed" (seq == -1) without crashing the engine.
         self._persist_failures = 0
+        # Amortised outbox retention: purge delivered rows every N publishes.
+        self._publishes_since_purge = 0
 
     @property
     def persist_failures(self) -> int:
@@ -118,7 +127,22 @@ class EventBus:
                     "redeliver, harmless for in-process subscribers.",
                     seq, run_id, exc,
                 )
+            else:
+                self._maybe_purge_outbox()
         return seq
+
+    def _maybe_purge_outbox(self) -> None:
+        """Amortised retention: every _OUTBOX_PURGE_INTERVAL delivered events,
+        drop delivered rows older than the retention window so the outbox table
+        stays bounded (defect 17). Best-effort — never fails a publish."""
+        self._publishes_since_purge += 1
+        if self._publishes_since_purge < _OUTBOX_PURGE_INTERVAL:
+            return
+        self._publishes_since_purge = 0
+        try:
+            self._outbox.purge_delivered(before_ms=now_ms() - _OUTBOX_RETENTION_MS)
+        except sqlite3.DatabaseError as exc:
+            logger.warning("EventBus: outbox purge failed: %s", exc)
 
     def _notify(self, event: dict[str, Any]) -> None:
         with self._lock:

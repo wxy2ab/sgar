@@ -518,6 +518,8 @@ class StructuredFlowRunner:
 
         tasks: list[TaskDefinition] = []
         dropped = 0
+        duplicate_ids = 0
+        seen_ids: set[str] = set()
         for i, item in enumerate(parsed):
             if not isinstance(item, dict):
                 dropped += 1
@@ -533,8 +535,20 @@ class StructuredFlowRunner:
                     s = str(dep or "").strip()
                     if s:
                         depends_on.append(s)
+            task_id = str(item.get("id", f"task_{i + 1}"))
+            if task_id in seen_ids:
+                # Duplicate planner id. Downstream ``by_id`` is last-wins and
+                # ``remaining`` is a set, so a collision would silently drop the
+                # earlier task while its output was still emitted twice in the
+                # summary. Rename to a unique id so every task runs exactly once.
+                duplicate_ids += 1
+                suffix = 2
+                while f"{task_id}__{suffix}" in seen_ids:
+                    suffix += 1
+                task_id = f"{task_id}__{suffix}"
+            seen_ids.add(task_id)
             tasks.append(TaskDefinition(
-                id=str(item.get("id", f"task_{i + 1}")),
+                id=task_id,
                 description=description,
                 task_type=str(item.get("type", "code_change")),
                 depends_on=depends_on,
@@ -544,5 +558,10 @@ class StructuredFlowRunner:
                 "Structured flow: dropped %d invalid task entries during parsing",
                 dropped,
             )
+        if duplicate_ids:
+            logger.warning(
+                "Structured flow: renamed %d duplicate task id(s) during parsing",
+                duplicate_ids,
+            )
         return tasks, {"dropped": dropped, "raw_length": raw_len,
-                       "parse_error": False}
+                       "parse_error": False, "duplicate_ids": duplicate_ids}

@@ -157,8 +157,17 @@ def read_trace(store: SgarStore) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
+        if not line.strip():
+            continue
+        try:
             records.append(json.loads(line))
+        except json.JSONDecodeError:
+            # A torn/corrupt line — e.g. a crash mid-append to this append-only
+            # JSONL — must not sink the whole trace: read_failed_trace,
+            # fsm_recovery_stats and the ``sgar trace`` CLI still need the
+            # intact records. Skip it (mirrors SgarStore.read_json's
+            # JSONDecodeError handling).
+            continue
     return records
 
 

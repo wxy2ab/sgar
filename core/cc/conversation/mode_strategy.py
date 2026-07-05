@@ -211,6 +211,17 @@ _FOCUSED_SUBTREE_DEPTH = 3
 _FOCUSED_SUBTREE_ENTRIES = 12
 
 
+def _is_within_workspace(resolved: Path, root: Path | None) -> bool:
+    """True if ``resolved`` is the workspace root or a descendant of it."""
+    if root is None:
+        return False
+    try:
+        resolved.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def build_paths_in_request_block(
     user_input: str | list[dict[str, object]],
     cwd: str | Path,
@@ -247,9 +258,14 @@ def build_paths_in_request_block(
                 resolved = cand.resolve()
             except OSError:
                 resolved = cand
-            if resolved.exists():
+            if resolved.exists() and _is_within_workspace(resolved, cwd_path):
                 status = "[verified]"
                 target = resolved
+            elif resolved.exists():
+                # A ``../`` / absolute token that resolves OUTSIDE the workspace
+                # must not be marked verified nor have its subtree embedded into
+                # the prompt (information disclosure). Acknowledge it, no content.
+                status = "[outside workspace — not shown]"
             else:
                 status = "[missing in cwd — verify with `glob`]"
         lines.append(f"- {status} `{tok}`")

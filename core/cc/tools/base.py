@@ -65,6 +65,21 @@ class BaseTool:
         del ctx
         return True
 
+    def is_hidden(self, ctx: Any) -> bool:
+        """Whether this tool is omitted from the LLM-facing schema while still
+        remaining dispatchable by name.
+
+        Distinct from ``is_enabled``. A *disabled* tool (``is_enabled`` False)
+        is both invisible to the model *and* rejected at the executor choke
+        point (TL1009) if dispatched by name. A *hidden* tool is invisible to
+        the model but still executes when a caller dispatches it by its wire
+        name — the pattern used by legacy wire-name aliases that a newer
+        unified tool has superseded in the schema. Default: not hidden, so the
+        LLM-facing surface is unchanged for every existing tool.
+        """
+        del ctx
+        return False
+
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         del arguments
         return self.spec.is_read_only

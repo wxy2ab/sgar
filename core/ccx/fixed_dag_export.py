@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from core.deepstack_v5 import NodeSpec
-from core.deepstack_v5.execution.node import _spec_from_dict, _spec_to_dict
+from core.deepstack_v5.execution.node import spec_from_dict, spec_to_dict
 from core.deepstack_v5.persistence import GraphStore, SQLiteRuntimeDB
 
 
@@ -174,7 +174,7 @@ def export_draft_dag(
     warnings: list[str] = []
     # Distil from the first observation (all share a shape by the check above).
     for row in per_run_rows[0]:
-        spec = _spec_from_dict(row["spec"])
+        spec = spec_from_dict(row["spec"])
         needs = _needs_authoring(spec.tool)
         # A fresh draft carries NONE of the original run's node metadata. That
         # bookkeeping (parent_node_id, cwd, session_id, sgar_session, spawn
@@ -240,7 +240,7 @@ def draft_to_dict(draft: DraftDag) -> dict[str, Any]:
         "created_at_ms": draft.created_at_ms,
         "expires_at_ms": draft.expires_at_ms,
         "warnings": list(draft.warnings),
-        "nodes": [_spec_to_dict(s) for s in draft.specs],
+        "nodes": [spec_to_dict(s) for s in draft.specs],
     }
 
 
@@ -264,7 +264,7 @@ def load_draft_dag(path: Path | str) -> DraftDag:
             f"this build understands {_ENVELOPE_VERSION}"
         )
     return DraftDag(
-        specs=[_spec_from_dict(n) for n in data.get("nodes") or []],
+        specs=[spec_from_dict(n) for n in data.get("nodes") or []],
         created_from_run_ids=list(data.get("created_from_run_ids") or []),
         created_at_ms=int(data.get("created_at_ms") or 0),
         expires_at_ms=int(data.get("expires_at_ms") or 0),

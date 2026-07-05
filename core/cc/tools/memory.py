@@ -89,10 +89,22 @@ class MemoryTool(BaseTool):
                 is_read_only=False,
             )
         )
+        self._memory_runtime = memory_runtime
         self._status = MemoryStatusTool(memory_runtime=memory_runtime)
         self._search = MemorySearchTool(memory_runtime=memory_runtime)
         self._store = MemoryStoreTool(memory_runtime=memory_runtime)
         self._fact = MemoryFactTool(memory_runtime=memory_runtime)
+
+    def is_enabled(self, ctx: Any) -> bool:
+        # Default-OFF facade. Hidden from the LLM-facing schema unless the
+        # operator opts in via ``memory_enabled``; when off, the exported tool
+        # schema is byte-identical to before the unified memory tool existed
+        # (the four legacy aliases already self-hide). Gate on the runtime's own
+        # config rather than ``ctx.config`` so visibility reflects how the engine
+        # was built, independent of the per-call context. The disabled-tool
+        # dispatch guard in ``executor.py`` blocks call-by-name while off.
+        del ctx
+        return bool(getattr(self._memory_runtime.config, "memory_enabled", False))
 
     def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
         return str(arguments.get("action") or "") in _READ_ACTIONS

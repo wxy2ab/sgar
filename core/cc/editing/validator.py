@@ -28,13 +28,9 @@ class EditValidator:
                 messages=[f"File too large: {path}"],
                 error_code="ED1008",
             )
-        if original_exists and not request.old_string and request.new_string == original_content:
-            return EditValidationResult(
-                ok=False,
-                stage="text",
-                messages=["Edit is empty."],
-                error_code="ED1002",
-            )
+        # A full-file write whose content is identical to what's already on disk
+        # is a no-op, not an error — it must report success (empty diff) rather
+        # than failing with ED1002 "Edit is empty".
         return EditValidationResult(ok=True, stage="text")
 
     def validate_structure(self, *, code: str, file_path: str, validate_python_syntax: bool) -> EditValidationResult:

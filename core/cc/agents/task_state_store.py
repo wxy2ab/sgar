@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 import time
 from typing import Any
 
 from ..jsonl import JsonlTailReader, append_jsonl_sync
 from .task_model import AgentTask, AgentTaskStatus
+
+logger = logging.getLogger(__name__)
 
 
 class TaskStateStore:
@@ -88,10 +92,12 @@ class TaskStateStore:
         )
 
     def persist_snapshot(self) -> None:
-        self.snapshot_path.write_text(
-            json.dumps([task.to_dict() for task in self.all()], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        data = json.dumps([task.to_dict() for task in self.all()], ensure_ascii=False, indent=2)
+        # Write atomically (temp file + os.replace) so a crash mid-write can't
+        # leave a truncated tasks.json that would fail to parse on next load.
+        tmp_path = self.snapshot_path.with_name(self.snapshot_path.name + ".tmp")
+        tmp_path.write_text(data, encoding="utf-8")
+        os.replace(tmp_path, self.snapshot_path)
         self._dirty_event_count = 0
 
     def all(self) -> list[AgentTask]:
@@ -113,10 +119,20 @@ class TaskStateStore:
         candidate = self.snapshot_path if self.snapshot_path.exists() else legacy_path
         if not candidate.exists():
             return []
-        raw_text = candidate.read_text(encoding="utf-8")
-        if not raw_text.strip():
+        try:
+            raw_text = candidate.read_text(encoding="utf-8")
+            if not raw_text.strip():
+                return []
+            payload = json.loads(raw_text)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+            # A corrupt/truncated snapshot must NOT brick the store. Fall back to
+            # an empty snapshot; ``load()`` then rebuilds authoritative state by
+            # replaying the durable event log (task_events.jsonl) via _sync_events.
+            logger.warning(
+                "TaskStateStore: unreadable/corrupt snapshot at %s; rebuilding from event log",
+                candidate,
+            )
             return []
-        payload = json.loads(raw_text)
         return payload if isinstance(payload, list) else []
 
     def _sync_events(self) -> None:

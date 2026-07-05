@@ -16,6 +16,19 @@ async def execute_single_tool(
     ctx: ToolUseContext,
     timeout_ms: int | None = None,
 ) -> ToolResult:
+    # Disabled tools are hidden from the LLM schema (``is_enabled``), but a
+    # by-name dispatch (older client, hardcoded tool_call) would otherwise still
+    # execute. Reject it here — the single choke point both orchestrator paths
+    # funnel through — so schema visibility and dispatch stay consistent.
+    if not tool.is_enabled(ctx):
+        return ToolResult(
+            tool_use_id=tool_call.tool_use_id,
+            tool_name=tool_call.tool_name,
+            success=False,
+            content=f"Tool '{tool_call.tool_name}' is disabled.",
+            error_code="TL1009",
+        )
+
     validation = tool.validate_input(tool_call.arguments)
     if not validation.ok:
         raise ToolValidationError(validation.message or "Invalid tool input.")

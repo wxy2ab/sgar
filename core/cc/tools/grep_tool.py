@@ -34,16 +34,18 @@ _RG_TIMEOUT_SECONDS = 60
 _PYTHON_FALLBACK_TIMEOUT_SECONDS = 60
 
 # Directories the Python fallback skips outright. Without this, a recursive
-# ``**/*`` over a workspace that contains a Python virtualenv (`env/` /
-# `.venv/`) or `node_modules/` walks 100k+ files and busts the deadline. The
-# rg binary already ignores most of these via .gitignore — the fallback has
-# no such ergonomics, so we hard-code the worst offenders.
+# ``**/*`` over a workspace that contains a virtualenv or ``node_modules/``
+# walks 100k+ files and busts the deadline. Restricted to CLEARLY-GENERATED
+# dirs only: generic source-like names (``env``/``venv``/``build``/``dist``)
+# are NOT pruned, because rg searches a *tracked* ``build/`` (it only skips
+# gitignored paths) and a bare-basename prune here would make the fallback
+# silently miss matches rg finds — an engine-dependent false negative.
 _FALLBACK_SKIP_DIR_NAMES = frozenset({
     ".git", ".hg", ".svn",
-    "env", ".venv", "venv",
+    ".venv",
     "node_modules",
     "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
-    "dist", "build", ".next", ".nuxt", ".cache",
+    ".next", ".nuxt", ".cache",
     ".idea", ".vscode",
 })
 
@@ -74,6 +76,34 @@ _FILE_TYPE_GLOB_SUFFIXES: dict[str, tuple[str, ...]] = {
     "rb": ("rb",),
     "lua": ("lua",),
 }
+
+
+def _parse_rg_match_lines(stdout: str, root: Path) -> list[dict[str, object]]:
+    """Parse rg ``path:line:text`` output into structured matches.
+
+    Shared by the plain and context-lines paths. rg context lines use ``-`` as
+    the field separator (``path-line-text``) and group separators are ``--``, so
+    they don't parse as ``path:int:text`` and are skipped — leaving only the
+    real match lines.
+    """
+    matches: list[dict[str, object]] = []
+    for line in stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        file_part, line_number, matched_line = parts
+        try:
+            line_no = int(line_number)
+        except ValueError:
+            continue
+        matches.append(
+            {
+                "file_path": str((root / file_part).resolve()),
+                "line_number": line_no,
+                "line": matched_line,
+            }
+        )
+    return matches
 
 
 class GrepTool(BaseTool):
@@ -341,12 +371,19 @@ class GrepTool(BaseTool):
         ]
         if files_only:
             cmd.append("--files-with-matches")
-        else:
-            cmd.extend(["--max-count", str(max_results)])
+        # NOTE: rg's --max-count is PER FILE, so it cannot serve as the global
+        # result cap (it would return up to num_files * max_results lines while
+        # the python fallback stops at max_results total). The total cap is
+        # applied by slicing the parsed matches below instead.
         if context_lines is not None and context_lines > 0 and not files_only:
             cmd.extend(["-C", str(min(context_lines, 10))])
+        # rg accepts -t and --glob together; honor both when supplied so the
+        # glob still narrows within a file_type (previously the glob was
+        # silently dropped whenever file_type was set).
         if file_type:
             cmd.extend(["-t", file_type])
+            if glob_pattern and glob_pattern != "**/*":
+                cmd.extend(["--glob", glob_pattern])
         else:
             cmd.extend(["--glob", glob_pattern])
         cmd.extend([pattern, "."])
@@ -404,41 +441,34 @@ class GrepTool(BaseTool):
 
         if context_lines and context_lines > 0:
             content = stdout.strip()
-            match_count = sum(1 for line in stdout.splitlines() if not line.startswith("-") and ":" in line)
+            matches = _parse_rg_match_lines(stdout, root)
+            truncated = len(matches) > max_results
+            if truncated:
+                matches = matches[:max_results]
             return {
-                "matches": [],
-                "count": match_count,
+                "matches": matches,
+                "count": len(matches),
                 "cwd": str(root),
                 "max_results": max_results,
-                "truncated": match_count >= max_results and proc.returncode == 0,
+                "truncated": truncated,
                 "engine": "rg",
                 "stderr": stderr.strip(),
+                # Full rg output (with the surrounding context lines) is kept for
+                # display; ``matches`` holds just the structured match lines.
                 "content": content if content else "(no matches)",
             }
 
-        matches: list[dict[str, object]] = []
-        for line in stdout.splitlines():
-            parts = line.split(":", 2)
-            if len(parts) != 3:
-                continue
-            file_part, line_number, matched_line = parts
-            try:
-                line_no = int(line_number)
-            except ValueError:
-                continue
-            matches.append(
-                {
-                    "file_path": str((root / file_part).resolve()),
-                    "line_number": line_no,
-                    "line": matched_line,
-                }
-            )
-
+        matches = _parse_rg_match_lines(stdout, root)
+        # rg's --max-count is per-file, so apply the global cap here by slicing
+        # the total parsed matches; ``truncated`` means more than max_results
+        # matches existed across all files (parity with the python fallback).
+        truncated = len(matches) > max_results
+        if truncated:
+            matches = matches[:max_results]
         content = "\n".join(
             f"{item['file_path']}:{item['line_number']}:{item['line']}"
             for item in matches
         )
-        truncated = len(matches) >= max_results and proc.returncode == 0
         if truncated:
             content = f"{content}\n\n[truncated to {max_results} matches]"
         return {

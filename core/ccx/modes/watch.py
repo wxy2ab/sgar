@@ -80,9 +80,10 @@ from .watch_checks import (
 logger = logging.getLogger(__name__)
 
 
-# Per-iteration cap on the subprocess command. The plan can override
-# this via the top-level ``per_iteration_timeout_s`` key (which Phase 0
-# may emit), bounded by the remaining wall-clock budget.
+# Per-iteration cap on the subprocess command (default). An operator may
+# override it via ``invocation.metadata["per_iteration_timeout_s"]`` (read once
+# at loop start, bounded by the remaining wall-clock budget). The verification
+# plan does NOT carry this key — only invocation metadata is consulted.
 _DEFAULT_PER_ITERATION_TIMEOUT_S: float = 600.0
 # Cap on stdout/stderr captured into the digest, to keep prompt sizes
 # bounded when the LLM sees the failure.
@@ -1207,6 +1208,34 @@ class _CommitResult:
         )
 
 
+def _changed_paths(cwd: str) -> list[str]:
+    """Repo-relative paths of every changed file in the working tree via
+    ``git status --porcelain`` (modified, added, or untracked). A rename entry
+    yields its NEW (destination) path. Used by :func:`_commit_fix` to stage
+    exactly the fix-scope-approved files instead of a ``:(glob)`` pathspec whose
+    ``*`` semantics differ from the fixer guard's fnmatch."""
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=cwd or None, capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+    if proc.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        entry = line[3:]  # strip the two-char ``XY`` status + one space
+        if " -> " in entry:  # rename/copy: the destination is what's committed
+            entry = entry.split(" -> ", 1)[1]
+        entry = entry.strip().strip('"')
+        if entry:
+            paths.append(entry)
+    return paths
+
+
 def _commit_fix(
     cwd: str,
     message: str,
@@ -1240,13 +1269,21 @@ def _commit_fix(
             # Best-effort: if reset fails (no HEAD on a fresh repo, etc.),
             # the path-scoped add below is still the primary safeguard.
             pass
-        # Step 2: stage only files under fix_scope. ``:(glob)`` pathspec
-        # magic gives the same ``**`` semantics as Python's fnmatch, so
-        # ``core/deepstack-agent/stock_rec_v3/**/*.py`` matches recursively.
-        # Use the same globs the fixer guard enforced — anything the
-        # fixer was *allowed* to write is fair game to commit.
-        pathspecs = [f":(glob){g}" for g in fix_scope]
-        add_cmd = ["git", "add", "--"] + pathspecs
+        # Step 2: stage exactly the changed files that pass the SAME scope
+        # guard the fixer enforced (``_path_matches_any_glob``, fnmatch-based,
+        # where ``*`` DOES cross ``/``). We must NOT reuse a ``:(glob)``
+        # pathspec here: git's ``:(glob)`` treats a single ``*`` as matching
+        # WITHIN one directory level (it does not cross ``/``), so a scope like
+        # ``src/*.py`` would let the fixer WRITE ``src/pkg/mod.py`` yet silently
+        # drop it from the commit. Enumerating the working tree and adding each
+        # guard-approved path keeps write-permission and commit in lockstep.
+        in_scope = sorted(
+            p for p in _changed_paths(cwd)
+            if _path_matches_any_glob(p, fix_scope, cwd)
+        )
+        # Empty list ⇒ ``git add --`` no-ops (rc 0); the commit below then fails
+        # with "nothing to commit", the same ok=False path as before.
+        add_cmd = ["git", "add", "--", *in_scope]
     else:
         # No fix_scope: legacy behaviour. Caller has explicitly disabled
         # fixing, so commit_each_fix shouldn't even fire — but if it
