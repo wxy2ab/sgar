@@ -781,7 +781,11 @@ def run_monitor(
     # the stall duration, and a per-poll reset caps it at ~interval so
     # the rule could never reach no_progress_window_ms.
     last_progress_wall_ms = int(wall_clock() * 1000)
-    last_llm_at = 0.0
+    # Baseline to the current monotonic reading (NOT 0.0): with 0.0 the first
+    # ``now - last_llm_at`` would be the whole monotonic clock value, so the
+    # first periodic LLM assessment would fire ~1 poll after start instead of
+    # after ``llm_cadence`` seconds have actually elapsed.
+    last_llm_at = monotonic()
     last_escalation_at = 0.0
     last_alert_at: dict[tuple[str, tuple[str, ...]], float] = {}
     no_progress_window_ms = int(max(llm_cadence, 1.0) * 1000)

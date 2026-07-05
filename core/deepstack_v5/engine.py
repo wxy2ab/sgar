@@ -238,10 +238,12 @@ class EngineV5:
                 None,
                 error=f"{type(exc).__name__}: {exc}",
             )
+            self._rt.run_store.persist_budget_snapshot(
+                run_id, self._rt.budget.budget.snapshot()
+            )
             self._rt.run_store.update_status(
                 run_id,
                 verdict.status,
-                budget=self._rt.budget.budget.snapshot(),
             )
             if interrupt is not None:
                 raise interrupt
@@ -263,10 +265,12 @@ class EngineV5:
         self._rt.budget.restore(budget_snapshot)
         if stored_status == RunStatus.BUDGET_EXHAUSTED and budget is not None:
             stored_status = RunStatus.RUNNING
+            self._rt.run_store.persist_budget_snapshot(
+                run_id, self._rt.budget.budget.snapshot()
+            )
             self._rt.run_store.update_status(
                 run_id,
                 RunStatus.RUNNING,
-                budget=self._rt.budget.budget.snapshot(),
             )
         if stored_status not in (RunStatus.RUNNING, RunStatus.WAITING_APPROVAL):
             verdict = self._build_verdict(run_id, run["goal"], graph, None)
@@ -279,10 +283,22 @@ class EngineV5:
         # Push RUNNING nodes whose lease was reclaimed back to READY so the
         # new workers can pick them up. Any node still RUNNING without a
         # current lease is ambiguous: mark it FAILED with WORKER_LOST.
+        #
+        # In the default single-process deployment (no external workers) any
+        # surviving lease belongs to the dead prior process, so force-reclaim
+        # every RUNNING node NOW rather than leaving it stuck until the lease
+        # TTL expires (defect 15). A genuine multi-process topology keeps the
+        # TTL slack: a still-live peer may legitimately own the node, so we only
+        # reclaim nodes whose lease is already gone.
+        force_reclaim = not self._rt.config.expect_external_workers
         for node_id, node in graph.nodes().items():
             if node.state == NodeState.RUNNING:
                 lease = self._rt.assignment.find_for(run_id, node_id)
-                if lease is None:
+                if lease is None or force_reclaim:
+                    if lease is not None:
+                        # Release the dead process's lease first so the FAILED
+                        # writeback isn't fenced by refuse_if_running_unowned.
+                        self._rt.assignment.release(lease.lease_id)
                     self._mark_worker_lost(
                         node,
                         message="resumed: lease lost, prior worker likely died",
@@ -333,10 +349,12 @@ class EngineV5:
                 ),
             )
             verdict.status = RunStatus.BUDGET_EXHAUSTED
+            self._rt.run_store.persist_budget_snapshot(
+                run_id, self._rt.budget.budget.snapshot()
+            )
             self._rt.run_store.update_status(
                 run_id,
                 RunStatus.BUDGET_EXHAUSTED,
-                budget=self._rt.budget.budget.snapshot(),
                 expected_status=(RunStatus.RUNNING, RunStatus.WAITING_APPROVAL),
                 refuse_if_terminal=True,
             )
@@ -405,10 +423,12 @@ class EngineV5:
             ),
         )
         verdict.status = RunStatus.CANCELLED
+        self._rt.run_store.persist_budget_snapshot(
+            run_id, self._rt.budget.budget.snapshot()
+        )
         updated = self._rt.run_store.update_status(
             run_id,
             RunStatus.CANCELLED,
-            budget=self._rt.budget.budget.snapshot(),
             expected_status=(RunStatus.RUNNING, RunStatus.WAITING_APPROVAL),
             refuse_if_terminal=True,
         )
@@ -674,9 +694,11 @@ class EngineV5:
                 interrupt = exc
 
         verdict = self._build_verdict(run_id, goal, graph, result, error=error)
+        self._rt.run_store.persist_budget_snapshot(
+            run_id, self._rt.budget.budget.snapshot()
+        )
         self._rt.run_store.update_status(
             run_id, verdict.status,
-            budget=self._rt.budget.budget.snapshot(),
             expected_status=(RunStatus.RUNNING, RunStatus.WAITING_APPROVAL),
             refuse_if_terminal=True,
         )
@@ -739,12 +761,24 @@ class EngineV5:
         # 4. Build inputs and decide.
         inputs = self._build_controller_inputs(run_id, graph)
         decision = self._rt.controller.decide(inputs)
-        self._rt.budget.consume(iteration=True)
 
-        # Fire compaction-related warning once on warning crossing.
-        if self._rt.budget.fire_warning_if_needed():
+        # Consume one iteration only for a work-doing decision. WAIT idle polls
+        # (blocked on slow workers) and HALT steps must not burn iteration
+        # budget, or a run bounded only by max_iterations could hit a false
+        # BUDGET_EXHAUSTED while merely waiting (defect 11).
+        if decision.kind == DecisionKind.ENQUEUE:
+            self._rt.budget.consume(iteration=True)
+
+        # Fire the compaction warning once on crossing — checked EVERY step so a
+        # token/cost crossing from the previous step's dispatch is caught even
+        # when this step's decision is HALT/WAIT. Periodically persist the
+        # in-flight budget so a hard SIGKILL/OOM cannot resurrect already-spent
+        # budget on resume; always flush on a warning crossing.
+        warning_crossed = self._rt.budget.fire_warning_if_needed()
+        if warning_crossed:
             self._rt.event_bus.publish(run_id, "budget.warning",
                                        self._rt.budget.budget.snapshot())
+        self._maybe_flush_budget(run_id, warning_crossed)
 
         nodes_started: tuple[str, ...] = ()
         nodes_completed: tuple[str, ...] = ()
@@ -783,6 +817,19 @@ class EngineV5:
             nodes_started=nodes_started,
             nodes_completed=nodes_completed,
         )
+
+    def _maybe_flush_budget(self, run_id: str, warning_crossed: bool) -> None:
+        """Persist the in-flight budget snapshot mid-loop via the monotonic
+        merge (never clobbers concurrent worker deltas). Flushes on a warning
+        crossing and every ``budget_flush_every_n_iterations`` iterations."""
+        if not self._rt.config.persist_to_db:
+            return
+        every_n = self._rt.config.budget_flush_every_n_iterations
+        iterations = self._rt.budget.budget.iterations
+        if warning_crossed or (every_n > 0 and iterations % every_n == 0):
+            self._rt.run_store.persist_budget_snapshot(
+                run_id, self._rt.budget.budget.snapshot()
+            )
 
     # -- dispatch ------------------------------------------------------------
 
@@ -845,7 +892,23 @@ class EngineV5:
                             res = self._dispatch_timed_out_result(graph, n, exc)
                         except Exception as exc:
                             res = self._dispatch_crashed_result(graph, n, exc)
-                        self._handle_dispatch_result(run_id, graph, res)
+                        try:
+                            self._handle_dispatch_result(run_id, graph, res)
+                        except Exception:
+                            # A late worker thread the backstop could not stop
+                            # (shutdown(wait=False) cannot kill it) can race
+                            # _force_fail_node on the same NodeExecution and raise
+                            # an illegal-transition error. That must not reach the
+                            # outer handler and abort every other in-flight/pending
+                            # node — the node self-heals on the next _step_once.
+                            # (The per-node lock makes torn state rare; this is
+                            # the belt-and-braces so one node's race is contained.)
+                            logger.warning(
+                                "v5 engine: dispatch-result handling raced for "
+                                "node=%s (run_id=%s); skipping, self-heals next "
+                                "step", n, run_id, exc_info=True,
+                            )
+                            continue
                         if not res.skipped:
                             started.append(n)
                             completed.append(n)
@@ -1033,9 +1096,18 @@ class EngineV5:
                 if row is not None:
                     self._refresh_node_from_row(graph, row)
             return
+        # A failure result must never overwrite an already-terminal node
+        # (defect 4). SUCCEEDED is excluded here so a failure carrying
+        # final_state=SUCCEEDED — e.g. a _LeaseLostError raised AFTER the node
+        # already succeeded, or a backstop timeout racing a just-finished
+        # worker — cannot flip a genuinely-completed node to FAILED. The
+        # unconditional _persist_node below is still fenced
+        # (refuse_if_terminal / refuse_if_running_unowned), so it never commits
+        # the local result over a real competitor's DB state.
         if result.failure is not None and node.state not in (
             NodeState.FAILED,
             NodeState.ABANDONED,
+            NodeState.SUCCEEDED,
         ):
             self._force_fail_node(node, result.failure)
         self._persist_node(run_id, node)
@@ -1083,7 +1155,10 @@ class EngineV5:
                     )
                 )
                 node.state = NodeState.FAILED
-                node.result = None
+                # Never null an existing result here: a failure result must not
+                # erase work a node already produced (defect 4). The guard in
+                # _handle_dispatch_result also excludes SUCCEEDED so this branch
+                # is not reached for an already-succeeded node.
                 node.updated_at_ms = now_ms()
                 return
         if node.state == NodeState.RUNNING:
@@ -1147,14 +1222,6 @@ class EngineV5:
                     self._abandon_for_replan_budget(run_id, graph, node_id, scope)
                     continue
                 new_specs = self._rt.controller.replan(scope, node, scope.reason)
-                self._replan_run_totals[run_id] = (
-                    self._replan_run_totals.get(run_id, 0) + 1
-                )
-                if scope.level == ScopeLevel.LOCAL:
-                    replan_state.local_used += 1
-                else:
-                    replan_state.global_used += 1
-                self._persist_replan_state(run_id)
 
             added: list[str] = []
             reused_current = False
@@ -1191,6 +1258,21 @@ class EngineV5:
                     ],
                     "trigger_node": node_id,
                 })
+
+            if added:
+                # Only count a replan that actually applied at least one spec.
+                # A replan that returned nothing, or whose specs were all skipped
+                # (same-id reuse cap already hit, or already present), is a
+                # no-op and must not consume the run-wide or per-node replan
+                # budget (defect 12).
+                self._replan_run_totals[run_id] = (
+                    self._replan_run_totals.get(run_id, 0) + 1
+                )
+                if scope.level == ScopeLevel.LOCAL:
+                    replan_state.local_used += 1
+                else:
+                    replan_state.global_used += 1
+                self._persist_replan_state(run_id)
 
             if reused_current:
                 continue

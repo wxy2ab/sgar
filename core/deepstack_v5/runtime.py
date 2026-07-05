@@ -12,6 +12,7 @@ multi-worker setups via the lease/heartbeat protocol.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -150,8 +151,11 @@ class RuntimeV5:
         interaction_fn: Callable[[Any], Any] | None = None,
     ) -> "RuntimeV5":
         cfg = config or ConfigV5()
-        if worker_count > 1:
-            cfg.parallelism = max(cfg.parallelism, worker_count)
+        if worker_count > 1 and worker_count > cfg.parallelism:
+            # Copy rather than mutate: a caller may share one ConfigV5 across
+            # several RuntimeV5.create() calls, and mutating parallelism in place
+            # would leak this run's worker_count into theirs (defect 14).
+            cfg = dataclasses.replace(cfg, parallelism=worker_count)
         cfg.validate()
 
         # Guard against the silent ":memory:" + multi-thread footgun

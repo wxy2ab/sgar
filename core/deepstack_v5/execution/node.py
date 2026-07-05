@@ -8,6 +8,7 @@ care about cross-node attempt history.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -68,6 +69,14 @@ class NodeExecution:
     updated_at_ms: int = field(default_factory=now_ms)
     history: list[tuple[str, str, int, str]] = field(default_factory=list)
     # Each entry: (from_state, to_state, ts_ms, reason)
+    # Serialises state mutation: the engine's future-backstop can force-fail a
+    # node concurrently with the still-running worker thread finishing it
+    # (ThreadPoolExecutor.shutdown(wait=False) cannot stop the thread). Reentrant
+    # so nested mutating calls on the same node don't self-deadlock. Excluded
+    # from init/repr/compare and never serialised.
+    _lock: "threading.RLock" = field(
+        default_factory=threading.RLock, init=False, repr=False, compare=False
+    )
 
     @property
     def node_id(self) -> str:
@@ -86,22 +95,24 @@ class NodeExecution:
     # -- transitions ---------------------------------------------------------
 
     def transition(self, to: NodeState, *, reason: str = "") -> None:
-        if not is_legal_node_transition(self.state, to):
-            raise ValueError(
-                f"illegal node transition {self.state.value} -> {to.value}"
-                + (f" ({reason})" if reason else "")
-            )
-        ts = now_ms()
-        self.history.append((self.state.value, to.value, ts, reason))
-        self.state = to
-        self.updated_at_ms = ts
+        with self._lock:
+            if not is_legal_node_transition(self.state, to):
+                raise ValueError(
+                    f"illegal node transition {self.state.value} -> {to.value}"
+                    + (f" ({reason})" if reason else "")
+                )
+            ts = now_ms()
+            self.history.append((self.state.value, to.value, ts, reason))
+            self.state = to
+            self.updated_at_ms = ts
 
     def new_attempt(self, *, worker_id: str | None = None) -> Attempt:
-        att = Attempt(attempt_id=new_id("att"), worker_id=worker_id,
-                      started_at_ms=now_ms())
-        self.attempts.append(att)
-        self.updated_at_ms = now_ms()
-        return att
+        with self._lock:
+            att = Attempt(attempt_id=new_id("att"), worker_id=worker_id,
+                          started_at_ms=now_ms())
+            self.attempts.append(att)
+            self.updated_at_ms = now_ms()
+            return att
 
     def current_attempt(self) -> Attempt | None:
         return self.attempts[-1] if self.attempts else None
@@ -113,19 +124,20 @@ class NodeExecution:
         result: Any | None = None,
         failure: Failure | None = None,
     ) -> None:
-        att = self.current_attempt()
-        if att is None:
-            raise RuntimeError("finish_attempt with no current attempt")
-        att.ended_at_ms = now_ms()
-        att.outcome = outcome
-        att.failure = failure
-        if result is not None:
-            self.result = result
-        if failure is not None:
-            self.failure = failure
-        elif outcome == "success":
-            self.failure = None
-        self.updated_at_ms = now_ms()
+        with self._lock:
+            att = self.current_attempt()
+            if att is None:
+                raise RuntimeError("finish_attempt with no current attempt")
+            att.ended_at_ms = now_ms()
+            att.outcome = outcome
+            att.failure = failure
+            if result is not None:
+                self.result = result
+            if failure is not None:
+                self.failure = failure
+            elif outcome == "success":
+                self.failure = None
+            self.updated_at_ms = now_ms()
 
     # -- serialization -------------------------------------------------------
 
@@ -211,4 +223,11 @@ def _failure_from_dict(d: Mapping[str, Any] | None) -> Failure | None:
     )
 
 
-__all__ = ["Attempt", "NodeExecution"]
+# Public serialization surface for external consumers (e.g. ccx fixed-DAG export).
+# Internal callers use the underscore-prefixed originals; these stable aliases give
+# out-of-package importers a name that will not silently vanish on a refactor.
+spec_to_dict = _spec_to_dict
+spec_from_dict = _spec_from_dict
+
+
+__all__ = ["Attempt", "NodeExecution", "spec_from_dict", "spec_to_dict"]

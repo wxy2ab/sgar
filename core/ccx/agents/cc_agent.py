@@ -203,15 +203,23 @@ def _drop_cc_native_orchestration_tools(registry: Any) -> list[str]:
 def _register_ask_human(
     registry: Any, *, enabled: bool, timeout_s: float,
 ) -> bool:
-    """Register the ``ask_human`` tool into a turn registry iff ``enabled``.
+    """Register the ``ask_human`` tool into a turn registry.
 
-    Returns whether the tool was registered. When disabled (the default,
-    i.e. no host interaction handler), this is a no-op so the registry,
-    system prompt, and prompt cache stay byte-identical. Extracted as a
-    module function so the byte-equivalence gate is directly unit-testable
-    against a real (or fake) registry without driving a full turn.
+    Registers iff ``enabled`` (a host interaction handler is present) AND the
+    operator kill switch ``CCX_ENABLE_ASK_HUMAN`` is not set to a falsey value.
+    Returns whether the tool was registered. When either gate is off (the
+    default, i.e. no host interaction handler), this is a no-op so the registry,
+    system prompt, and prompt cache stay byte-identical. Extracted as a module
+    function so the byte-equivalence gate is directly unit-testable against a
+    real (or fake) registry without driving a full turn.
     """
     if not enabled or registry is None or not hasattr(registry, "register"):
+        return False
+    # Operator kill switch (defense-in-depth): even with a handler present, a
+    # falsey CCX_ENABLE_ASK_HUMAN forces the tool OFF. Default ON, so this is a
+    # no-op unless an operator explicitly opts out.
+    from ..services.interaction import ask_human_enabled
+    if not ask_human_enabled():
         return False
     from .ask_human_tool import CcxAskHumanTool
     registry.register(CcxAskHumanTool(timeout_s=timeout_s))

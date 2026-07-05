@@ -3,10 +3,12 @@
 .. warning:: EXPERIMENTAL — no production callers. Nothing outside the
    test suite constructs ``TeamRuntime``, and the "drop-in cc
    compatible" claim below has known semantic divergences (envelope
-   direction is coordinator→worker where cc emits worker→lead; a
-   successful node yields two ``task_completed`` envelopes via the
-   ``node.succeeded`` + ``node.completed`` kind mapping). Reconcile
-   those before building on this layer.
+   direction is coordinator→worker where cc emits worker→lead). A
+   successful node still routes two ``task_completed`` envelopes into
+   the mailbox via the ``node.succeeded`` + ``node.completed`` kind
+   mapping, but :meth:`collect_worker_results` now dedups them per
+   worker so callers see one result per success. Reconcile the envelope
+   direction before building on this layer.
 
 cc's TeamRuntime is built around long-lived **worker controllers** that
 sit idle in subprocesses waiting for task assignments delivered via a
@@ -285,10 +287,22 @@ class TeamRuntime:
     def collect_worker_results(
         self, *, ack: bool = False,
     ) -> list[MailboxEnvelope]:
-        return self.collect_worker_events(
-            message_types={"task_completed"},
-            ack=ack,
-        )
+        # A single successful node emits BOTH node.succeeded (dispatcher) and
+        # node.completed (engine, only on SUCCEEDED), each mapped to
+        # task_completed with DISTINCT sequences — so the bridge's
+        # (run_id, sequence) dedup cannot collapse them. Dedup per worker node
+        # (``to_runtime_id`` = the v5 node_id) here so one success yields exactly
+        # one result envelope instead of two.
+        seen: set[str] = set()
+        results: list[MailboxEnvelope] = []
+        for env in self.collect_worker_events(
+            message_types={"task_completed"}, ack=ack,
+        ):
+            if env.to_runtime_id in seen:
+                continue
+            seen.add(env.to_runtime_id)
+            results.append(env)
+        return results
 
     # -- Cleanup -------------------------------------------------------------
 

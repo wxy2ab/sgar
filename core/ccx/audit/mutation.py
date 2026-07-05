@@ -72,6 +72,12 @@ class MutationResult:
     ``applied is False`` means the anchor was not found exactly once (source
     drifted); ``rc``/``red``/``is_blind_spot`` are then not meaningful and the
     caller should record an anchor-miss instead of a teeth verdict.
+
+    ``unproven``/``timed_out`` mean the mutation WAS applied but the teeth
+    oracle rendered no verdict (a non-running pytest — usage/collection error
+    or no tests collected — or a timeout). ``red`` and ``is_blind_spot`` are
+    then both ``False``; the caller must refuse the mutation rather than count
+    a non-verdict as proven teeth.
     """
 
     name: str
@@ -85,6 +91,15 @@ class MutationResult:
     tail: str = ""
     red: bool = False
     is_blind_spot: bool = False
+    #: The teeth oracle never rendered a real verdict — pytest returned a
+    #: usage/collection error or "no tests collected" (rc ∉ {0, 1}), so the
+    #: mutation is neither proven RED teeth nor a GREEN blind spot. The caller
+    #: must REFUSE it, not count it as teeth (see ``regression_capture``).
+    unproven: bool = False
+    #: The teeth run exceeded ``test_timeout_s`` — same class as ``unproven``:
+    #: no verdict was rendered, an unrunnable-harness condition, not evidence
+    #: of a blind spot.
+    timed_out: bool = False
 
 
 # ResultHook: called once per mutation (applied or anchor-miss) after revert.
@@ -156,8 +171,12 @@ def run_mutation_campaign(
     2. Write the rubber-stamp (``old`` → ``new``).
     3. ``try`` run the tests ``finally`` revert the file. The ``finally``
        guarantees the worktree returns to HEAD even on timeout / exception.
-    4. Label: ``red = rc != 0`` (tests caught it ⇒ teeth);
-       ``is_blind_spot = applied and not red``.
+    4. Label the outcome from the pytest exit code: ``rc == 1`` ⇒ RED teeth
+       (the guard caught the mutation); ``rc == 0`` ⇒ GREEN blind spot; a
+       timeout ⇒ ``timed_out``; any other ``rc`` (usage/collection error, no
+       tests collected) ⇒ ``unproven``. ``timed_out``/``unproven`` are NEITHER
+       teeth NOR a blind spot — the oracle rendered no verdict, so the caller
+       must refuse the mutation rather than count it either way.
 
     ``on_result`` (if given) is called once per mutation — for anchor-misses
     too — *after* revert, so a recording callback can never observe a mutated
@@ -185,22 +204,54 @@ def run_mutation_campaign(
             continue
 
         target.write_text(src.replace(m.old, m.new), encoding="utf-8")
+        rc: int | None = None
+        tail = ""
+        timed_out = False
         try:
-            rc, tail = _run_tests(
-                wt, m.tests, pybin=pybin, timeout_s=test_timeout_s
-            )
+            try:
+                rc, tail = _run_tests(
+                    wt, m.tests, pybin=pybin, timeout_s=test_timeout_s
+                )
+            except subprocess.TimeoutExpired:
+                # A timed-out proof is NOT evidence the guard is a blind spot —
+                # the oracle never rendered a verdict. Surface it as its own
+                # (unrunnable-harness) state instead of folding a timeout into
+                # the RED/GREEN teeth label; ``code_task._run_suite`` handles a
+                # subprocess timeout the same lenient way.
+                timed_out = True
+                tail = "TIMEOUT"
         finally:
             _git_revert(wt, m.file)
 
+        # pytest exit codes: 0 = all passed (guard did NOT catch the mutation ⇒
+        # blind spot); 1 = a test failed (the guard CAUGHT it ⇒ genuine teeth).
+        # Any other rc (2/3 usage or collection error, 4 bad cmdline, 5 no tests
+        # collected, or a killed process) means the teeth ORACLE never ran the
+        # guard's assertions — neither RED teeth nor a GREEN blind spot, but an
+        # UNPROVEN result the caller must refuse (a stale/renamed ``m.tests``
+        # would otherwise score as proven teeth). Mirrors code_task._run_suite's
+        # lenient rc==5 / collection-error handling.
+        unproven = (not timed_out) and (rc not in (0, 1))
         red = rc != 0
+        if timed_out or unproven:
+            red = False
         res = MutationResult(
             name=m.name, track=m.track, file=m.file, tests=list(m.tests),
             rationale=m.rationale, applied=True, anchor_count=count,
-            rc=rc, tail=tail, red=red, is_blind_spot=not red,
+            rc=rc, tail=tail, red=red,
+            is_blind_spot=(not red and not unproven and not timed_out),
+            unproven=unproven, timed_out=timed_out,
         )
         results.append(res)
         if log is not None:
-            teeth = "TEETH (caught)" if red else "BLIND SPOT (uncaught)"
+            if timed_out:
+                teeth = "UNPROVEN (timed out)"
+            elif unproven:
+                teeth = f"UNPROVEN (rc={rc}, no verdict)"
+            elif red:
+                teeth = "TEETH (caught)"
+            else:
+                teeth = "BLIND SPOT (uncaught)"
             log(f"[{m.name}] {m.file} -> rc={rc} :: {teeth}")
         if on_result is not None:
             on_result(res, m)

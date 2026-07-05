@@ -191,7 +191,11 @@ class JsonlMemoryStore:
             remaining = max(0, cap - len(pinned))
             kept = pinned + unpinned[:remaining]
         pruned = len(entries) - len(kept)
-        if pruned <= 0:
+        # Rewrite the journal when there is anything to remove: pruned entries
+        # OR corrupt rows to quarantine. A store that never exceeds its cap must
+        # STILL quarantine corrupt rows once — otherwise every load re-parses
+        # and re-warns on the same unparseable line forever.
+        if pruned <= 0 and not corrupt_rows:
             return 0
         if corrupt_rows and not self._quarantine_corrupt_rows_unlocked(corrupt_rows):
             return 0

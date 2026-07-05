@@ -111,7 +111,11 @@ class ClaimStore:
     def update_confidence(self, claim_id: str, confidence: float) -> None:
         with self._lock:
             claim = self._claims.get(claim_id)
-            if claim is None:
+            # An archived claim is frozen: mirror add_evidence's guard so a
+            # re-confidence can't half-mutate it (updating confidence in the DB
+            # while ClaimStorePersistence.upsert leaves archived_at_ms set, so
+            # the claim stays excluded from active queries anyway) — defect 18.
+            if claim is None or claim.archived:
                 return
             claim.confidence = max(0.0, min(1.0, confidence))
             claim.updated_at_ms = now_ms()

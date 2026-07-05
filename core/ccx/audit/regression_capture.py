@@ -254,6 +254,37 @@ def promote_finding(
 
     not_applied = [r.name for r in teeth if not r.applied]
     blind = [r.name for r in teeth if r.is_blind_spot]
+    # (3a) The teeth proof could not be RENDERED — the oracle timed out, hit a
+    #      pytest usage/collection error, or collected no tests (rc ∉ {0, 1}).
+    #      That is NOT a blind spot (a definite "no teeth" verdict); it is an
+    #      unrunnable-harness condition, the same class as a post-fix UNRUNNABLE
+    #      check. Refuse to promote — do NOT stamp REJECTED, and do NOT count a
+    #      non-verdict as proven teeth.
+    timed_out = [r.name for r in teeth if getattr(r, "timed_out", False)]
+    unproven = [r.name for r in teeth if getattr(r, "unproven", False)]
+    if timed_out or unproven:
+        reasons = []
+        if timed_out:
+            reasons.append(f"teeth proof TIMED OUT (no verdict): {timed_out}")
+        if unproven:
+            reasons.append(
+                "teeth oracle ran no assertions — pytest usage/collection error "
+                f"or no tests collected: {unproven}"
+            )
+        rec = _record(
+            "uncertain",
+            "ABORTED: teeth proof could not execute — " + "; ".join(reasons),
+            extra={
+                "phase": "teeth", "timed_out": timed_out, "unproven": unproven,
+                "teeth": [r.name for r in teeth if r.red],
+            },
+        )
+        return PromotionResult(
+            promoted=False, status=ABORTED_HARNESS_DEFECT, code_location=key,
+            recidivism=recidivism, post_fix=post, teeth=teeth, ledger_record=rec,
+            prior_state=prior_state, is_reopen=is_reopen,
+            detail="teeth proof did not execute; not a verdict",
+        )
     if blind or not_applied:
         reasons = []
         if blind:

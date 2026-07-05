@@ -1820,6 +1820,17 @@ class CodeAgent:
                 "ccx.CodeAgent does not support streaming for "
                 "agent_mode='deliberate'; use run()/run_sync()"
             )
+        # Debug and audit are multi-iteration meta-loop modes (the goal loop is
+        # reused verbatim) and are NOT keys in CCX_MODE_TOOL_MAP. Without this
+        # guard they fall through to root_node_for below, which raises
+        # ``ValueError: unknown ccx mode`` instead of the contracted
+        # NotImplementedError a caller catches to fall back to cc. Same class as
+        # goal/deliberate: no single streaming chain to yield.
+        if mode in {"debug", "audit"}:
+            raise NotImplementedError(
+                f"ccx.CodeAgent does not support streaming for agent_mode={mode!r}; "
+                "use run()/run_sync() (meta-loop mode is non-streaming)"
+            )
         llm = self._resolve_llm(config)
         workspace = self._resolve_workspace(request)
         cwd_resolved = str(Path(request.cwd or ".").resolve())

@@ -30,6 +30,7 @@ from .diagnostics import ModeStepRecord, PlanDiagnosticsTracer
 from ._goal import current_goal_text
 from .llm_client import LLMCallable, text_of
 from .parsing import parse_llm_json
+from ._dag_helpers import _order_for_backward_deps
 from .prompts import PromptLoadError, fallback_system_prompt, load_mode_prompts
 
 
@@ -364,6 +365,8 @@ def _parse_spec_response(response: str) -> dict[str, Any]:
             remapped.append(mapped)
         item["depends_on"] = remapped
         cleaned_items.append(item)
+    cleaned_items, order_issues = _order_for_backward_deps(cleaned_items, "spec")
+    dependency_issues.extend(order_issues)
     return {
         "items": cleaned_items,
         "rationale": rationale,

@@ -58,6 +58,10 @@ def _parse_frontmatter(default_name: str, content: str) -> tuple[str, str]:
     name = default_name
     description = ""
 
+    # ``body`` is the region the description fallback may scan. It must exclude
+    # the frontmatter lines themselves, or a bare ``name:``/``key: value`` line
+    # leaks in as the description.
+    body = content
     stripped = content.lstrip()
     if stripped.startswith("---"):
         # Body after the opening fence; close on the next line that is exactly '---'.
@@ -76,9 +80,18 @@ def _parse_frontmatter(default_name: str, content: str) -> tuple[str, str]:
                 raw_desc = meta.get("description")
                 if raw_desc:
                     description = " ".join(str(raw_desc).split())
+            # Fallback scans only the content AFTER the closing fence.
+            after_fence = rest[end + 4:]
+            newline = after_fence.find("\n")
+            body = after_fence[newline + 1:] if newline != -1 else ""
+        else:
+            # Opening fence but no closing fence: the frontmatter is malformed
+            # and unterminated, so there is no reliable body — don't let those
+            # lines leak into the description.
+            body = ""
 
     if not description:
-        for line in content.splitlines():
+        for line in body.splitlines():
             line = line.strip()
             if not line or line.startswith("#") or line.startswith("---"):
                 continue

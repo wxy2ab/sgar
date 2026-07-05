@@ -227,6 +227,11 @@ class SQLiteRuntimeDB:
         # close-all on shutdown so per-thread connections from worker
         # pools don't outlive the runtime.
         self._all_conns: list[sqlite3.Connection] = []
+        # Bumped on every close(). A thread-local connection tagged with an
+        # older generation is treated as stale by _get_conn and reopened, so a
+        # close() from one thread can't leave OTHER threads holding a
+        # use-after-close connection (defect 9).
+        self._closed_generation = 0
         self._init_lock = _init_lock_for(self.path)
         # Ensure parent directory exists for non-memory paths.
         if self.path != ":memory:":
@@ -236,8 +241,9 @@ class SQLiteRuntimeDB:
     # -- connection management ------------------------------------------------
 
     def _get_conn(self) -> sqlite3.Connection:
+        current_gen = self._closed_generation
         conn = getattr(self._local, "conn", None)
-        if conn is None:
+        if conn is None or getattr(self._local, "conn_generation", -1) != current_gen:
             conn = sqlite3.connect(
                 self.path,
                 isolation_level=None,  # autocommit; we manage txns explicitly
@@ -252,6 +258,7 @@ class SQLiteRuntimeDB:
             else:
                 conn.execute("PRAGMA journal_mode = MEMORY")
             self._local.conn = conn
+            self._local.conn_generation = current_gen
             with self._lock:
                 self._all_conns.append(conn)
         return conn
@@ -267,6 +274,9 @@ class SQLiteRuntimeDB:
         with self._lock:
             conns = list(self._all_conns)
             self._all_conns.clear()
+            # Invalidate every thread's cached connection, not just the
+            # caller's — _get_conn compares this generation and reopens.
+            self._closed_generation += 1
         for conn in conns:
             try:
                 conn.close()
@@ -404,8 +414,15 @@ class SQLiteRuntimeDB:
             yield conn
             conn.execute("COMMIT")
         except BaseException:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
+            # Best-effort rollback: if the connection was closed underneath us
+            # (e.g. a concurrent close()), rolling back would raise a
+            # ProgrammingError that masks the original body exception. Swallow
+            # only the rollback error and re-raise the real one.
+            try:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise
 
     # -- query helpers --------------------------------------------------------

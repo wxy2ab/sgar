@@ -23,6 +23,13 @@ class SessionCompactor:
 
     def should_compact(self, session: QuerySession, message_store: SessionMessageStore) -> bool:
         total_chars = message_store.total_char_count()
+        # Hard ceiling is a safety valve: compact to avoid context overflow even
+        # when auto-compaction is otherwise disabled.
+        if total_chars >= session.config.compact_hard_threshold:
+            return True
+        # Below the ceiling, honor the operator's auto_compact_enabled toggle.
+        if not session.config.auto_compact_enabled:
+            return False
         if total_chars >= session.config.compact_soft_threshold:
             return True
         return len(message_store.snapshot()) > max(self.preserve_recent_messages + 10, 40)

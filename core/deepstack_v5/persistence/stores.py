@@ -102,7 +102,6 @@ class RunStore:
         run_id: str,
         status: RunStatus | str,
         *,
-        budget: dict[str, Any] | None = None,
         expected_status: RunStatus | str | Sequence[RunStatus | str] | None = None,
         refuse_if_terminal: bool = False,
     ) -> bool:
@@ -124,28 +123,40 @@ class RunStore:
                 and existing_status != status_val
             ):
                 return False
-            if budget is None:
-                cur = self.db.execute(
-                    "UPDATE runs SET status = ?, updated_at_ms = ? WHERE run_id = ?",
-                    (
-                        status_val,
-                        now_ms(),
-                        run_id,
-                    ),
-                )
-            else:
-                cur = self.db.execute(
-                    """
-                    UPDATE runs SET status = ?, updated_at_ms = ?, budget_json = ?
-                    WHERE run_id = ?
-                    """,
-                    (
-                        status_val,
-                        now_ms(),
-                        _dumps(budget),
-                        run_id,
-                    ),
-                )
+            cur = self.db.execute(
+                "UPDATE runs SET status = ?, updated_at_ms = ? WHERE run_id = ?",
+                (
+                    status_val,
+                    now_ms(),
+                    run_id,
+                ),
+            )
+            return cur.rowcount > 0
+
+    def persist_budget_snapshot(
+        self, run_id: str, snapshot: dict[str, Any]
+    ) -> bool:
+        """Durably persist an engine budget snapshot via a monotonic merge.
+
+        Replaces the removed ``update_status(budget=...)`` blind write: reads
+        the current row inside the transaction and merges per counter (see
+        ``_merge_budget_snapshot``) so it can never regress a value a concurrent
+        WorkerHarness accumulated via ``increment_budget_usage``. Pure write —
+        emits no events and computes no warning crossing; the engine owns
+        ``budget.warning`` emission.
+        """
+        with self.db.transaction():
+            row = self.db.query_one(
+                "SELECT budget_json FROM runs WHERE run_id = ?", (run_id,)
+            )
+            if row is None:
+                return False
+            db_budget = dict(_loads(row["budget_json"]) or {})
+            merged = _merge_budget_snapshot(db_budget, snapshot)
+            cur = self.db.execute(
+                "UPDATE runs SET budget_json = ?, updated_at_ms = ? WHERE run_id = ?",
+                (_dumps(merged), now_ms(), run_id),
+            )
             return cur.rowcount > 0
 
     def update_metadata(self, run_id: str, metadata: dict[str, Any]) -> None:
@@ -236,12 +247,21 @@ def _apply_budget_delta(
     cost: float,
     elapsed_s: float | None,
 ) -> None:
+    # Price-aware token->cost derivation: a token-only client reports cost=0,
+    # so derive the cost from the persisted price exactly as
+    # BudgetTracker.consume does (control/budget.py). Without this, a token-only
+    # run's max_cost cap never fires because consumed_cost stays 0 in the DB
+    # (and the harness then restores that 0 back over its locally-derived cost).
+    derived = cost
+    price = budget.get("cost_per_1k_tokens")
+    if not cost and tokens and price:
+        derived = (tokens / 1000.0) * float(price)
     if tokens:
         budget["consumed_tokens"] = int(budget.get("consumed_tokens") or 0) + tokens
     else:
         budget["consumed_tokens"] = int(budget.get("consumed_tokens") or 0)
-    if cost:
-        budget["consumed_cost"] = float(budget.get("consumed_cost") or 0.0) + cost
+    if derived:
+        budget["consumed_cost"] = float(budget.get("consumed_cost") or 0.0) + derived
     else:
         budget["consumed_cost"] = float(budget.get("consumed_cost") or 0.0)
     if elapsed_s is not None:
@@ -273,7 +293,66 @@ def _budget_is_warning(budget: dict[str, Any]) -> bool:
         and float(budget.get("elapsed_s") or 0.0) >= float(max_wallclock_s) * ratio
     ):
         return True
+    max_iterations = budget.get("max_iterations")
+    if (
+        max_iterations
+        and int(budget.get("iterations") or 0) >= float(max_iterations) * ratio
+    ):
+        return True
     return False
+
+
+# Counters that only ever grow within a run; the durable write must never
+# regress one, so we merge them as max(db, incoming).
+_BUDGET_MONOTONIC_KEYS = ("consumed_tokens", "consumed_cost", "elapsed_s")
+# Config/limit keys the live engine snapshot is authoritative for.
+_BUDGET_CONFIG_KEYS = (
+    "max_tokens",
+    "max_cost",
+    "max_wallclock_s",
+    "max_iterations",
+    "warning_ratio",
+    "cost_per_1k_tokens",
+)
+
+
+def _merge_budget_snapshot(
+    db_budget: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Monotonic per-counter merge for durable engine budget writes.
+
+    Used by ``persist_budget_snapshot`` in place of the old blind overwrite so
+    an engine snapshot can never clobber token/cost a concurrent WorkerHarness
+    accumulated via ``increment_budget_usage``.
+
+    Rules:
+    - ``consumed_tokens`` / ``consumed_cost`` / ``elapsed_s`` -> ``max(db, incoming)``.
+      Correct for the default in-process engine (sole writer, incoming >= db)
+      and for the engine + external-worker topology where consumption is
+      worker-driven (db >= incoming). It does NOT correctly total a *mixed*
+      topology where the engine AND external workers both consume the SAME run
+      concurrently — that case was already mis-accounted (the old blind write
+      clobbered it) and is unsupported; max() is strictly better because it
+      stops the clobber.
+    - ``iterations`` -> ``incoming`` (engine-authoritative; workers never write it).
+    - config keys (``max_*``, ``warning_ratio``, ``cost_per_1k_tokens``) ->
+      ``incoming`` when present, so a resume-with-new-budget override wins; a key
+      absent from ``incoming`` (e.g. ``cost_per_1k_tokens`` gated out when None)
+      is left as the DB's value.
+    """
+    merged = dict(db_budget or {})
+    for key in _BUDGET_MONOTONIC_KEYS:
+        db_v = float(db_budget.get(key) or 0.0)
+        in_v = float(incoming.get(key) or 0.0)
+        merged[key] = max(db_v, in_v)
+    # Preserve the JSON int type for token count.
+    merged["consumed_tokens"] = int(merged.get("consumed_tokens") or 0)
+    if "iterations" in incoming:
+        merged["iterations"] = int(incoming.get("iterations") or 0)
+    for key in _BUDGET_CONFIG_KEYS:
+        if key in incoming:
+            merged[key] = incoming[key]
+    return merged
 
 
 def _coerce_status_values(
@@ -803,6 +882,21 @@ class EventStore:
             for r in rows
         ]
 
+    def count_kinds(self, run_id: str, kinds: Sequence[str]) -> dict[str, int]:
+        """Count events of the given kinds for a run over ALL rows (not just a
+        recent window), so a summary can report true totals when the event
+        count exceeds the snapshot read cap (defect 16)."""
+        kinds = list(kinds)
+        if not kinds:
+            return {}
+        placeholders = ",".join("?" * len(kinds))
+        rows = self.db.query(
+            f"SELECT kind, COUNT(*) AS n FROM events "
+            f"WHERE run_id = ? AND kind IN ({placeholders}) GROUP BY kind",
+            (run_id, *kinds),
+        )
+        return {r["kind"]: int(r["n"]) for r in rows}
+
     def read_sequences(
         self, sequences: Sequence[int], *, run_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -1050,7 +1144,7 @@ class SnapshotStore:
                    summary, payload_json, created_at_ms
             FROM snapshots
             WHERE run_id = ?
-            ORDER BY created_at_ms DESC, snapshot_id DESC
+            ORDER BY created_at_ms DESC, highwater_sequence DESC, rowid DESC
             LIMIT 1
             """,
             (run_id,),

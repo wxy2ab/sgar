@@ -29,6 +29,7 @@ import argparse
 import datetime as _dt
 import html
 import json
+import re
 import sqlite3
 import sys
 import webbrowser
@@ -785,11 +786,18 @@ def _load_template() -> str:
     return _TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
+_PLACEHOLDER_RE = re.compile(r"\{\{ (\w+) \}\}")
+
+
 def _render_template(template: str, mapping: dict[str, str]) -> str:
-    out = template
-    for key, value in mapping.items():
-        out = out.replace("{{ " + key + " }}", value)
-    return out
+    # Single pass over the ORIGINAL template: a substituted value that itself
+    # contains a later placeholder literal (e.g. a node_id / goal echoing
+    # "{{ EVENTS_SECTION }}" — html.escape does NOT escape ``{}``) must never be
+    # re-scanned and spliced. Sequential str.replace re-scans already-rendered
+    # output and would corrupt it; re.sub visits each real placeholder span once.
+    def _sub(m: "re.Match[str]") -> str:
+        return mapping.get(m.group(1), m.group(0))
+    return _PLACEHOLDER_RE.sub(_sub, template)
 
 
 def build_html(

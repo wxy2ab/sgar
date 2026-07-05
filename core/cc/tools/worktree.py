@@ -15,7 +15,9 @@ def _worktree_root(base_cwd: Path) -> Path:
 
 def _copy_workspace(src: Path, dst: Path) -> None:
     ignore = shutil.ignore_patterns("__pycache__", ".git", ".cc", ".pytest_cache")
-    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ignore)
+    # dirs_exist_ok=False: refuse to merge into an existing worktree so two
+    # same-named sessions cannot silently pollute each other's isolated copy.
+    shutil.copytree(src, dst, ignore=ignore)
 
 
 class EnterWorktreeTool(BaseTool):
@@ -59,6 +61,16 @@ class EnterWorktreeTool(BaseTool):
         src = Path(ctx.cwd).resolve()
         slug = str(tool_call.arguments.get("name") or f"wt_{uuid.uuid4().hex[:8]}")
         dst = _worktree_root(src) / slug
+        if dst.exists():
+            # An explicit name that collides with an existing worktree would let
+            # two sessions pollute each other's isolated copy — refuse instead.
+            return ToolResult(
+                tool_use_id=tool_call.tool_use_id,
+                tool_name=tool_call.tool_name,
+                success=False,
+                content=f"Worktree '{slug}' already exists at {dst}; choose a different name.",
+                error_code="AG1004",
+            )
         _copy_workspace(src, dst)
 
         def modify(current_ctx: ToolUseContext) -> ToolUseContext:

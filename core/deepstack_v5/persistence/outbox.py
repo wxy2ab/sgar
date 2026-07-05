@@ -94,5 +94,21 @@ class Outbox:
         )
         return int(row["n"]) if row else 0
 
+    def purge_delivered(self, *, before_ms: int) -> int:
+        """Delete delivered rows whose delivered_at_ms < before_ms.
+
+        The outbox is a crash-recovery WAL: only UNDELIVERED rows are ever
+        replayed, so purging old delivered rows is safe and keeps the table
+        from growing without bound. Recently-delivered rows are retained (the
+        caller passes a watermark) so a prompt reset_pending()/replay still
+        works. Returns the number of rows purged.
+        """
+        cur = self.db.execute(
+            "DELETE FROM outbox WHERE delivered_at_ms IS NOT NULL "
+            "AND delivered_at_ms < ?",
+            (before_ms,),
+        )
+        return cur.rowcount
+
 
 __all__ = ["Outbox"]

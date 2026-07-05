@@ -50,8 +50,13 @@ NETWORK_PATTERNS = (
 )
 
 DESTRUCTIVE_PATTERNS = (
-    "rm -rf",
-    "rm -r -f",
+    # Unambiguous multi-token signatures. These are safe to match anywhere as a
+    # substring (incl. embedded in interpreter payloads, e.g. shutil.rmtree()),
+    # because they don't collide with ordinary flags or prose. `rm` with
+    # force+recursive (any flag order) is handled by ``_is_recursive_force_rm``;
+    # the English words ``format``/``truncate`` are handled by
+    # ``_has_destructive_command_word`` (command position only) so that
+    # ``git log --format`` and ``git commit -m "truncate table"`` don't false-positive.
     "del /f /q",
     "rmdir ",
     "remove-item -recurse -force",
@@ -59,14 +64,22 @@ DESTRUCTIVE_PATTERNS = (
     "remove-item -r -force",
     "git reset --hard",
     "git checkout --",
-    "format ",
     "mkfs",
     "find / -delete",
-    "truncate ",
     "dd of=",
     "chmod 777",
     "rmtree(",
 )
+
+# English words that are destructive as commands but common as flags/args.
+_AMBIGUOUS_DESTRUCTIVE_WORDS = ("format", "truncate")
+
+# In-place stream editors (sed/perl/ruby with -i / --in-place) mutate files.
+_INPLACE_EDIT_RE = re.compile(r"\b(?:sed|perl|ruby)\b[^;&|]*(?:\s-i\b|--in-place\b)")
+
+# Command / process substitution can smuggle arbitrary commands past token
+# classification, so it is always downgraded to ``unknown`` (ask).
+_SUBSTITUTION_MARKERS = ("$(", "`", "<(", ">(")
 
 WORKSPACE_WRITE_PATTERNS = (
     "mv ",
@@ -115,6 +128,46 @@ def _is_interpreter_wrapper(command: str) -> bool:
     return any(flag in command for flag in INTERPRETER_FLAG_PATTERNS)
 
 
+def _has_destructive_command_word(command: str) -> bool:
+    # Match ``format``/``truncate`` only at command position (start of the
+    # command or whitespace-preceded), never as a flag (``--format``) or right
+    # after a quote (``git commit -m "truncate table"``).
+    return any(
+        re.search(rf"(?:^|\s){word}\b", command) is not None
+        for word in _AMBIGUOUS_DESTRUCTIVE_WORDS
+    )
+
+
+def _is_recursive_force_rm(command: str) -> bool:
+    # ``rm`` is destructive when it carries BOTH a recursive and a force flag,
+    # in any order or combination (``-rf``, ``-fr``, ``-r -f``, ``--recursive
+    # --force``, ``-f --recursive``).
+    for match in re.finditer(r"(?:^|[\s;&|(])rm\b([^;&|]*)", command):
+        has_recursive = has_force = False
+        for token in match.group(1).split():
+            if token.startswith("--"):
+                name = token[2:]
+                if name == "recursive":
+                    has_recursive = True
+                elif name == "force":
+                    has_force = True
+            elif token.startswith("-") and len(token) > 1:
+                letters = token[1:]
+                if "r" in letters:
+                    has_recursive = True
+                if "f" in letters:
+                    has_force = True
+            else:
+                break  # first positional argument — stop scanning flags
+            if has_recursive and has_force:
+                return True
+    return False
+
+
+def _is_inplace_edit(command: str) -> bool:
+    return _INPLACE_EDIT_RE.search(command) is not None
+
+
 def _classification_from_patterns(
     command: str,
     *,
@@ -123,11 +176,17 @@ def _classification_from_patterns(
     read_only_patterns: tuple[str, ...],
     workspace_write_patterns: tuple[str, ...],
 ) -> CommandClassification:
-    if any(_contains_pattern(command, pattern) for pattern in destructive_patterns):
+    if (
+        _is_recursive_force_rm(command)
+        or _has_destructive_command_word(command)
+        or any(_contains_pattern(command, pattern) for pattern in destructive_patterns)
+    ):
         return CommandClassification(category="destructive", is_destructive=True, touches_workspace=True)
     if any(_contains_pattern(command, pattern) for pattern in network_patterns):
         return CommandClassification(category="network", touches_network=True)
-    if any(_contains_pattern(command, pattern) for pattern in workspace_write_patterns):
+    if _is_inplace_edit(command) or any(
+        _contains_pattern(command, pattern) for pattern in workspace_write_patterns
+    ):
         return CommandClassification(category="workspace_write", touches_workspace=True)
     if any(command.startswith(pattern) or _contains_pattern(command, pattern) for pattern in read_only_patterns):
         return CommandClassification(category="read_only")
@@ -136,6 +195,13 @@ def _classification_from_patterns(
 
 def classify_command(command: str, *, shell_kind: str) -> CommandClassification:
     normalized = _normalize_command(command)
+
+    # Check command / process substitution FIRST, before base classification —
+    # otherwise a read-only or workspace-write outer token (``cat $(...)``,
+    # ``echo `...```) returns early and the substituted command is never seen.
+    if any(marker in normalized for marker in _SUBSTITUTION_MARKERS):
+        return CommandClassification(category="unknown", touches_workspace=True)
+
     destructive_patterns = DESTRUCTIVE_PATTERNS
     workspace_write_patterns = WORKSPACE_WRITE_PATTERNS
     if shell_kind == "powershell":
@@ -151,9 +217,6 @@ def classify_command(command: str, *, shell_kind: str) -> CommandClassification:
     )
     if base.category != "unknown":
         return base
-
-    if "$(" in normalized or "`" in normalized:
-        return CommandClassification(category="unknown", touches_workspace=True)
 
     if _is_interpreter_wrapper(normalized):
         wrapped = _classification_from_patterns(

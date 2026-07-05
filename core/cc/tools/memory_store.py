@@ -33,7 +33,14 @@ class MemoryStoreTool(BaseTool):
 
     def is_enabled(self, ctx):
         del ctx
-        return False
+        # Mirror the unified MemoryTool: dispatchable by its legacy wire name
+        # only while memory is enabled (cc's executor rejects disabled tools
+        # via TL1009). Hidden from the LLM schema via is_hidden regardless.
+        return bool(getattr(self.memory_runtime.config, "memory_enabled", False))
+
+    def is_hidden(self, ctx):
+        del ctx
+        return True
 
     def validate_input(self, arguments: dict[str, Any]) -> ValidationResult:
         for field in ("memory_kind", "subject", "summary", "text"):

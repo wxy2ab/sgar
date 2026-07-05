@@ -208,6 +208,10 @@ class LocalSubprocessController:
         )
         self.handle.process_id = self.process.pid
         self._started = True
+        # The child has inherited its own copies of these FDs at exec, so close
+        # the parent's copies now instead of leaking them until GC / close. The
+        # startup/response readers re-open the log files by path, not by handle.
+        self._close_streams()
 
     async def _wait_for_startup(self, timeout: float = 10.0) -> None:
         deadline = time.time() + timeout
@@ -249,7 +253,7 @@ class LocalSubprocessController:
                     "final_text": response.get("final_text", ""),
                     "message_id": message_id,
                 }
-                for key in ("synced", "shared_context", "shared_allowed_paths", "kind"):
+                for key in ("synced", "shared_context", "shared_allowed_paths", "kind", "error", "error_code"):
                     if key in response:
                         result[key] = response[key]
                 return result

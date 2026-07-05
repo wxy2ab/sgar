@@ -22,6 +22,14 @@ from .turn_pipeline import (
 )
 
 
+# Event types that ``run_single_turn`` yields only at a terminal completion
+# point (each is immediately followed by ``return``). Once one of these is
+# yielded the turn is done, so the turn-timeout guard must not fire after it.
+_TERMINAL_COMPLETION_EVENT_TYPES = frozenset(
+    {"assistant_completed", "assistant_followup_completed"}
+)
+
+
 class QueryEngine:
     _SESSION_SNAPSHOT_INTERVAL = 5
 
@@ -123,7 +131,16 @@ class QueryEngine:
                     tool_call_count += 1
                 self._record_session_event(event)
                 yield event
-                if turn_timeout is not None and (time.monotonic() - turn_start) >= turn_timeout:
+                # Skip the timeout guard for terminal completion events: the turn
+                # has already produced its result, so a slow-but-completed turn
+                # must be finalized as success, not mismarked FAILED/QE1008 (which
+                # also dropped its memory store). The guard still fires for
+                # non-terminal events so a genuinely long-running turn aborts.
+                if (
+                    turn_timeout is not None
+                    and event.event_type not in _TERMINAL_COMPLETION_EVENT_TYPES
+                    and (time.monotonic() - turn_start) >= turn_timeout
+                ):
                     elapsed = int(time.monotonic() - turn_start)
                     timeout_event = self._build_turn_timeout_event(
                         turn_id=turn_id, elapsed_seconds=elapsed, limit_seconds=int(turn_timeout),

@@ -168,28 +168,35 @@ def degraded_completion(
 
     Predicate note: ``completed`` is the only success-shaped ``RunStatus``, so
     only it can mask degradation as success. We key on ``abandoned > 0 OR
-    failed > 0``. The reachable production case is ``abandoned > 0`` (FAILED is
-    not in ``TERMINAL_NODE_STATES``, so a live v5 ``completed`` run cannot carry
-    a ``failed`` node); ``failed`` is included as harmless defence-in-depth so
-    the monitor stays honest against a partial / crashed DB write.
+    failed > 0 OR skipped > 0 OR cancelled > 0`` — the exact complement of
+    ``RunSpecResult.succeeded`` (fixed_dag.py), which treats abandoned, failed,
+    skipped AND cancelled nodes as non-success. ``abandoned`` is the common
+    production case; ``skipped``/``cancelled`` are reachable (a single-node
+    cancel skips its dependents) yet would otherwise show a clean green badge
+    that disagrees with ``succeeded``; ``failed`` is defence-in-depth against a
+    partial / crashed DB write.
     """
     if str(status or "").strip().lower() != "completed":
         return None
     counts = state_counts or {}
     abandoned = int(counts.get("abandoned", 0) or 0)
     failed = int(counts.get("failed", 0) or 0)
-    if abandoned <= 0 and failed <= 0:
+    skipped = int(counts.get("skipped", 0) or 0)
+    cancelled = int(counts.get("cancelled", 0) or 0)
+    if abandoned <= 0 and failed <= 0 and skipped <= 0 and cancelled <= 0:
         return None
-    return {"abandoned": abandoned, "failed": failed}
+    return {
+        "abandoned": abandoned, "failed": failed,
+        "skipped": skipped, "cancelled": cancelled,
+    }
 
 
 def _degraded_phrase(degraded: dict[str, int]) -> str:
     """``{'abandoned': 2, 'failed': 1}`` -> ``"2 abandoned, 1 failed"``."""
     parts: list[str] = []
-    if degraded.get("abandoned"):
-        parts.append(f"{degraded['abandoned']} abandoned")
-    if degraded.get("failed"):
-        parts.append(f"{degraded['failed']} failed")
+    for key in ("abandoned", "failed", "skipped", "cancelled"):
+        if degraded.get(key):
+            parts.append(f"{degraded[key]} {key}")
     return ", ".join(parts)
 
 
@@ -246,7 +253,13 @@ def _state_counts(conn: sqlite3.Connection, run_id: str) -> dict[str, int]:
         "SELECT state, COUNT(*) AS n FROM nodes WHERE run_id = ? GROUP BY state",
         (run_id,),
     )
-    return {_row_get(r, "state", ""): int(_row_get(r, "n", 0) or 0) for r in rows}
+    # Coerce a NULL ``state`` cell (corrupt / partially-written DB — which this
+    # watcher deliberately tolerates) to "" so every key is a str. A None key
+    # would blow up ``sorted(counts.items())`` on a mixed str/None set.
+    return {
+        str(_row_get(r, "state", "") or ""): int(_row_get(r, "n", 0) or 0)
+        for r in rows
+    }
 
 
 def get_run(conn: sqlite3.Connection, run_id: str) -> dict[str, Any] | None:
@@ -658,7 +671,10 @@ def render_nodes_table(
 
     # Summary line
     counts = state_counts or {}
-    counts_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "-"
+    counts_str = ", ".join(
+        f"{k}={v}"
+        for k, v in sorted(counts.items(), key=lambda kv: str(kv[0]))
+    ) or "-"
     leases = list(leases or [])
     now = _now_ms()
     expired = sum(
@@ -944,6 +960,7 @@ def compute_run_stats(
             "calls": 0,
             "preview_bytes": 0,
             "full_content_bytes": 0,
+            "saved_bytes": 0,
             "failures": 0,
         })
         kind = r["kind"]
@@ -951,10 +968,17 @@ def compute_run_stats(
             bucket["calls"] += 1
         elif kind == "cc.tool_result":
             preview = payload.get("preview") or ""
-            bucket["preview_bytes"] += len(str(preview).encode("utf-8"))
+            preview_len = len(str(preview).encode("utf-8"))
+            bucket["preview_bytes"] += preview_len
             full = payload.get("full_content_bytes")
             if isinstance(full, int):
                 bucket["full_content_bytes"] += full
+                # Bytes saved by offloading THIS result = its full size minus
+                # the inline preview kept for it. Accumulate per offloaded
+                # result — never subtract the whole run's preview total (which
+                # includes small inline results that were never offloaded) from
+                # the offloaded subset, which understates savings and floors to 0.
+                bucket["saved_bytes"] += max(0, full - preview_len)
         elif kind in ("cc.tool_failed", "cc.tool_completed"):
             if payload.get("success") is False:
                 bucket["failures"] += 1
@@ -963,7 +987,7 @@ def compute_run_stats(
     for tool_name, b in sorted(per_tool.items()):
         full = b["full_content_bytes"]
         prev = b["preview_bytes"]
-        saved = max(0, full - prev) if full > 0 else 0
+        saved = b["saved_bytes"]  # accumulated per offloaded result (see above)
         ratio = (saved / full) if full > 0 else 0.0
         tools.append({
             "tool_name": tool_name,

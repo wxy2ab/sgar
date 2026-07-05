@@ -92,6 +92,13 @@ class RepositoryOutlineCache:
             return self._empty(target, max_depth, max_entries_per_dir)
         if not resolved.exists() or not resolved.is_dir():
             return self._empty(resolved, max_depth, max_entries_per_dir)
+        # Enforce the documented "under cwd" guarantee. A ``../..`` token can
+        # resolve to a real directory OUTSIDE the repo (absolute tokens are
+        # neutralized upstream — only dot-dot escapes reach here). Refuse
+        # anything that is neither cwd itself nor a descendant of it.
+        cwd_resolved = Path(self.cwd).resolve()
+        if resolved != cwd_resolved and cwd_resolved not in resolved.parents:
+            return self._empty(resolved, max_depth, max_entries_per_dir)
 
         key = (str(resolved), max_depth, max_entries_per_dir)
         cached = self._focused.get(key)

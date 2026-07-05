@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import re
 from typing import Any
@@ -31,7 +32,12 @@ def slugify_artifact_task(value: str | None, *, fallback: str) -> str:
     text = text.strip("-")
     if not text:
         return fallback
-    return text[:64]
+    if len(text) <= 64:
+        return text
+    # Truncation alone collides for long tasks sharing a 64-char prefix; append a
+    # short stable hash of the full value so distinct tasks get distinct slugs.
+    digest = hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:8]
+    return f"{text[:55]}-{digest}"
 
 
 def resolve_artifact_root(

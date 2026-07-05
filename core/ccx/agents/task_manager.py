@@ -76,6 +76,21 @@ _NODE_TO_TASK_STATE: dict[NodeState, AgentTaskStatus] = {
 }
 
 
+def _dep_ids(raw: Any) -> list[str]:
+    """Normalise a ``depends_on_task_ids`` value to a list of id strings.
+
+    A bare STRING (``"task_a"`` instead of ``["task_a"]``) would otherwise
+    iterate CHARACTER-BY-CHARACTER — producing bogus ``missing dependency: t``
+    failures and corrupting the persisted ``depends_on`` into single letters.
+    Coerce it to a single-element list; anything falsy → ``[]``.
+    """
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    return [str(d) for d in raw]
+
+
 # --------------------------------------------------------------------------- #
 # TaskManager
 # --------------------------------------------------------------------------- #
@@ -212,7 +227,7 @@ class TaskManager:
         for task_id, task in pending.items():
             deps: list[str] = []
             seen: set[str] = set()
-            for raw_dep in task.input_payload.get("depends_on_task_ids") or ():
+            for raw_dep in _dep_ids(task.input_payload.get("depends_on_task_ids")):
                 dep_id = str(raw_dep)
                 if dep_id in seen:
                     continue
@@ -355,7 +370,7 @@ class TaskManager:
                 "node_id": task.task_id,
                 "tool": "ccx.agent",
                 "params": dict(task.input_payload or {}),
-                "depends_on": list(task.input_payload.get("depends_on_task_ids") or []),
+                "depends_on": _dep_ids(task.input_payload.get("depends_on_task_ids")),
                 "max_attempts": 3,
                 "timeout_s": None,
                 "requires_approval": False,

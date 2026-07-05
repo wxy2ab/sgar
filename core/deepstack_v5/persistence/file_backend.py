@@ -21,7 +21,12 @@ from ..types import (
     TERMINAL_RUN_STATUSES,
     now_ms,
 )
-from .stores import BudgetIncrementResult, _apply_budget_delta, _budget_is_warning
+from .stores import (
+    BudgetIncrementResult,
+    _apply_budget_delta,
+    _budget_is_warning,
+    _merge_budget_snapshot,
+)
 
 
 class InMemoryRunStore:
@@ -57,7 +62,6 @@ class InMemoryRunStore:
         run_id: str,
         status: RunStatus | str,
         *,
-        budget: dict[str, Any] | None = None,
         expected_status: RunStatus | str | Sequence[RunStatus | str] | None = None,
         refuse_if_terminal: bool = False,
     ) -> bool:
@@ -78,8 +82,19 @@ class InMemoryRunStore:
                 return False
             run["status"] = status_val
             run["updated_at_ms"] = now_ms()
-            if budget is not None:
-                run["budget"] = budget
+            return True
+
+    def persist_budget_snapshot(
+        self, run_id: str, snapshot: dict[str, Any]
+    ) -> bool:
+        """In-memory parity for :meth:`RunStore.persist_budget_snapshot`."""
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return False
+            db_budget = dict(run.get("budget") or {})
+            run["budget"] = _merge_budget_snapshot(db_budget, snapshot)
+            run["updated_at_ms"] = now_ms()
             return True
 
     def update_metadata(self, run_id: str, metadata: dict[str, Any]) -> None:
@@ -435,6 +450,18 @@ class InMemoryEventStore:
                     break
             return out
 
+    def count_kinds(self, run_id: str, kinds: Sequence[str]) -> dict[str, int]:
+        wanted = set(kinds)
+        counts: dict[str, int] = {}
+        with self._lock:
+            for ev in self._events:
+                if ev["run_id"] != run_id:
+                    continue
+                k = ev["kind"]
+                if k in wanted:
+                    counts[k] = counts.get(k, 0) + 1
+        return counts
+
     def read_sequences(
         self, sequences: Sequence[int], *, run_id: str | None = None
     ) -> list[dict[str, Any]]:
@@ -502,6 +529,15 @@ class InMemoryOutbox:
     def pending_count(self) -> int:
         with self._lock:
             return len(self._undelivered)
+
+    def purge_delivered(self, *, before_ms: int) -> int:
+        # Delivered sequences are dropped on mark_delivered, so nothing
+        # accumulates here; drop their stale run-id bookkeeping for parity.
+        with self._lock:
+            stale = [s for s in self._run_ids if s not in self._undelivered]
+            for s in stale:
+                del self._run_ids[s]
+        return 0
 
 
 __all__ = [

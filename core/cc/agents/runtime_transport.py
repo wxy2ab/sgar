@@ -53,7 +53,10 @@ class FileRuntimeTransport:
             import json
 
             return json.loads(self.status_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            # exists()-then-read is racy (the worker may rewrite/remove the file
+            # between the check and the read) and the file may hold partial or
+            # non-UTF-8 bytes mid-write; treat any of these as "no status yet".
             return {}
 
     def request_stop(self, reason: str) -> None:

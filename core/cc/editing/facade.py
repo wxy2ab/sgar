@@ -106,6 +106,9 @@ class CodeEditFacade:
             after_content=updated_content,
         )
 
+        # Static validations run against the in-memory ``updated_content``.
+        # Runtime validation is deferred until AFTER the write (below) so the
+        # runtime command observes the STAGED content, not the pre-edit file.
         validation_results = [
             text_result,
             self.validator.validate_structure(
@@ -117,14 +120,6 @@ class CodeEditFacade:
         if all(result.ok for result in validation_results):
             validation_results.append(
                 self.validator.validate_semantics(code=updated_content, file_path=request.file_path)
-            )
-        if all(result.ok for result in validation_results):
-            validation_results.append(
-                self.validator.validate_runtime(
-                    file_path=request.file_path,
-                    runtime_command=request.runtime_command,
-                    runtime_shell=request.runtime_shell,
-                )
             )
 
         first_failure = next((item for item in validation_results if not item.ok), None)
@@ -174,6 +169,32 @@ class CodeEditFacade:
                 rollback_performed=True,
                 error_code="ED2001",
             )
+        # Runtime validation now runs against the freshly-written file, so a
+        # content-sensitive command (linter, compile, targeted test) sees the
+        # edited content. On failure, restore the checkpoint (rewrites the
+        # original) so the file is not left in the rejected state.
+        runtime_result = self.validator.validate_runtime(
+            file_path=request.file_path,
+            runtime_command=request.runtime_command,
+            runtime_shell=request.runtime_shell,
+        )
+        validation_results.append(runtime_result)
+        if not runtime_result.ok:
+            rollback_result = self.rollback_manager.restore_checkpoint(checkpoint.checkpoint_id)
+            self.file_state_cache.read(request.file_path)
+            return EditResult(
+                success=False,
+                file_path=request.file_path,
+                content=original_snapshot.content,
+                before_hash=original_snapshot.file_hash,
+                after_hash=original_snapshot.file_hash,
+                preview=preview,
+                validation_results=validation_results,
+                checkpoint_id=checkpoint.checkpoint_id,
+                rollback_performed=rollback_result.success,
+                error_code=runtime_result.error_code,
+            )
+
         after_hash = compute_file_hash(updated_content)
         self.file_state_cache.read(request.file_path)
         return EditResult(

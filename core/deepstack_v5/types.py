@@ -307,6 +307,8 @@ class Budget:
             return True
         if self.max_wallclock_s and self.elapsed_s >= self.max_wallclock_s * ratio:
             return True
+        if self.max_iterations and self.iterations >= self.max_iterations * ratio:
+            return True
         return False
 
     def snapshot(self) -> dict[str, Any]:

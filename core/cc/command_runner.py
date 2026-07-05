@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict, dataclass, field
+import os
 from pathlib import Path
 import platform
 import shlex
+import signal
 import subprocess
 import time
 from typing import Sequence
@@ -86,6 +88,7 @@ def execute_command(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",  # non-UTF-8 output must not raise UnicodeDecodeError
             timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
@@ -114,6 +117,44 @@ def execute_command(
     )
 
 
+def _terminate_process(proc: "asyncio.subprocess.Process") -> None:
+    """Kill the subprocess and, on POSIX, its whole process group.
+
+    The children are spawned with ``start_new_session=True`` so they lead their
+    own group; ``proc.kill()`` alone would leave grandchildren orphaned but
+    running. Falls back to a plain kill where process groups aren't available
+    (Windows) or the group is already gone.
+    """
+    if proc.pid is not None and hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+async def _pump_stream(stream: "asyncio.StreamReader | None", chunks: list[bytes]) -> None:
+    """Continuously read a stream into ``chunks`` until EOF.
+
+    Runs concurrently with the process so output is accumulated as it arrives —
+    on timeout the already-read chunks are the salvaged partial output, and the
+    pipes never fill (which would deadlock a producer). ``communicate()`` cannot
+    be used for this: it buffers into a local that is discarded when the
+    surrounding ``wait_for`` cancels it, losing the partial output.
+    """
+    if stream is None:
+        return
+    while True:
+        chunk = await stream.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+
+
 async def execute_command_async(
     *,
     command: str,
@@ -139,6 +180,7 @@ async def execute_command_async(
             cwd=resolved_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     elif resolved_shell == "shell":
         try:
@@ -166,32 +208,58 @@ async def execute_command_async(
             cwd=resolved_cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
     else:
         raise ValueError(f"Unsupported shell_kind: {resolved_shell}")
 
     started_at = time.perf_counter()
-    proc = await create
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout_s,
+        proc = await create
+    except OSError as exc:
+        # Spawn failure (e.g. binary not found) previously raised outside the
+        # try and surfaced as an opaque error; return a shaped failed result.
+        return CommandExecutionResult(
+            success=False,
+            command=command,
+            shell_kind=resolved_shell,
+            cwd=resolved_cwd,
+            exit_code=127,
+            stderr=str(exc),
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
         )
+    # Pump stdout/stderr concurrently so partial output is preserved on timeout
+    # and the pipes can't fill and deadlock the child.
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    pump_stdout = asyncio.ensure_future(_pump_stream(proc.stdout, stdout_chunks))
+    pump_stderr = asyncio.ensure_future(_pump_stream(proc.stderr, stderr_chunks))
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout_s)
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        # Kill the whole process group (not just the direct child); the pumps
+        # then drain any remaining buffered output before the pipes close, so
+        # the [check:]/run_tests evidence tail survives (matching the sync path).
+        _terminate_process(proc)
+        try:
+            await asyncio.wait_for(asyncio.gather(pump_stdout, pump_stderr), timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            pump_stdout.cancel()
+            pump_stderr.cancel()
         return CommandExecutionResult(
             success=False,
             command=command,
             shell_kind=resolved_shell,
             cwd=resolved_cwd,
             exit_code=-1,
-            stdout="",
-            stderr="",
+            stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+            stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
             duration_ms=int(timeout_ms or 0),
             was_timeout=True,
         )
 
+    # Process exited within the budget — let the pumps finish reading to EOF.
+    await asyncio.gather(pump_stdout, pump_stderr, return_exceptions=True)
     duration_ms = int((time.perf_counter() - started_at) * 1000)
     return CommandExecutionResult(
         success=proc.returncode == 0,
@@ -199,8 +267,8 @@ async def execute_command_async(
         shell_kind=resolved_shell,
         cwd=resolved_cwd,
         exit_code=proc.returncode or 0,
-        stdout=stdout_bytes.decode("utf-8", errors="replace"),
-        stderr=stderr_bytes.decode("utf-8", errors="replace"),
+        stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+        stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
         duration_ms=duration_ms,
     )
 

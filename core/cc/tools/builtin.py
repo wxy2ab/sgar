@@ -57,9 +57,11 @@ def build_builtin_tool_registry(
     registry.register(GrepTool())
     if memory_runtime is not None:
         registry.register(MemoryTool(memory_runtime=memory_runtime))
-        # Legacy aliases — hidden from the LLM schema (is_enabled=False) but
-        # still resolvable by name for in-process callers and tests during
-        # the deprecation window.
+        # Legacy aliases — hidden from the LLM schema (is_hidden=True) but
+        # still dispatchable by their wire name for in-process callers, older
+        # clients, and tests during the deprecation window. They mirror the
+        # unified tool's gating (is_enabled tracks memory_enabled) so a by-name
+        # dispatch is rejected (TL1009) exactly when the unified tool is off.
         registry.register(MemoryStatusTool(memory_runtime=memory_runtime))
         registry.register(MemorySearchTool(memory_runtime=memory_runtime))
         registry.register(MemoryStoreTool(memory_runtime=memory_runtime))
