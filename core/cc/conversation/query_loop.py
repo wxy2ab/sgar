@@ -308,6 +308,156 @@ def _compact_conversation_messages(
     return head + [{"role": "user", "content": "[Earlier conversation rounds have been compacted.]"}] + tail
 
 
+# --- #1 Dangling tool-call repair -----------------------------------------
+# conversation_messages accumulates across every tool round of a turn and is
+# re-sent to the API each round. Anthropic-compatible backends (the Volc /
+# DeepSeek clients this loop drives) reject a request when an assistant
+# tool_call has no matching tool result, OR when a tool result references no
+# known tool_call — either raises an opaque HTTP 400 that aborts the whole
+# turn with no usable output. In the common path every call yields a result,
+# but any single unpaired entry (a tool that returned None, an auto-exit whose
+# result was dropped at ``result is not None``, a future refactor, a partially
+# consumed round) would then poison every subsequent round's request. We
+# enforce the pairing invariant defensively right before each send instead of
+# trusting every producer to stay balanced forever.
+_ORPHAN_TOOL_RESULT_PLACEHOLDER = (
+    "[tool result unavailable: this tool call produced no result "
+    "(interrupted or returned nothing). Treat it as failed and continue.]"
+)
+
+
+def _reconcile_tool_call_pairing(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return ``messages`` with tool_call ↔ tool_result pairing guaranteed.
+
+    For every assistant ``tool_calls`` id that has no answering ``role:"tool"``
+    message, synthesise a failure result immediately after the assistant turn;
+    drop any ``role:"tool"`` message whose ``tool_call_id`` is declared by no
+    assistant turn. Order is otherwise preserved (system stays at index 0), so
+    the result is safe to assign back over ``conversation_messages`` — which
+    also permanently repairs the in-memory list for later rounds.
+    """
+    declared_ids: set[str] = set()
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                if isinstance(tc, dict) and tc.get("id"):
+                    declared_ids.add(str(tc["id"]))
+    answered_ids: set[str] = {
+        str(m["tool_call_id"])
+        for m in messages
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    reconciled: list[dict[str, Any]] = []
+    for m in messages:
+        if m.get("role") == "tool":
+            if str(m.get("tool_call_id") or "") not in declared_ids:
+                continue  # orphan tool result — no assistant call declares it
+            reconciled.append(m)
+            continue
+        reconciled.append(m)
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id") or "")
+                if tc_id and tc_id not in answered_ids:
+                    reconciled.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": _ORPHAN_TOOL_RESULT_PLACEHOLDER,
+                        }
+                    )
+                    answered_ids.add(tc_id)
+    return reconciled
+
+
+# --- #2 Validation-retry loop guard ---------------------------------------
+# A model that re-sends a tool call which fails INPUT validation (bad path,
+# wrong types, missing required arg) gets an identical error every time — the
+# result is deterministic in the arguments, so resending cannot make progress.
+# Nothing but the coarse ``max_tool_rounds`` ceiling stops it, so a stuck model
+# can burn the entire round budget (and the tokens/latency that go with it) on
+# one broken call. We count consecutive validation failures per identical
+# (tool_name, arguments) call and, once the same call has failed
+# ``_VALIDATION_RETRY_LOOP_THRESHOLD`` times, inject a one-shot directive naming
+# the loop and telling the model to change approach. A structural counter, not
+# a standing prompt hint — the model can ignore a hint but the directive only
+# appears once it has demonstrably wedged.
+_RETRY_LOOP_ERROR_CODES = frozenset({"TL1002"})  # ToolValidationError
+_VALIDATION_RETRY_LOOP_THRESHOLD = 3
+
+
+def _retry_loop_key(tool_name: str, arguments: Any) -> str:
+    """Stable identity for 'the same call': tool name + canonical arguments.
+
+    A retried call carries a fresh ``tool_use_id`` each time, so identity must
+    be content-based. Argument order is normalised so equivalent dicts collapse
+    to one key.
+    """
+    try:
+        args_repr = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        args_repr = str(arguments)
+    return f"{tool_name}\x00{args_repr}"
+
+
+def _update_validation_retry_state(
+    round_calls: list[tuple[str, Any, str | None, bool]],
+    counts: dict[str, int],
+    warned: set[str],
+    *,
+    threshold: int = _VALIDATION_RETRY_LOOP_THRESHOLD,
+    language: str = "en",
+) -> str | None:
+    """Fold this round's results into the per-call validation-failure counters
+    and return a stop-directive if any identical call just crossed the loop
+    threshold (else ``None``).
+
+    ``round_calls`` is ``(tool_name, arguments, error_code, success)`` per
+    executed call. A success or non-validation error for a key resets it (and
+    clears its warned flag) — the guard targets a call wedged on the SAME
+    validation error, not intermittent failures interleaved with progress, and
+    a reset lets a genuinely new wedge later re-warn.
+    """
+    newly_wedged: list[tuple[str, int]] = []
+    for tool_name, arguments, error_code, success in round_calls:
+        key = _retry_loop_key(tool_name, arguments)
+        if success or error_code not in _RETRY_LOOP_ERROR_CODES:
+            counts.pop(key, None)
+            warned.discard(key)
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        if counts[key] >= threshold and key not in warned:
+            warned.add(key)
+            newly_wedged.append((tool_name, counts[key]))
+    if not newly_wedged:
+        return None
+    return _format_validation_retry_directive(newly_wedged, language)
+
+
+def _format_validation_retry_directive(
+    wedged: list[tuple[str, int]], language: str
+) -> str:
+    names = ", ".join(f"`{tool}` (×{n})" for tool, n in wedged)
+    if str(language).lower().startswith("zh"):
+        return (
+            f"⚠ 检测到重试循环：{names} 已用相同参数多次未通过输入校验。"
+            "重复发送相同的调用不会改变错误结果，也不会有任何进展。"
+            "请停止重试同一方案——检查该工具所需的参数名称与类型并改正，"
+            "或改用其它工具，或在没有该调用的情况下继续。"
+        )
+    return (
+        f"⚠ RETRY LOOP DETECTED: {names} failed input validation with the same "
+        "arguments. Resending an identical call cannot change the error or make "
+        "progress. STOP retrying the same approach — fix the arguments (check the "
+        "tool's required parameter names and types), use a different tool, or "
+        "proceed without it."
+    )
+
+
 async def run_single_turn(
     *,
     session: QuerySession,
@@ -383,11 +533,21 @@ async def run_single_turn(
     # RED verdict here blocks implementation-task auto-completion (see
     # ``_post_edit_blocks_autocomplete``). Stays None when the feature is off.
     latest_post_edit_verify_passed: bool | None = None
+    # Per-identical-call validation-failure counters + one-shot warned set for
+    # the validation-retry loop guard (#2). Persist across rounds of this turn.
+    validation_retry_counts: dict[str, int] = {}
+    validation_retry_warned: set[str] = set()
     while max_tool_rounds is None or tool_round < _effective_tool_limit(max_tool_rounds, session):
         if use_messages_mode:
             conversation_messages = _compact_conversation_messages(
                 conversation_messages, token_budget=compact_token_budget,
             )
+            # Dangling tool-call repair (#1). Guarantee every assistant
+            # tool_call has a matching tool result (and vice versa) before the
+            # request goes out, so a single unpaired entry from any prior round
+            # can't 400 the whole turn. Cheap and a no-op on the balanced
+            # common path; permanently repairs the in-memory list when not.
+            conversation_messages = _reconcile_tool_call_pairing(conversation_messages)
             # Inline tool-use ledger reminder. Reasoning models in long
             # multi-round tool sessions sometimes re-issue the same
             # file_read / grep / glob calls because the original tool
@@ -763,6 +923,28 @@ async def run_single_turn(
 
         _update_agent_collaboration_state(session=session, tool_results=collected_results)
 
+        # --- Validation-retry loop guard (#2). Count this round's per-identical
+        # -call validation failures; if a call just wedged (same args failed
+        # validation ``_VALIDATION_RETRY_LOOP_THRESHOLD`` times) inject a one-shot
+        # directive so the model changes approach instead of burning the whole
+        # round budget on a deterministically-failing call. Results carry no
+        # arguments, so pair each back to its originating call to key by content.
+        _call_args_by_id = {
+            c.tool_use_id: c.arguments for c in (*normalized_calls, *auto_exit_calls)
+        }
+        _round_calls = [
+            (r.tool_name, _call_args_by_id.get(r.tool_use_id, {}), r.error_code, r.success)
+            for r in collected_results
+        ]
+        retry_loop_directive = _update_validation_retry_state(
+            _round_calls,
+            validation_retry_counts,
+            validation_retry_warned,
+            language=session.prompt_language,
+        )
+        if retry_loop_directive and use_messages_mode:
+            conversation_messages.append({"role": "user", "content": retry_loop_directive})
+
         # --- Opt-in post-edit verification (default OFF; byte-equivalent when
         # off). After a round that mutated code, run the configured verification
         # command and feed the exit-code-gated verdict back into the loop so the
@@ -1029,17 +1211,28 @@ async def run_single_turn(
             return
 
         if use_messages_mode:
+            # The retry-loop directive (#2) was already appended inline above in
+            # messages mode; here only the followup instruction remains.
             if followup_instruction:
                 conversation_messages.append({"role": "user", "content": followup_instruction})
             conversation_messages[0] = {"role": "system", "content": prompt_parts.combined}
         else:
+            # Non-messages mode threads a single instruction_override, so fold
+            # the retry-loop directive (#2) in ahead of any followup.
+            _instruction_override = followup_instruction
+            if retry_loop_directive:
+                _instruction_override = (
+                    retry_loop_directive
+                    if not _instruction_override
+                    else f"{retry_loop_directive}\n\n{_instruction_override}"
+                )
             current_prompt = _serialize_follow_up_prompt(
                 user_input=content,
                 assistant_response=response.payload,
                 tool_results=collected_results,
                 prompt_catalog=prompt_catalog,
                 prompt_language=session.prompt_language,
-                instruction_override=followup_instruction,
+                instruction_override=_instruction_override,
             )
         tool_round += 1
 

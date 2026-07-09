@@ -1,8 +1,59 @@
+import os
 from typing import Any, Dict, List, Optional
 
+from tenacity import retry, stop_after_attempt, wait_fixed
+
 from ..utils.config_setting import Config
+from ..utils.log import logger
 from ._llm_api_client import LLMApiClient
 from .openai_chat_client import OpenAIChatClient
+
+
+def _blank_and_no_tool_calls(resp: Any) -> bool:
+    """A tool_invoke response is *pathologically* empty when its visible content
+    is blank AND it carries no tool_calls (the model finished the turn but said
+    nothing). Empty content *with* tool_calls is legitimate and must not retry.
+    """
+    if not isinstance(resp, dict):
+        return False
+    content = resp.get("content")
+    if content is not None and str(content).strip():
+        return False
+    return not resp.get("tool_calls")
+
+
+def _resolve_enable_thinking() -> bool:
+    """doubao-seed-code's hidden ``reasoning_content`` mode.
+
+    Defaults to ``True`` (the historical behavior for every existing caller).
+    Structured / tool-loop workloads — notably ccx doc-mode investigators that
+    must emit strict JSON after a tool loop — are hurt by it: the reasoning
+    trace can consume an entire turn and return empty visible content
+    (``status=empty``) or narrate-then-truncate the JSON (``status=unparseable``),
+    and it roughly triples per-call latency. An operator can force non-thinking
+    for such a run via ``VOLC_CODING_ENABLE_THINKING=0`` (also accepts
+    ``false`` / ``no`` / ``off``), which yields reliable strict JSON and much
+    lower latency without swapping the client class or model.
+    """
+    raw = os.getenv("VOLC_CODING_ENABLE_THINKING")
+    if raw is not None and raw.strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _resolve_reasoning_effort() -> str:
+    """Reasoning-effort budget for the coding endpoint. Defaults to ``"high"``
+    (historical behavior). This is the real lever for structured / tool-loop
+    workloads: at ``"high"``/``"low"`` the hidden reasoning trace on
+    ark-code-latest can run for minutes per call and, in a tool loop, eat the
+    final turn (empty / unparseable JSON); ``"minimal"`` bounds the trace to
+    ~zero, giving ~5s reliable strict-JSON completions. Operators set
+    ``VOLC_CODING_REASONING_EFFORT=minimal`` (or low/medium/high) for such runs.
+    """
+    raw = os.getenv("VOLC_CODING_REASONING_EFFORT")
+    if raw and raw.strip():
+        return raw.strip().lower()
+    return "high"
 
 
 class VolcCodingClient(LLMApiClient):
@@ -31,7 +82,7 @@ class VolcCodingClient(OpenAIChatClient):
     #: same requests complete in 1.9-4.5s, matching SimpleDeepSeekClient.
     #: doubao-seed-code-preview-251028 is Volc's own coding-tuned model for
     #: this coding-plan endpoint — the natural default for a "coding" client.
-    DEFAULT_MODEL = "doubao-seed-code-preview-251028"
+    DEFAULT_MODEL = "ark-code-latest"
 
     def __init__(self, model: str = ""):
         base_url = "https://ark.cn-beijing.volces.com/api/coding/v3"
@@ -50,7 +101,9 @@ class VolcCodingClient(OpenAIChatClient):
             model, ("volc_coding_client_model",), self.DEFAULT_MODEL,
         )
         super().__init__(
-            api_key, base_url, max_tokens=16000, enable_thinking=True,
+            api_key, base_url, max_tokens=16000,
+            enable_thinking=_resolve_enable_thinking(),
+            reasoning_effort=_resolve_reasoning_effort(),
             model=resolved_model,
             # doubao-seed-code's documented spec: 256k max context, 224k max
             # input. Used by cc's query_loop (getattr(..., "context_window_
@@ -86,10 +139,138 @@ class VolcCodingClient(OpenAIChatClient):
         # instance turned on JSON mode.
         saved_format = self.extra_body.pop("format", None)
         try:
-            return super().tool_invoke(messages, tools)
+            result = self._streaming_tool_completion(messages, tools)
+            # At reasoning_effort="high"/"low", doubao-seed-code can spend an
+            # ENTIRE turn on hidden reasoning and return empty visible content
+            # with NO tool_calls (finish_reason "stop") — a pathological
+            # "finished but said nothing" turn. Empty AND no tool_calls is never
+            # legitimate, so re-issue. The first re-issue keeps full reasoning
+            # (preserve depth); the LAST forces enable_thinking=False so a
+            # visible answer must appear. ``get_client`` builds a fresh client
+            # per turn (core/cc/llm.py:96), so this instance is not shared across
+            # threads and the temporary enable_thinking toggle is race-free.
+            retries = self._TOOL_EMPTY_CONTENT_RETRIES
+            attempt = 0
+            while attempt < retries and _blank_and_no_tool_calls(result):
+                force_no_thinking = attempt == retries - 1
+                logger.warning(
+                    "VolcCodingClient.tool_invoke: empty content + no tool_calls "
+                    "(reasoning_effort=%s); re-issuing (attempt %d/%d%s)",
+                    self.reasoning_effort, attempt + 1, retries,
+                    ", thinking disabled" if force_no_thinking else "",
+                )
+                if force_no_thinking and self.enable_thinking is not False:
+                    prev = self.enable_thinking
+                    self.enable_thinking = False
+                    try:
+                        result = self._streaming_tool_completion(messages, tools)
+                    finally:
+                        self.enable_thinking = prev
+                else:
+                    result = self._streaming_tool_completion(messages, tools)
+                attempt += 1
+            return result
         finally:
             if saved_format is not None:
                 self.extra_body["format"] = saved_format
+
+    @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
+    def _streaming_tool_completion(
+        self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Tool-calling completion issued with ``stream=True``.
+
+        The ark coding endpoint idle-closes a *non-stream* request that goes
+        silent for ~60s while the model reasons — and at ``reasoning_effort``
+        "high" the hidden reasoning trace routinely runs several minutes, so
+        the base (stream=False) ``tool_invoke`` reliably fails deep-reasoning
+        turns with a connection reset -> retry storm -> bridge timeout.
+        Streaming makes the reasoning_content tokens flow, keeping the
+        connection alive; we accumulate the visible content and the tool_call
+        deltas (id / name / arguments arrive incrementally) and return the same
+        normalized ``{content, tool_calls}`` shape the base produces. The
+        ``@retry`` covers a genuine mid-stream drop (rare once streaming keeps
+        the socket warm). Mirrors the kwargs the base ``tool_invoke`` builds.
+        """
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": True,
+            "timeout": 600,
+            "tools": tools,
+            "stream_options": {"include_usage": True},
+        }
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+        extra_body = dict(self.extra_body) if self.extra_body else {}
+        if self.enable_thinking is not None:
+            extra_body["enable_thinking"] = self.enable_thinking
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.verbosity is not None:
+            kwargs["verbosity"] = self.verbosity
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+        if self.presence_penalty is not None:
+            kwargs["presence_penalty"] = self.presence_penalty
+        if self.frequency_penalty is not None:
+            kwargs["frequency_penalty"] = self.frequency_penalty
+        if self.stop is not None:
+            kwargs["stop"] = self.stop
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        if self.service_tier is not None:
+            kwargs["service_tier"] = self.service_tier
+        if self.parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = self.parallel_tool_calls
+
+        content_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        usage = None
+        stream = self.client.chat.completions.create(**kwargs)
+        for chunk in stream:
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            piece = getattr(delta, "content", None)
+            if piece:
+                content_parts.append(piece)
+            deltas = getattr(delta, "tool_calls", None)
+            if deltas:
+                for tc in deltas:
+                    idx = getattr(tc, "index", 0) or 0
+                    while len(tool_calls) <= idx:
+                        tool_calls.append(
+                            {"id": None, "type": "function",
+                             "function": {"name": "", "arguments": ""}}
+                        )
+                    slot = tool_calls[idx]
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            slot["function"]["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["function"]["arguments"] += fn.arguments
+        if usage is not None:
+            try:
+                self._update_stats(usage)
+            except Exception:  # noqa: BLE001 — stats are best-effort
+                pass
+        return self._normalize_tool_invoke_response(
+            "".join(content_parts), tool_calls or None
+        )
+
+    #: Re-issues on a pathological empty-content-with-no-tool-calls turn. Kept
+    #: to 2 (vs the base ``_EMPTY_CONTENT_RETRIES=3``) because each high-effort
+    #: re-issue is expensive; the 2nd (final) one disables thinking and is fast.
+    _TOOL_EMPTY_CONTENT_RETRIES = 2
 
     # NOTE on "ccx occasionally emits empty output" with this client:
     # doubao-seed-code runs with enable_thinking=True and can spend an entire
