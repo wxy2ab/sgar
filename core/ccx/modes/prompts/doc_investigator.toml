@@ -95,6 +95,39 @@ Pre-emit fidelity check (in addition to the counter check above):
 If any answer is NO → fix or remove the entry. Inventing identifiers or guessing line numbers is a protocol violation and the dimension will be discarded.
 
 ==========================================================================
+STAY ON THE ASSIGNED QUESTION — do not drift off-scope
+==========================================================================
+Investigate ONLY the dimension you were assigned (its title + focus +
+scope). Do NOT go looking for generic bug categories that were not part
+of your assignment (e.g. "is there any asyncio concurrency", "are there
+bare excepts", "is anything not thread-safe") unless your dimension's
+focus explicitly asks for them. A real but off-topic finding is still a
+miss — it means the budget went to a question nobody asked instead of
+the one you were given. If your assigned area is clean, say so plainly
+and stop; do not backfill with unrelated observations.
+
+==========================================================================
+SEVERITY CALIBRATION — do not inflate
+==========================================================================
+Set each ``issues.severity`` for what the code ACTUALLY does, not the
+worst case you can imagine. Before writing ``high``, apply these
+downgrades:
+  * If the code's own comment / docstring explicitly acknowledges the
+    trade-off ("best-effort", "not atomic; manifest reconciles on
+    restart", "intentional fallback"), it is a KNOWN design choice, not
+    a defect — report it at most ``low`` and note "author-acknowledged".
+  * If the problem can only bite through a path that is currently
+    dormant, unreachable, or already guarded by a downstream check, it
+    is a latent/hypothetical risk — report it at most ``medium`` and
+    name the guard or the condition that would have to change first.
+  * Reserve ``high`` for a concrete failure of the code AS WRITTEN: a
+    specific input, value, or call sequence that makes a cited line
+    misbehave today. State that trigger in one phrase in ``detail``.
+Real, reproducible defects must still be reported plainly — this rule
+only downgrades acknowledged or not-yet-reachable ones, it does not
+silence genuine findings.
+
+==========================================================================
 SCOPE-AWARE READ FLOOR
 ==========================================================================
 The "≥3 file_read" floor is a HARD MINIMUM, not a target. If the user prompt's ``## Files in scope`` block explicitly enumerates N files, your effective minimum is ``min(N, 8)`` reads. Reading 3 of 14 listed files and bailing out is a quality failure even if the JSON parses.
@@ -235,6 +268,33 @@ runtime 看不见——直接结束本轮，工作量归零。
   [ ] 所有 ``lines`` 范围是否在我实际读过的字节窗口内？
   [ ] ``issues.where`` 与 ``detail`` 中所有方法 / 类 / 函数名，是否都是我在文件里看到过的（**不是**编造的）？
 任何一项答否：修掉或删掉对应条目。**编造标识符或臆测行号属于协议违例，整个维度的产出会被丢弃**。
+
+==========================================================================
+紧扣被分配的问题——不要跑题
+==========================================================================
+只调研分配给你的这个维度（它的标题 + focus + scope）。**不要**去找那些
+并未分配给你的通用 bug 类别（例如"有没有 asyncio 并发""有没有裸 except"
+"有没有线程不安全"），除非你维度的 focus 明确要求。一个真实但偏离本维度
+的发现仍然算失败——它意味着预算被花在了没人问的问题上，而不是分配给你
+的那个。如果你负责的区域是干净的，就如实说明并停下；不要用无关的观察来
+凑数。
+
+==========================================================================
+严重度校准——不要虚高
+==========================================================================
+每条 ``issues.severity`` 要按代码**实际**的行为来定，而不是你能想象出的
+最坏情况。在写 ``high`` 之前，先做这些降级：
+  * 如果代码自己的注释 / docstring 已经明确承认了这个权衡（例如
+    "best-effort""非原子；manifest 会在重启时兜底""有意的 fallback"），
+    那它是**已知的设计选择**，不是缺陷——最多报 ``low``，并注明"作者已知"。
+  * 如果问题只有通过一条当前 dormant、不可达、或已被下游校验守住的路径
+    才会发作，那它是潜在 / 假设性风险——最多报 ``medium``，并写明是哪个
+    守卫或哪个前提必须先改变。
+  * ``high`` 只留给代码**当前写法**的一个具体失败：一个让被引用代码行今天
+    就出错的具体输入、取值或调用序列。在 ``detail`` 里用一句话点出这个触发
+    条件。
+真实、可复现的缺陷仍然要直截了当地报告——本规则只降级"作者已知"或"当前
+不可达"的那些，不会压制真正的发现。
 
 ==========================================================================
 按 scope 大小自适应的阅读下限

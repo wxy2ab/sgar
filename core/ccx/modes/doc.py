@@ -483,6 +483,39 @@ or guessing line numbers is a protocol violation and the dimension \
 will be discarded.
 
 ==========================================================================
+STAY ON THE ASSIGNED QUESTION — do not drift off-scope
+==========================================================================
+Investigate ONLY the dimension you were assigned (its title + focus +
+scope). Do NOT go looking for generic bug categories that were not part
+of your assignment (e.g. "is there any asyncio concurrency", "are there
+bare excepts", "is anything not thread-safe") unless your dimension's
+focus explicitly asks for them. A real but off-topic finding is still a
+miss — it means the budget went to a question nobody asked instead of
+the one you were given. If your assigned area is clean, say so plainly
+and stop; do not backfill with unrelated observations.
+
+==========================================================================
+SEVERITY CALIBRATION — do not inflate
+==========================================================================
+Set each ``issues.severity`` for what the code ACTUALLY does, not the
+worst case you can imagine. Before writing ``high``, apply these
+downgrades:
+  * If the code's own comment / docstring explicitly acknowledges the
+    trade-off ("best-effort", "not atomic; manifest reconciles on
+    restart", "intentional fallback"), it is a KNOWN design choice, not
+    a defect — report it at most ``low`` and note "author-acknowledged".
+  * If the problem can only bite through a path that is currently
+    dormant, unreachable, or already guarded by a downstream check, it
+    is a latent/hypothetical risk — report it at most ``medium`` and
+    name the guard or the condition that would have to change first.
+  * Reserve ``high`` for a concrete failure of the code AS WRITTEN: a
+    specific input, value, or call sequence that makes a cited line
+    misbehave today. State that trigger in one phrase in ``detail``.
+Real, reproducible defects must still be reported plainly — this rule
+only downgrades acknowledged or not-yet-reachable ones, it does not
+silence genuine findings.
+
+==========================================================================
 SCOPE-AWARE READ FLOOR
 ==========================================================================
 The "≥3 file_read" floor is a HARD MINIMUM, not a target. If the user \
@@ -690,6 +723,33 @@ file_read 过的文件？没有就修掉或删掉。
 都是我在文件里看到过的（**不是**编造的）？
 任何一项答否：修掉或删掉对应条目。**编造标识符或臆测行号属于协议\
 违例，整个维度的产出会被丢弃**。
+
+==========================================================================
+紧扣被分配的问题——不要跑题
+==========================================================================
+只调研分配给你的这个维度（它的标题 + focus + scope）。**不要**去找那些
+并未分配给你的通用 bug 类别（例如"有没有 asyncio 并发""有没有裸 except"
+"有没有线程不安全"），除非你维度的 focus 明确要求。一个真实但偏离本维度
+的发现仍然算失败——它意味着预算被花在了没人问的问题上，而不是分配给你
+的那个。如果你负责的区域是干净的，就如实说明并停下；不要用无关的观察来
+凑数。
+
+==========================================================================
+严重度校准——不要虚高
+==========================================================================
+每条 ``issues.severity`` 要按代码**实际**的行为来定，而不是你能想象出的
+最坏情况。在写 ``high`` 之前，先做这些降级：
+  * 如果代码自己的注释 / docstring 已经明确承认了这个权衡（例如
+    "best-effort""非原子；manifest 会在重启时兜底""有意的 fallback"），
+    那它是**已知的设计选择**，不是缺陷——最多报 ``low``，并注明"作者已知"。
+  * 如果问题只有通过一条当前 dormant、不可达、或已被下游校验守住的路径
+    才会发作，那它是潜在 / 假设性风险——最多报 ``medium``，并写明是哪个
+    守卫或哪个前提必须先改变。
+  * ``high`` 只留给代码**当前写法**的一个具体失败：一个让被引用代码行今天
+    就出错的具体输入、取值或调用序列。在 ``detail`` 里用一句话点出这个触发
+    条件。
+真实、可复现的缺陷仍然要直截了当地报告——本规则只降级"作者已知"或"当前
+不可达"的那些，不会压制真正的发现。
 
 ==========================================================================
 按 scope 大小自适应的阅读下限
@@ -1123,6 +1183,71 @@ class DocModeRunner(ModeRunner):
         "no markdown code fences, and no text before or after the JSON object."
     )
 
+    # Truncation salvage. When a cc investigator turn ends because it hit a
+    # TERMINAL cap (the tool-round limit, a generic stall, or the turn
+    # wall-clock timeout) rather than the model choosing to stop, the terminal
+    # assistant text is a process notice like "Tool round limit (N) reached…".
+    # That notice parses as ``unparseable`` and — after the prose-to-JSON and
+    # forced-JSON salvages also fail on it — the whole dimension renders as
+    # "nothing found", silently discarding the files the investigator already
+    # read (observed live: pass2 phase_0_62_to_0_75 and pass3
+    # shadow_and_factor_diag dims both zeroed out this way). When on, a thin
+    # finding produced by one of these terminal caps is replaced with a
+    # distinct ``round_capped`` finding that names the files examined so the
+    # operator knows to re-run with a narrower scope instead of reading the
+    # dimension as clean. Fires ONLY on the already-broken path (thin findings
+    # + a terminal-cap exit reason), so runs that never cap are byte-identical.
+    # Set False to disable.
+    DOC_SALVAGE_TRUNCATED: bool = True
+
+    # Evidence line-number re-anchoring. Investigator ``evidence`` entries carry
+    # an LLM-self-reported ``lines`` range with NO validation, and reasoning
+    # backends routinely fabricate it — observed up to line numbers past the end
+    # of the file (L50030 cited in a 4429-line file). The ``excerpt`` (verbatim
+    # code) is accurate, so when on, ``_push_findings`` re-anchors each entry by
+    # grepping its excerpt back into the target file: a unique whitespace-
+    # tolerant match overwrites ``lines`` with the real line; 0-or-many matches
+    # blank ``lines`` and set ``line_unverified`` rather than keeping a
+    # fabricated number. Correct citations re-confirm to the same value (byte-
+    # identical); only wrong ones change. Set False to disable.
+    DOC_LINE_REANCHOR: bool = True
+    # Skip re-anchoring files larger than this (bytes) — a citation into a
+    # multi-MB generated file isn't worth the read.
+    DOC_LINE_REANCHOR_MAX_BYTES: int = 2_000_000
+
+    # Deterministic findings appendix. Under a weak/minimal synthesis backend
+    # the LLM summarises and silently DROPS issues from the final report (the
+    # structured findings survive in runtime.db but not the markdown). When on,
+    # ``_run_synthesizer`` appends a deterministic, de-duplicated appendix of
+    # every issue/evidence entry NOT already present in the synthesized prose,
+    # guaranteeing the report's issue count is >= the sum of per-dimension
+    # issues. Skipped entirely when there are zero issues+evidence (byte-
+    # identical for empty-findings runs). Set False to disable.
+    DOC_FINDINGS_APPENDIX: bool = True
+
+    # Structural severity calibration. The investigator PROMPT asks the model to
+    # stay on scope and not inflate severity, but that is a soft hope. This adds
+    # a DETERMINISTIC post-pass over each reported issue, computed from the real
+    # source:
+    #   * ``citation_unverified`` — the issue's ``where`` does not resolve to a
+    #     real in-range line in a readable in-tree file (catches fabricated /
+    #     out-of-range citations, e.g. a line past EOF). This is the ONE signal
+    #     that is ENFORCED: an issue whose location cannot be verified is capped
+    #     to at most ``medium`` (you cannot rate ``high`` what you cannot even
+    #     locate). Never dropped; the original severity is kept in
+    #     ``severity_original``.
+    #   * ``out_of_scope`` — the cited path is outside the dimension's
+    #     ``scope_hint`` (only when that hint names concrete paths). ANNOTATION
+    #     only — surfaced to the synth, never auto-dropped.
+    #   * ``nearby_ack`` — the cited line's surrounding comments acknowledge a
+    #     deliberate trade-off ("best-effort" / "not atomic" / "by design" / …).
+    #     ANNOTATION only — never auto-downgraded (a real high-severity bug can
+    #     sit next to such a comment; auto-downgrading would silence it).
+    # Only unverifiable findings are capped — no genuine, locatable finding is
+    # ever silenced. Set False to disable (annotations + cap both go away;
+    # byte-identical then).
+    DOC_STRUCTURAL_CALIBRATION: bool = True
+
     # Synth-side gate: when too many investigators end up shallow /
     # empty / unparseable, falling through to a full synthesizer call
     # produces a low-quality "padded" report. If the share of dimensions
@@ -1546,6 +1671,7 @@ class DocModeRunner(ModeRunner):
             )
             findings["tool_call_count"] = 0
             findings["file_read_count"] = 0
+            findings["dimension_scope_hint"] = str(dim.get("scope_hint") or "")
             self._push_findings(run_id, dim.get("id") or "", findings)
             return SubagentResult(
                 final_text=findings.get("summary", ""),
@@ -1612,6 +1738,7 @@ class DocModeRunner(ModeRunner):
                     tool_call_count,
                     file_read_count,
                     tool_ledger,
+                    terminal_exit_reason,
                 ) = await self._invoke_investigator_once(
                     dim=dim, root_goal=root_goal, focus=invocation.goal,
                     retry_feedback=retry_feedback, survey=survey,
@@ -1637,6 +1764,7 @@ class DocModeRunner(ModeRunner):
                 tool_call_count = 0
                 file_read_count = 0
                 tool_ledger = []
+                terminal_exit_reason = None
                 logger.warning(
                     "doc investigator: dim=%r attempt %d/%d raised "
                     "%s: %s — marking dimension non-ok and continuing "
@@ -1830,7 +1958,43 @@ class DocModeRunner(ModeRunner):
                     actually_ran, self.INVESTIGATOR_HARD_MIN_ATTEMPTS,
                 )
 
+        # Truncation salvage (post-loop). If every attempt failed and the
+        # LAST attempt ended because a terminal cap cut it short (tool-round
+        # limit / stall / turn timeout) rather than the model choosing to
+        # stop, the ``findings`` we have are a thin, unparseable leak of the
+        # cap notice. Replace them with a distinct ``round_capped`` finding
+        # that names what was examined — so the synth flags the dimension as
+        # needing a narrower re-run instead of rendering it as clean. Guarded
+        # to the already-broken path (thin findings + a truncation exit
+        # reason), so healthy runs are byte-identical. Retries have already
+        # had their chance above; only salvage what remains stuck.
+        if (
+            self.DOC_SALVAGE_TRUNCATED
+            and terminal_exit_reason in _TRUNCATION_EXIT_REASONS
+            and str(findings.get("status") or "") in {"empty", "unparseable", "shallow"}
+            and not (findings.get("evidence") or findings.get("issues"))
+        ):
+            salvaged = self._build_truncated_salvage_findings(
+                dim=dim,
+                tool_ledger=tool_ledger,
+                exit_reason=str(terminal_exit_reason),
+            )
+            # Preserve the bookkeeping fields the synth / observability read.
+            salvaged["tool_call_count"] = tool_call_count
+            salvaged["file_read_count"] = file_read_count
+            salvaged["attempts"] = findings.get("attempts", len(attempts))
+            logger.info(
+                "doc investigator: dim=%r salvaged as round_capped "
+                "(exit_reason=%s, %d file(s) examined) — was status=%s.",
+                dim.get("id") or dim.get("title") or "?",
+                terminal_exit_reason,
+                salvaged.get("file_examined_count", 0),
+                findings.get("status"),
+            )
+            findings = salvaged
+
         findings["attempt_log"] = attempts
+        findings["dimension_scope_hint"] = str(dim.get("scope_hint") or "")
         self._push_findings(run_id, dim.get("id") or "", findings)
         return SubagentResult(
             final_text=findings.get("summary", ""),
@@ -1846,6 +2010,59 @@ class DocModeRunner(ModeRunner):
                 "via": "ccx_doc_with_tools",
             },
         )
+
+    def _build_truncated_salvage_findings(
+        self,
+        *,
+        dim: dict[str, Any],
+        tool_ledger: list[dict[str, Any]],
+        exit_reason: str,
+    ) -> dict[str, Any]:
+        """Build a ``round_capped`` finding from what a cut-short investigator
+        turn managed to examine.
+
+        The ``tool_ledger`` only records WHICH files were read (its
+        ``file_read`` entries key on ``file_path``), not their content — but
+        naming them tells the operator exactly where the truncated pass got to
+        and what a narrower re-run should target. Wording is deliberately
+        end-user-neutral (no process/agent-internal terms) because this
+        summary flows into the synthesizer, which must never echo them.
+        """
+        files: list[str] = []
+        for entry in tool_ledger:
+            if entry.get("tool") != "file_read":
+                continue
+            key = str(entry.get("key") or "").strip()
+            if key and key not in files:
+                files.append(key)
+        if files:
+            shown = files[:20]
+            more = len(files) - len(shown)
+            file_list = ", ".join(shown)
+            tail = f" (and {more} more file(s))" if more > 0 else ""
+            summary = (
+                "This area was only partly examined before the review pass "
+                "ended, so the analysis here is incomplete. Files examined so "
+                f"far: {file_list}{tail}. A focused re-run on a narrower slice "
+                "is needed to finish reviewing this area."
+            )
+        else:
+            summary = (
+                "This area was only partly examined before the review pass "
+                "ended, so the analysis here is incomplete. A focused re-run "
+                "on a narrower slice is needed to finish reviewing this area."
+            )
+        return {
+            "dimension_id": str(dim.get("id") or ""),
+            "dimension_title": str(dim.get("title") or ""),
+            "summary": summary,
+            "evidence": [],
+            "issues": [],
+            "confidence": "low",
+            "status": "round_capped",
+            "exit_reason": exit_reason,
+            "file_examined_count": len(files),
+        }
 
     def _try_convert_prose_to_findings(
         self,
@@ -1922,11 +2139,20 @@ class DocModeRunner(ModeRunner):
         focus: str,
         retry_feedback: str,
         survey: dict[str, Any] | None = None,
-    ) -> tuple[str, int, int, list[dict[str, Any]]]:
+    ) -> tuple[str, int, int, list[dict[str, Any]], str | None]:
         """Single investigator turn: build a fresh cc QueryEngine with
         the read-only registry, frame the prompt (with optional retry
         feedback), and drive the engine. Returns ``(final_text,
-        tool_call_count, file_read_count, tool_ledger)``.
+        tool_call_count, file_read_count, tool_ledger,
+        terminal_exit_reason)``.
+
+        ``terminal_exit_reason`` is the ``exit_reason`` carried in the
+        metadata of the FINAL assistant-text message of the primary turn
+        (e.g. ``completed`` / ``completed_after_tools`` on a healthy turn,
+        or one of ``_TRUNCATION_EXIT_REASONS`` when a cap cut it short). It
+        is captured from the first drain only — never the forced-JSON
+        continuation, whose tiny round budget could itself cap and produce
+        a false ``tool_round_limit_reached``.
 
         ``tool_ledger`` is a deduplicated list of ``file_read`` /
         ``grep`` / ``glob`` calls made in this attempt, used by the
@@ -1961,6 +2187,10 @@ class DocModeRunner(ModeRunner):
         tool_call_count = 0
         file_read_count = 0
         tool_ledger: list[dict[str, Any]] = []
+        # ``exit_reason`` of the terminal assistant-text message of the
+        # primary turn. Bound only inside ``_drain`` (the forced-JSON
+        # continuation deliberately does not touch it — see docstring).
+        terminal_exit_reason: str | None = None
         # tool_use_id -> identity string ("tool\x00key\x00repr(args)"),
         # used to match the deferred tool_result back to the ledger
         # entry recorded when the tool_use fired.
@@ -1996,6 +2226,7 @@ class DocModeRunner(ModeRunner):
 
         async def _drain() -> None:
             nonlocal final_text, tool_call_count, file_read_count
+            nonlocal terminal_exit_reason
             async for event in engine.submit_message(
                 framed, max_tool_rounds=rounds_cap,
             ):
@@ -2062,6 +2293,16 @@ class DocModeRunner(ModeRunner):
                     and getattr(msg, "kind", "") == "assistant_text"
                 ):
                     final_text = str(getattr(msg, "content", ""))
+                    # Capture the terminal turn's exit_reason. cc emits it on
+                    # the completion / followup message metadata; the LAST such
+                    # message wins (mirrors final_text). Only overwrite on a
+                    # truthy value so intermediate assistant texts (no
+                    # exit_reason) never regress a captured terminal reason.
+                    _md = getattr(msg, "metadata", None)
+                    if isinstance(_md, dict):
+                        _er = _md.get("exit_reason")
+                        if _er:
+                            terminal_exit_reason = str(_er)
 
         try:
             await asyncio.wait_for(
@@ -2152,7 +2393,10 @@ class DocModeRunner(ModeRunner):
             )
         finally:
             engine.close()
-        return final_text, tool_call_count, file_read_count, tool_ledger
+        return (
+            final_text, tool_call_count, file_read_count, tool_ledger,
+            terminal_exit_reason,
+        )
 
     def _build_retry_feedback(
         self,
@@ -2855,6 +3099,23 @@ class DocModeRunner(ModeRunner):
     def _push_findings(
         self, run_id: str, dim_id: str, findings: dict[str, Any],
     ) -> None:
+        # Re-anchor fabricated evidence line numbers BEFORE the guards below,
+        # and before the collector's shallow-copy push, so the correction is
+        # reflected in both the collector's copy and the caller's ``findings``
+        # (shared nested evidence dicts). This is the single chokepoint every
+        # investigator path (lite / async / error / salvage) funnels through.
+        if self.DOC_LINE_REANCHOR:
+            try:
+                self._reanchor_findings_evidence(findings)
+            except Exception as exc:  # noqa: BLE001 — never let re-anchor break a push
+                logger.debug("doc investigator: line re-anchor skipped: %s", exc)
+        # Structural severity calibration runs AFTER re-anchoring (same
+        # chokepoint) so it sees corrected evidence and shares the file read.
+        if self.DOC_STRUCTURAL_CALIBRATION:
+            try:
+                self._structural_calibrate_issues(findings)
+            except Exception as exc:  # noqa: BLE001 — never let calibration break a push
+                logger.debug("doc investigator: structural calibration skipped: %s", exc)
         if self.findings_collector is None:
             logger.debug("doc investigator: no findings_collector wired; skipping push")
             return
@@ -2862,6 +3123,145 @@ class DocModeRunner(ModeRunner):
             logger.debug("doc investigator: missing run_id/dim_id, skipping push")
             return
         self.findings_collector.push(run_id, dim_id, findings)
+
+    def _reanchor_findings_evidence(self, findings: dict[str, Any]) -> None:
+        """Overwrite each evidence entry's ``lines`` with the true line number
+        derived from its ``excerpt``, or mark ``line_unverified`` when the
+        excerpt cannot be uniquely located.
+
+        The LLM self-reports ``lines`` with no validation and reasoning
+        backends fabricate it (up to numbers past EOF). The ``excerpt`` is a
+        verbatim copy, so we grep it back into the file:
+          * unique whitespace-tolerant match → real 1-based line/range;
+          * >1 matches → keep the reported start line ONLY if it is one of the
+            matches (disambiguated), else blank + ``line_unverified``;
+          * 0 matches (or unreadable/oversized/out-of-tree file) → blank +
+            ``line_unverified`` (never keep a fabricated number).
+
+        Mutates ``findings['evidence']`` in place. Best-effort per entry.
+        """
+        evidence = findings.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            return
+        try:
+            cwd_root = Path(self.cwd).resolve()
+        except Exception:  # noqa: BLE001
+            return
+        file_cache: dict[str, list[str] | None] = {}
+
+        for ev in evidence:
+            if not isinstance(ev, dict):
+                continue
+            excerpt = str(ev.get("excerpt") or "")
+            path = str(ev.get("path") or "").strip()
+            if not excerpt.strip() or not path:
+                continue
+            lines = self._read_file_lines_for_anchor(path, cwd_root, file_cache)
+            if lines is None:
+                # File missing / outside tree / too big / unreadable — we
+                # cannot verify the reported line, so do not trust it.
+                ev["lines"] = ""
+                ev["line_unverified"] = True
+                continue
+            resolved = _anchor_excerpt_to_lines(
+                excerpt=excerpt, file_lines=lines,
+            )
+            if resolved is None:
+                ev["lines"] = ""
+                ev["line_unverified"] = True
+            else:
+                ev["lines"] = resolved
+                ev.pop("line_unverified", None)
+
+    def _read_file_lines_for_anchor(
+        self,
+        path: str,
+        cwd_root: Path,
+        cache: dict[str, list[str] | None],
+    ) -> list[str] | None:
+        """Read ``path`` (repo-relative or absolute) as a list of lines,
+        enforcing the it-stays-inside-cwd + size guards. Returns ``None`` when
+        the file cannot be safely read. Cached per call."""
+        if path in cache:
+            return cache[path]
+        result: list[str] | None = None
+        try:
+            candidate = Path(path)
+            if not candidate.is_absolute():
+                candidate = cwd_root / candidate
+            candidate = candidate.resolve()
+            if not candidate.is_relative_to(cwd_root):
+                cache[path] = None
+                return None
+            if not candidate.is_file():
+                cache[path] = None
+                return None
+            if candidate.stat().st_size > self.DOC_LINE_REANCHOR_MAX_BYTES:
+                cache[path] = None
+                return None
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+            result = text.splitlines()
+        except Exception:  # noqa: BLE001 — unreadable → unverifiable
+            result = None
+        cache[path] = result
+        return result
+
+    def _structural_calibrate_issues(self, findings: dict[str, Any]) -> None:
+        """Attach deterministic, source-derived calibration facts to each issue,
+        and enforce the one that is safe to enforce.
+
+        For every issue with a ``where`` locator:
+          * ``citation_unverified`` (ENFORCED) — the location does not resolve
+            to a real in-range line in a readable in-tree file. Such an issue is
+            capped to at most ``medium`` (``severity_original`` preserved); a
+            claim you cannot even locate must not carry ``high``. Never dropped.
+          * ``out_of_scope`` (annotation) — the cited path is outside the
+            dimension's ``scope_hint`` (only when that hint names real paths).
+          * ``nearby_ack`` (annotation) — a deliberate-trade-off comment sits
+            next to the cited line.
+
+        Annotations are surfaced to the synth/appendix; only the unverifiable
+        cap changes severity, so no locatable finding is ever silenced.
+        """
+        issues = findings.get("issues")
+        if not isinstance(issues, list) or not issues:
+            return
+        try:
+            cwd_root = Path(self.cwd).resolve()
+        except Exception:  # noqa: BLE001
+            return
+        scope_roots = _scope_roots(str(findings.get("dimension_scope_hint") or ""))
+        file_cache: dict[str, list[str] | None] = {}
+
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            path, line = _parse_where_location(str(issue.get("where") or ""))
+            verified = False
+            file_lines: list[str] | None = None
+            if _looks_like_path(path):
+                file_lines = self._read_file_lines_for_anchor(path, cwd_root, file_cache)
+                if file_lines is not None and (line is None or 1 <= line <= len(file_lines)):
+                    verified = True
+
+            # Scope annotation — only when the hint names concrete paths.
+            if scope_roots and path and not _path_in_scope(path, scope_roots):
+                issue["out_of_scope"] = True
+
+            # Author-acknowledgment annotation — only for a located line.
+            if verified and file_lines is not None and line is not None:
+                ack = _scan_nearby_ack(file_lines, line)
+                if ack:
+                    issue["nearby_ack"] = ack
+
+            # ENFORCED: an unverifiable citation cannot justify high/critical.
+            if not verified:
+                issue["citation_unverified"] = True
+                sev = str(issue.get("severity") or "medium").lower()
+                if sev in ("high", "critical"):
+                    issue["severity_original"] = sev
+                    issue["severity"] = "medium"
+                    issue["severity_capped_reason"] = "unverified-citation"
 
     # ------------------------------------------------------------------ #
     # Phase 3 — synthesizer
@@ -3029,6 +3429,17 @@ class DocModeRunner(ModeRunner):
         markdown, synth_calls, truncation_log = self._synthesize_with_continuations(
             system=system, user=user, findings_count=len(findings),
         )
+        # Lossless safety net. A weak/minimal synthesis backend summarises and
+        # silently DROPS issues from the prose. Append a deterministic,
+        # de-duplicated appendix of every issue/evidence entry NOT already in
+        # the markdown so the report's issue count is >= the sum of
+        # per-dimension issues. Runs AFTER continuations (so _looks_truncated
+        # never sees it) and returns "" when everything is already covered or
+        # there is nothing to add (byte-identical then).
+        if self.DOC_FINDINGS_APPENDIX and findings:
+            appendix = _render_findings_appendix(findings, markdown)
+            if appendix:
+                markdown = markdown.rstrip() + "\n\n" + appendix
         artifact_path = self._maybe_write_artifact(
             goal=root_goal, markdown=markdown,
         )
@@ -4357,6 +4768,20 @@ _LEDGER_TOOLS = ("file_read", "grep", "glob")
 _LEDGER_SOFT_LIMIT: int = 40
 
 
+# Terminal ``exit_reason`` values (from cc's query loop / engine metadata) that
+# mean the investigator turn was CUT SHORT by a cap rather than the model
+# choosing to stop. All three ride an ``assistant_followup_completed`` event
+# whose ``message.metadata`` carries ``exit_reason``:
+#   * ``tool_round_limit_reached`` — query_loop.py (tool-round ceiling)
+#   * ``generic_stalled``          — query_loop.py (no-progress stall)
+#   * ``turn_timeout``             — query_engine.py (turn wall-clock timeout)
+# When a dimension ends this way with only a leaked notice for content, the
+# truncation salvage (``DOC_SALVAGE_TRUNCATED``) rescues it as ``round_capped``.
+_TRUNCATION_EXIT_REASONS = frozenset(
+    {"tool_round_limit_reached", "generic_stalled", "turn_timeout"}
+)
+
+
 def _ledger_key_arg(tool: str, arguments: dict[str, Any]) -> str:
     if tool == "file_read":
         return str(arguments.get("file_path") or "")
@@ -4732,6 +5157,209 @@ def _classify_investigator_outcome(
     return "shallow"
 
 
+# Comment markers that signal a DELIBERATE, author-acknowledged trade-off.
+# Used only to ANNOTATE an issue whose cited line sits next to such a comment
+# (never to auto-downgrade — a real bug can live next to one of these).
+_ACK_MARKERS = (
+    "best-effort", "best effort", "not atomic", "non-atomic", "by design",
+    "on purpose", "intentional", "deliberate", "known limitation",
+    "known trade", "trade-off", "tradeoff", "we accept", "by-design",
+    "有意", "故意", "设计如此", "已知", "可接受", "非原子", "兜底", "权衡",
+)
+
+_WHERE_LOC_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:-\d+)?\s*$")
+
+
+def _parse_where_location(where: str) -> tuple[str, int | None]:
+    """Parse an ``issues.where`` string into ``(path, start_line)``.
+
+    Handles ``"foo.py:44"``, ``"foo.py:44-50"`` and a bare ``"foo.py"``.
+    Returns ``("", None)`` for an empty/unparseable value.
+    """
+    w = (where or "").strip().strip("`")
+    if not w:
+        return "", None
+    m = _WHERE_LOC_RE.match(w)
+    if m:
+        try:
+            return m.group("path").strip(), int(m.group("line"))
+        except ValueError:
+            return m.group("path").strip(), None
+    return w.rstrip(":").strip(), None
+
+
+def _looks_like_path(token: str) -> bool:
+    return bool(token) and ("/" in token or bool(re.search(r"\.\w+$", token)))
+
+
+def _scope_roots(scope_hint: str) -> list[str]:
+    """Extract concrete path roots from a dimension ``scope_hint``. Tokens that
+    don't look like paths (prose hints) are ignored, so scope enforcement only
+    runs when the hint actually names files/dirs."""
+    roots: list[str] = []
+    for tok in re.split(r"[,\s;]+", scope_hint or ""):
+        tok = tok.strip().strip("`")
+        if not tok:
+            continue
+        had_slash = "/" in tok
+        tok = tok.rstrip("/").lstrip("./")
+        # A trailing-slash dir ("governance/") is a path even though it has no
+        # extension; a bare prose word ("performance") is not.
+        if tok and (had_slash or re.search(r"\.\w+$", tok)):
+            roots.append(tok)
+    return roots
+
+
+def _path_in_scope(path: str, roots: list[str]) -> bool:
+    p = path.strip().lstrip("./")
+    for r in roots:
+        if p == r or p.startswith(r + "/") or r.startswith(p.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _scan_nearby_ack(file_lines: list[str], line: int, *, window: int = 6) -> str:
+    """Scan comment text within ``±window`` lines of a 1-based ``line`` for a
+    deliberate-trade-off marker. Returns the matched comment snippet (trimmed),
+    or ``""`` if none. Only the comment portion (after ``#``) is scanned so a
+    code identifier named e.g. ``fallback`` does not trip it."""
+    lo = max(0, line - 1 - window)
+    hi = min(len(file_lines), line - 1 + window + 1)
+    for raw in file_lines[lo:hi]:
+        if "#" not in raw:
+            continue
+        comment = raw.split("#", 1)[1]
+        low = comment.lower()
+        if any(mk in low for mk in _ACK_MARKERS):
+            return comment.strip()[:120]
+    return ""
+
+
+def _anchor_excerpt_to_lines(
+    *, excerpt: str, file_lines: list[str],
+) -> str | None:
+    """Locate ``excerpt`` in ``file_lines`` and return the true 1-based line
+    range (``"42"`` or ``"42-50"``), or ``None`` when it cannot be uniquely
+    anchored.
+
+    Strategy: pick the longest line of the excerpt as a distinctive anchor and
+    match it (whitespace-tolerant, substring — the excerpt may be truncated at
+    300 chars) against the file. A single match yields the true position; the
+    range is reconstructed from the anchor's offset within the excerpt and
+    verified by re-containing the excerpt in the reconstructed window (falling
+    back to the anchor's own line if the window doesn't line up, e.g. after
+    reformatting). Zero or multiple matches → ``None`` (caller marks the entry
+    unverified rather than trusting a fabricated line).
+    """
+    def _norm(s: str) -> str:
+        return " ".join(s.split())
+
+    ex_raw = excerpt.splitlines()
+    anchor_idx, anchor_norm = -1, ""
+    for i, line in enumerate(ex_raw):
+        nl = _norm(line)
+        if len(nl) > len(anchor_norm):
+            anchor_norm, anchor_idx = nl, i
+    if not anchor_norm or not file_lines:
+        return None
+
+    norm_file = [_norm(fl) for fl in file_lines]
+    matches = [i for i, nf in enumerate(norm_file) if anchor_norm in nf]
+    if len(matches) != 1:
+        return None
+    m = matches[0]
+
+    start0 = m - anchor_idx
+    if start0 < 0:
+        start0 = m
+    n_lines = len(ex_raw) if ex_raw else 1
+    end0 = min(start0 + n_lines - 1, len(file_lines) - 1)
+
+    # Verify the reconstructed span actually contains the excerpt; otherwise
+    # trust only the anchor line (never emit a confidently-wrong range).
+    window_norm = " ".join(norm_file[start0:end0 + 1])
+    ex_norm = " ".join(_norm(l) for l in ex_raw if _norm(l))
+    if ex_norm and ex_norm in window_norm:
+        start, end = start0 + 1, end0 + 1
+    else:
+        start = end = m + 1
+    return str(start) if start == end else f"{start}-{end}"
+
+
+def _issue_annotation_suffix(issue: dict[str, Any]) -> str:
+    """Reviewer-facing suffix carrying the deterministic calibration facts
+    (``_structural_calibrate_issues``) so the synthesizer and the human see
+    them. End-user-neutral wording."""
+    parts: list[str] = []
+    if issue.get("citation_unverified"):
+        parts.append("[unverified location]")
+    if issue.get("out_of_scope"):
+        parts.append("[outside the assigned area]")
+    if issue.get("nearby_ack"):
+        parts.append("[the code here notes a known trade-off]")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _render_findings_appendix(
+    findings: list[dict[str, Any]], synth_markdown: str,
+) -> str:
+    """Deterministic, de-duplicated appendix of every issue / evidence entry
+    that is NOT already present in ``synth_markdown``.
+
+    Guards against a weak synthesis backend silently dropping issues: anything
+    the LLM omitted from the prose is restored here verbatim, so the final
+    report's issue count is >= the sum of per-dimension issues. Returns ``""``
+    when every entry is already represented (byte-identical) or there is
+    nothing to add. Wording is end-user-neutral (no process/agent terms).
+    """
+    haystack = synth_markdown or ""
+
+    def _present(needle: str) -> bool:
+        needle = (needle or "").strip()
+        return bool(needle) and needle in haystack
+
+    blocks: list[str] = []
+    for f in findings:
+        title = f.get("dimension_title") or f.get("dimension_id") or "(unnamed)"
+        lines: list[str] = []
+        for issue in (f.get("issues") or []):
+            if not isinstance(issue, dict):
+                continue
+            i_title = str(issue.get("title") or "").strip()
+            where = str(issue.get("where") or "").strip()
+            # Skip if the prose already carries this issue (by title or by its
+            # file:line locator).
+            if _present(i_title) or _present(where):
+                continue
+            sev = str(issue.get("severity") or "medium")
+            detail = str(issue.get("detail") or "").strip()
+            where_part = f" ({where})" if where else ""
+            suffix = _issue_annotation_suffix(issue)
+            lines.append(f"- [{sev}] {i_title}: {detail}{where_part}{suffix}".rstrip())
+        for ev in (f.get("evidence") or []):
+            if not isinstance(ev, dict):
+                continue
+            path = str(ev.get("path") or "").strip()
+            ev_lines = str(ev.get("lines") or "").strip()
+            locator = f"{path}:{ev_lines}" if ev_lines else path
+            if not path or _present(locator):
+                continue
+            excerpt = str(ev.get("excerpt") or "").replace("\n", " ")[:200].strip()
+            lines.append(f"- {locator} — {excerpt}".rstrip())
+        if lines:
+            blocks.append(f"### {title}\n" + "\n".join(lines))
+
+    if not blocks:
+        return ""
+    return (
+        "## Appendix — full findings\n\n"
+        "These concrete findings were recorded during the review but are not "
+        "already covered above; they are listed here verbatim so none is "
+        "lost:\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
 def _render_findings_for_synth(findings: list[dict[str, Any]]) -> str:
     """Render the collected investigator findings as a deterministic
     Markdown block fed to the synthesizer prompt.
@@ -4786,6 +5414,14 @@ def _render_findings_for_synth(findings: list[dict[str, Any]]) -> str:
                 "the final report flag this dimension as needing a "
                 "deeper review rather than presenting it as verified."
             )
+        elif status == "round_capped":
+            chunks.append(
+                "Coverage: partial — this area was only partly examined "
+                "before the pass ended. Treat the summary as a partial "
+                "lead; in the final report, flag this dimension as needing "
+                "a focused follow-up rather than presenting it as fully "
+                "reviewed. Do NOT invent findings for the unexamined part."
+            )
         else:
             chunks.append(f"Coverage: full | Confidence: {f.get('confidence', 'medium')}")
         chunks.append(f"Summary: {f.get('summary', '')}")
@@ -4796,9 +5432,10 @@ def _render_findings_for_synth(findings: list[dict[str, Any]]) -> str:
                 where = issue.get("where") or ""
                 where_part = f" ({where})" if where else ""
                 sev = issue.get("severity", "medium")
+                suffix = _issue_annotation_suffix(issue)
                 chunks.append(
                     f"  - [{sev}] {issue.get('title', '')}: "
-                    f"{issue.get('detail', '')}{where_part}"
+                    f"{issue.get('detail', '')}{where_part}{suffix}"
                 )
         evidence = f.get("evidence") or []
         if evidence:
