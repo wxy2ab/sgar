@@ -86,6 +86,7 @@ class OpenAIChatClient(LLMApiClient):
         self.truncated_count = 0
         self._last_finish_reason: Optional[str] = None
         self._last_reasoning_content: Optional[str] = None
+        self.observed_backend_model: Optional[str] = None
         self.history = []
         self.model = config.resolve_value(
             model,
@@ -299,6 +300,7 @@ class OpenAIChatClient(LLMApiClient):
             kwargs["response_format"] = self._response_format
 
         completion = self.client.chat.completions.create(**kwargs)
+        self.observed_backend_model = getattr(completion, "model", None)
         if is_stream:
             return completion if raw_response else self._process_stream(completion)
         else:

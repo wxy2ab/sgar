@@ -5,6 +5,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -16,6 +17,16 @@ from ..runtime_transport import FileRuntimeTransport
 from ..swarm.mailbox import MailboxEnvelope, MailboxStore
 from ..task_model import AgentTaskStatus, is_terminal_status
 from .base import BackendHandle, RuntimeBackend, RuntimeController
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _subprocess_group_kwargs() -> dict[str, Any]:
+    if _is_windows():
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
 
 
 class LocalSubprocessController:
@@ -110,12 +121,7 @@ class LocalSubprocessController:
     async def stop(self, reason: str) -> None:
         self.transport.request_stop(reason)
         if self.process is not None and self.process.returncode is None:
-            self.process.terminate()
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                self.process.kill()
-                await self.process.wait()
+            await self._stop_process_tree()
         self._close_streams()
         self.task_manager.load_tasks_from_disk()
         current_task = self.task_manager.get(self.task.task_id)
@@ -205,6 +211,7 @@ class LocalSubprocessController:
             env=env,
             stdout=self._stdout_handle,
             stderr=self._stderr_handle,
+            **_subprocess_group_kwargs(),
         )
         self.handle.process_id = self.process.pid
         self._started = True
@@ -295,21 +302,67 @@ class LocalSubprocessController:
         if self._stderr_handle is not None and not self._stderr_handle.closed:
             self._stderr_handle.close()
 
+    async def _stop_process_tree(self) -> None:
+        if self.process is None or self.process.returncode is not None:
+            return
+        if _is_windows():
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/PID",
+                    str(self.process.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(killer.wait(), timeout=5.0)
+                if killer.returncode != 0:
+                    self.process.kill()
+            except (OSError, asyncio.TimeoutError):
+                self.process.kill()
+        else:
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                self.process.terminate()
+        try:
+            await asyncio.wait_for(self.process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            if not _is_windows():
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    self.process.kill()
+            else:
+                self.process.kill()
+            await self.process.wait()
+
     def close_sync(self) -> None:
         if self.process is not None and self.process.returncode is None:
-            try:
-                self.process.terminate()
-            except ProcessLookupError:
-                pass
-        elif self.handle.process_id:
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(self.handle.process_id), "/T", "/F"],
-                    capture_output=True,
-                    check=False,
-                )
-            except Exception:
-                pass
+            if _is_windows():
+                try:
+                    completed = subprocess.run(
+                        ["taskkill", "/PID", str(self.process.pid), "/T", "/F"],
+                        capture_output=True,
+                        check=False,
+                        timeout=5,
+                    )
+                    if completed.returncode != 0:
+                        self.process.kill()
+                except (OSError, subprocess.SubprocessError):
+                    try:
+                        self.process.kill()
+                    except ProcessLookupError:
+                        pass
+            else:
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        self.process.terminate()
+                    except ProcessLookupError:
+                        pass
         self._close_streams()
 
     def __del__(self) -> None:

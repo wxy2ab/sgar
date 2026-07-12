@@ -47,6 +47,7 @@ class MiniMaxClient(LLMApiClient):
         }
         self.debug = False
         self._last_id = ""
+        self.observed_backend_model = None
         self.request_timeout = (30, 600)
         self.max_retries = 4
         self.retry_backoff_base_seconds = 2
@@ -115,6 +116,7 @@ class MiniMaxClient(LLMApiClient):
             try:
                 response = self._request_with_retry(payload, stream=False)
                 result = response.json()
+                self.observed_backend_model = result.get("model")
 
                 if self.debug and "id" in result:
                     logger.info(f"response ID: {result['id']}")

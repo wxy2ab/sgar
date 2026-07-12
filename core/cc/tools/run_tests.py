@@ -24,11 +24,17 @@ from typing import Any
 
 from .base import BaseTool, ToolCall, ToolResult, ToolSpec, ValidationResult
 from .context import ToolUseContext
-from ..command_runner import run_check_command_async
+from ..command_runner import default_shell_kind, run_check_command_async
 from ..safety import classify_command_permission
 
 
 _DEFAULT_VERIFY_TIMEOUT_MS = 120_000
+_VALID_KINDS = ("auto", "shell", "powershell")
+
+
+def _resolve_kind(raw: Any) -> str:
+    kind = str(raw or "auto").lower()
+    return default_shell_kind() if kind == "auto" else kind
 
 
 class RunTestsTool(BaseTool):
@@ -42,8 +48,8 @@ class RunTestsTool(BaseTool):
                     "verdict. Exit code 0 means PASS; any non-zero means FAIL. "
                     "Use this to verify your edits before declaring a task "
                     "done — a green result is the evidence that a change works. "
-                    "The command runs via shlex.split (NO shell), so wrap a "
-                    "pipeline or redirection explicitly as sh -c \"...\"."
+                    "kind='auto' uses PowerShell on Windows and direct argv "
+                    "execution elsewhere."
                 ),
                 input_schema={
                     "type": "object",
@@ -60,6 +66,11 @@ class RunTestsTool(BaseTool):
                             "description": "Working directory (defaults to the session cwd).",
                         },
                         "timeout_ms": {"type": "integer"},
+                        "kind": {
+                            "type": "string",
+                            "enum": list(_VALID_KINDS),
+                            "default": "auto",
+                        },
                     },
                     "required": ["command"],
                 },
@@ -78,6 +89,12 @@ class RunTestsTool(BaseTool):
     def validate_input(self, arguments: dict[str, Any]) -> ValidationResult:
         if not arguments.get("command"):
             return ValidationResult(ok=False, message="command is required.")
+        raw_kind = arguments.get("kind")
+        if raw_kind is not None and str(raw_kind).lower() not in _VALID_KINDS:
+            return ValidationResult(
+                ok=False,
+                message=f"kind must be one of {_VALID_KINDS}, got {raw_kind!r}.",
+            )
         return ValidationResult(ok=True)
 
     def check_permissions(self, ctx: ToolUseContext, arguments: dict[str, Any]):
@@ -85,9 +102,10 @@ class RunTestsTool(BaseTool):
         # through the SAME permission classifier as the shell tool so this tool
         # can't become a way to bypass command permissions.
         target_cwd = str(Path(arguments.get("cwd") or ctx.cwd).resolve())
+        resolved_kind = _resolve_kind(arguments.get("kind"))
         return classify_command_permission(
             command=str(arguments.get("command") or ""),
-            shell_kind="shell",
+            shell_kind=resolved_kind,
             cwd=ctx.cwd,
             target_cwd=target_cwd,
             mode=ctx.permissions.mode,
@@ -100,9 +118,11 @@ class RunTestsTool(BaseTool):
         timeout_ms = int(
             tool_call.arguments.get("timeout_ms") or _DEFAULT_VERIFY_TIMEOUT_MS
         )
+        resolved_kind = _resolve_kind(tool_call.arguments.get("kind"))
         verdict = await run_check_command_async(
             command=str(tool_call.arguments["command"]),
             cwd=cwd,
+            shell_kind=resolved_kind,
             timeout_ms=timeout_ms,
         )
         error_code: str | None = None

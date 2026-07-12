@@ -77,6 +77,7 @@ class SimpleDeepSeekClient(LLMApiClient):
         # phase ate the budget, leaving no JSON). Tracked so a run can tell.
         self.truncated_count = 0
         self._last_finish_reason: Optional[str] = None
+        self.observed_backend_model: Optional[str] = None
         self.history = []
         self._model_list = [
             "deepseek-v4-flash",
@@ -420,6 +421,7 @@ class SimpleDeepSeekClient(LLMApiClient):
     def _create_chat_completion(self, messages: List[Dict[str, str]], is_stream: bool, tools: List[Dict[str, Any]] = None, raw_response: bool = False) -> Union[str, Iterator[str]]:
         kwargs = self._build_request_kwargs(messages, is_stream, tools)
         completion = self.client.chat.completions.create(**kwargs)
+        self.observed_backend_model = getattr(completion, "model", None)
         if is_stream:
             return completion if raw_response else self._process_stream(completion)
         else:

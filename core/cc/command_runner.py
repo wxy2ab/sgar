@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 import platform
 import shlex
+import shutil
 import signal
 import subprocess
 import time
-from typing import Sequence
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -30,7 +32,160 @@ class CommandExecutionResult:
 
 
 def default_shell_kind() -> str:
-    return "powershell" if platform.system().lower().startswith("win") else "shell"
+    return "powershell" if _is_windows() else "shell"
+
+
+def _is_windows() -> bool:
+    return platform.system().lower().startswith("win")
+
+
+def resolve_powershell_executable(env: dict[str, str] | None = None) -> str | None:
+    """Resolve PowerShell 7 first, then Windows PowerShell 5.1."""
+    search_path = env.get("PATH") if env is not None else None
+    for candidate in ("pwsh", "powershell.exe", "powershell"):
+        executable = shutil.which(candidate, path=search_path)
+        if executable:
+            return executable
+    return None
+
+
+@dataclass(slots=True)
+class _CommandInvocation:
+    argv: list[str]
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+def _powershell_script(command: str) -> str:
+    # -EncodedCommand removes the host shell/CRT quoting layer.  The preamble
+    # makes redirected output deterministic on both pwsh and Windows PowerShell
+    # 5.1; the trailer propagates native-command and cmdlet failures.
+    return (
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        "$OutputEncoding = [Console]::OutputEncoding; "
+        f"& {{ {command} }}; "
+        "$__cc_success = $?; $__cc_native_exit = $LASTEXITCODE; "
+        "if ($null -ne $__cc_native_exit) { exit $__cc_native_exit }; "
+        "if (-not $__cc_success) { exit 1 }"
+    )
+
+
+def _normalize_shell_argv(argv: list[str]) -> list[str]:
+    if not _is_windows():
+        return argv
+    normalized: list[str] = []
+    for token in argv:
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
+            normalized.append(token[1:-1])
+        else:
+            normalized.append(token)
+    return normalized
+
+
+def format_shell_command(argv: list[str]) -> str:
+    """Serialize argv for later parsing by ``kind='shell'`` on the current OS."""
+    if _is_windows():
+        return subprocess.list2cmdline(argv)
+    return shlex.join(argv)
+
+
+def _build_invocation(
+    command: str,
+    shell_kind: str,
+    *,
+    env: dict[str, str] | None = None,
+) -> _CommandInvocation:
+    if not command.strip():
+        raise ValueError("Empty command.")
+    if shell_kind == "powershell":
+        executable = resolve_powershell_executable(env)
+        if executable is None:
+            raise FileNotFoundError(
+                "PowerShell is not installed or not on PATH "
+                "(tried pwsh, powershell.exe, powershell)."
+            )
+        encoded = base64.b64encode(_powershell_script(command).encode("utf-16-le")).decode("ascii")
+        family = "pwsh" if Path(executable).name.lower().startswith("pwsh") else "windows_powershell"
+        return _CommandInvocation(
+            argv=[
+                executable,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                encoded,
+            ],
+            metadata={"executable": executable, "powershell_family": family},
+        )
+    if shell_kind == "shell":
+        try:
+            argv = shlex.split(command, posix=not _is_windows())
+        except ValueError as exc:
+            raise ValueError(f"Invalid command syntax: {exc}") from exc
+        if not argv:
+            raise ValueError("Empty command.")
+        argv = _normalize_shell_argv(argv)
+        return _CommandInvocation(argv=argv, metadata={"executable": argv[0]})
+    raise ValueError(f"Unsupported shell_kind: {shell_kind}")
+
+
+def _decode_output(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return value.decode("utf-8", errors="replace")
+
+
+def _spawn_group_kwargs() -> dict[str, Any]:
+    if _is_windows():
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+def _failure_result(
+    *,
+    command: str,
+    shell_kind: str,
+    cwd: str,
+    error: Exception,
+    metadata: dict[str, object] | None = None,
+) -> CommandExecutionResult:
+    return CommandExecutionResult(
+        success=False,
+        command=command,
+        shell_kind=shell_kind,
+        cwd=cwd,
+        exit_code=-1 if isinstance(error, ValueError) else 127,
+        stderr=str(error),
+        metadata=dict(metadata or {}),
+    )
+
+
+def _terminate_process_sync(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is not None:
+        return
+    if _is_windows():
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            if completed.returncode == 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    elif hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def execute_command(
@@ -39,93 +194,94 @@ def execute_command(
     cwd: str | Path,
     shell_kind: str | None = None,
     timeout_ms: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> CommandExecutionResult:
     resolved_shell = shell_kind or default_shell_kind()
     resolved_cwd = str(Path(cwd).resolve())
     timeout_s = None if timeout_ms is None else timeout_ms / 1000
 
-    if resolved_shell == "powershell":
-        cmd: Sequence[str] = [
-            "powershell",
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            command,
-        ]
-        shell = False
-    elif resolved_shell == "shell":
-        try:
-            cmd = shlex.split(command)
-        except ValueError as exc:
-            return CommandExecutionResult(
-                success=False,
-                command=command,
-                shell_kind=resolved_shell,
-                cwd=resolved_cwd,
-                exit_code=-1,
-                stderr=f"Invalid command syntax: {exc}",
-            )
-        if not cmd:
-            return CommandExecutionResult(
-                success=False,
-                command=command,
-                shell_kind=resolved_shell,
-                cwd=resolved_cwd,
-                exit_code=-1,
-                stderr="Empty command.",
-            )
-        shell = False
-    else:
-        raise ValueError(f"Unsupported shell_kind: {resolved_shell}")
-
     try:
-        started_at = time.perf_counter()
-        completed = subprocess.run(
-            cmd,
+        invocation = _build_invocation(command, resolved_shell, env=env)
+    except (OSError, ValueError) as exc:
+        return _failure_result(
+            command=command,
+            shell_kind=resolved_shell,
             cwd=resolved_cwd,
-            shell=shell,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",  # non-UTF-8 output must not raise UnicodeDecodeError
-            timeout=timeout_s,
+            error=exc,
         )
+    started_at = time.perf_counter()
+    try:
+        proc = subprocess.Popen(
+            invocation.argv,
+            cwd=resolved_cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **_spawn_group_kwargs(),
+        )
+        stdout, stderr = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
+        _terminate_process_sync(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = exc.output, exc.stderr
         return CommandExecutionResult(
             success=False,
             command=command,
             shell_kind=resolved_shell,
             cwd=resolved_cwd,
             exit_code=-1,
-            stdout=(exc.stdout or ""),
-            stderr=(exc.stderr or ""),
+            stdout=_decode_output(stdout),
+            stderr=_decode_output(stderr),
             duration_ms=int(timeout_ms or 0),
             was_timeout=True,
+            metadata=invocation.metadata,
+        )
+    except OSError as exc:
+        return _failure_result(
+            command=command,
+            shell_kind=resolved_shell,
+            cwd=resolved_cwd,
+            error=exc,
+            metadata=invocation.metadata,
         )
 
     duration_ms = int((time.perf_counter() - started_at) * 1000)
     return CommandExecutionResult(
-        success=completed.returncode == 0,
+        success=proc.returncode == 0,
         command=command,
         shell_kind=resolved_shell,
         cwd=resolved_cwd,
-        exit_code=completed.returncode,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
+        exit_code=proc.returncode or 0,
+        stdout=_decode_output(stdout),
+        stderr=_decode_output(stderr),
         duration_ms=duration_ms,
+        metadata=invocation.metadata,
     )
 
 
-def _terminate_process(proc: "asyncio.subprocess.Process") -> None:
-    """Kill the subprocess and, on POSIX, its whole process group.
-
-    The children are spawned with ``start_new_session=True`` so they lead their
-    own group; ``proc.kill()`` alone would leave grandchildren orphaned but
-    running. Falls back to a plain kill where process groups aren't available
-    (Windows) or the group is already gone.
-    """
-    if proc.pid is not None and hasattr(os, "killpg"):
+async def _terminate_process(proc: "asyncio.subprocess.Process") -> None:
+    """Terminate the complete subprocess tree on the current platform."""
+    if proc.returncode is not None:
+        return
+    if _is_windows() and proc.pid is not None:
+        try:
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(proc.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(killer.wait(), timeout=5)
+            if killer.returncode == 0:
+                return
+        except (OSError, asyncio.TimeoutError):
+            pass
+    elif proc.pid is not None and hasattr(os, "killpg"):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             return
@@ -161,73 +317,41 @@ async def execute_command_async(
     cwd: str | Path,
     shell_kind: str | None = None,
     timeout_ms: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> CommandExecutionResult:
     resolved_shell = shell_kind or default_shell_kind()
     resolved_cwd = str(Path(cwd).resolve())
     timeout_s = None if timeout_ms is None else timeout_ms / 1000
 
-    if resolved_shell == "powershell":
-        args = [
-            "powershell",
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            command,
-        ]
-        create = asyncio.create_subprocess_exec(
-            *args,
-            cwd=resolved_cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-    elif resolved_shell == "shell":
-        try:
-            args = shlex.split(command)
-        except ValueError as exc:
-            return CommandExecutionResult(
-                success=False,
-                command=command,
-                shell_kind=resolved_shell,
-                cwd=resolved_cwd,
-                exit_code=-1,
-                stderr=f"Invalid command syntax: {exc}",
-            )
-        if not args:
-            return CommandExecutionResult(
-                success=False,
-                command=command,
-                shell_kind=resolved_shell,
-                cwd=resolved_cwd,
-                exit_code=-1,
-                stderr="Empty command.",
-            )
-        create = asyncio.create_subprocess_exec(
-            *args,
-            cwd=resolved_cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-    else:
-        raise ValueError(f"Unsupported shell_kind: {resolved_shell}")
-
-    started_at = time.perf_counter()
     try:
-        proc = await create
-    except OSError as exc:
-        # Spawn failure (e.g. binary not found) previously raised outside the
-        # try and surfaced as an opaque error; return a shaped failed result.
-        return CommandExecutionResult(
-            success=False,
+        invocation = _build_invocation(command, resolved_shell, env=env)
+    except (OSError, ValueError) as exc:
+        return _failure_result(
             command=command,
             shell_kind=resolved_shell,
             cwd=resolved_cwd,
-            exit_code=127,
-            stderr=str(exc),
-            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            error=exc,
         )
+    started_at = time.perf_counter()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *invocation.argv,
+            cwd=resolved_cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            **_spawn_group_kwargs(),
+        )
+    except OSError as exc:
+        result = _failure_result(
+            command=command,
+            shell_kind=resolved_shell,
+            cwd=resolved_cwd,
+            error=exc,
+            metadata=invocation.metadata,
+        )
+        result.duration_ms = int((time.perf_counter() - started_at) * 1000)
+        return result
     # Pump stdout/stderr concurrently so partial output is preserved on timeout
     # and the pipes can't fill and deadlock the child.
     stdout_chunks: list[bytes] = []
@@ -240,7 +364,7 @@ async def execute_command_async(
         # Kill the whole process group (not just the direct child); the pumps
         # then drain any remaining buffered output before the pipes close, so
         # the [check:]/run_tests evidence tail survives (matching the sync path).
-        _terminate_process(proc)
+        await _terminate_process(proc)
         try:
             await asyncio.wait_for(asyncio.gather(pump_stdout, pump_stderr), timeout=1.0)
         except (asyncio.TimeoutError, Exception):
@@ -256,7 +380,12 @@ async def execute_command_async(
             stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
             duration_ms=int(timeout_ms or 0),
             was_timeout=True,
+            metadata=invocation.metadata,
         )
+    except asyncio.CancelledError:
+        await _terminate_process(proc)
+        await asyncio.gather(pump_stdout, pump_stderr, return_exceptions=True)
+        raise
 
     # Process exited within the budget — let the pumps finish reading to EOF.
     await asyncio.gather(pump_stdout, pump_stderr, return_exceptions=True)
@@ -270,6 +399,7 @@ async def execute_command_async(
         stdout=b"".join(stdout_chunks).decode("utf-8", errors="replace"),
         stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
         duration_ms=duration_ms,
+        metadata=invocation.metadata,
     )
 
 
@@ -308,6 +438,7 @@ class CheckVerdict:
     timed_out: bool = False
     unrunnable: bool = False  # could not execute at all (no verification signal)
     error: str | None = None  # spawn-time error (bad command, not found, …)
+    shell_kind: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -372,11 +503,12 @@ async def run_check_command_async(
     verdicts (``unrunnable=True`` when the command could not execute at all) so
     the caller can attach evidence and decide policy.
     """
+    resolved_shell = shell_kind or default_shell_kind()
     try:
         result = await execute_command_async(
             command=command,
             cwd=cwd,
-            shell_kind=shell_kind,
+            shell_kind=resolved_shell,
             timeout_ms=timeout_ms,
         )
     except (OSError, ValueError) as exc:  # e.g. binary not found on spawn
@@ -386,6 +518,7 @@ async def run_check_command_async(
             exit_code=None,
             unrunnable=True,
             error=str(exc),
+            shell_kind=resolved_shell,
         )
     tail = _check_tail(f"{result.stdout}\n{result.stderr}")
     return CheckVerdict(
@@ -396,4 +529,5 @@ async def run_check_command_async(
         timed_out=result.was_timeout,
         unrunnable=_result_unrunnable(result),
         error=None,
+        shell_kind=result.shell_kind,
     )

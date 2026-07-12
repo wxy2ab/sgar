@@ -28,7 +28,7 @@ class ShellTool(BaseTool):
                 description=(
                     "Run a shell command in the current working directory. "
                     "Use kind='auto' (default) to pick the host's native shell — "
-                    "bash/zsh on Linux/macOS, PowerShell on Windows. "
+                    "direct argv execution on Linux/macOS, PowerShell on Windows. "
                     "Explicit kind='shell' or kind='powershell' overrides the default."
                 ),
                 input_schema={
@@ -41,7 +41,9 @@ class ShellTool(BaseTool):
                             "default": "auto",
                             "description": (
                                 "Shell flavor. 'auto' picks the host default; "
-                                "'shell' forces bash/zsh; 'powershell' forces pwsh."
+                                "'shell' executes a POSIX-quoted argv without a shell; "
+                                "'powershell' prefers pwsh and falls back to "
+                                "Windows PowerShell 5.1."
                             ),
                         },
                         "cwd": {"type": "string"},
