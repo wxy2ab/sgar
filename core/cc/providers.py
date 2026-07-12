@@ -78,6 +78,7 @@ class ShellResult:
     exit_code: int
     duration_ms: int = 0
     was_timeout: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -90,6 +91,7 @@ class ShellResult:
             "exit_code": self.exit_code,
             "duration_ms": self.duration_ms,
             "was_timeout": self.was_timeout,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -200,6 +202,7 @@ class LocalCommandProvider:
             cwd=cwd or os.getcwd(),
             shell_kind=shell_kind,
             timeout_ms=timeout_ms,
+            env=env,
         )
         return ShellResult(
             stdout=result.stdout,
@@ -207,6 +210,7 @@ class LocalCommandProvider:
             exit_code=result.exit_code,
             duration_ms=result.duration_ms,
             was_timeout=result.was_timeout,
+            metadata=dict(result.metadata),
         )
 
 

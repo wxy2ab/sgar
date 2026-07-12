@@ -79,7 +79,54 @@ _INPLACE_EDIT_RE = re.compile(r"\b(?:sed|perl|ruby)\b[^;&|]*(?:\s-i\b|--in-place
 
 # Command / process substitution can smuggle arbitrary commands past token
 # classification, so it is always downgraded to ``unknown`` (ask).
-_SUBSTITUTION_MARKERS = ("$(", "`", "<(", ">(")
+_SUBSTITUTION_MARKERS = ("$(", "<(", ">(")
+
+_POWERSHELL_READ_ONLY_COMMANDS = (
+    "get-childitem",
+    "gci",
+    "get-content",
+    "gc",
+    "get-location",
+    "gl",
+    "get-item",
+    "gi",
+    "get-process",
+    "gps",
+    "get-service",
+    "select-string",
+    "where-object",
+)
+
+_POWERSHELL_WRITE_COMMANDS = (
+    "set-content",
+    "add-content",
+    "out-file",
+    "new-item",
+    "move-item",
+    "copy-item",
+    "rename-item",
+    "set-item",
+    "set-itemproperty",
+    "set-acl",
+)
+
+_POWERSHELL_DESTRUCTIVE_COMMANDS = (
+    "remove-item",
+    "ri",
+    "del",
+    "erase",
+    "rm",
+    "rmdir",
+    "remove-itemproperty",
+    "clear-item",
+    "clear-content",
+    "format-volume",
+    "clear-disk",
+    "initialize-disk",
+    "stop-computer",
+    "restart-computer",
+    "stop-process",
+)
 
 WORKSPACE_WRITE_PATTERNS = (
     "mv ",
@@ -168,6 +215,11 @@ def _is_inplace_edit(command: str) -> bool:
     return _INPLACE_EDIT_RE.search(command) is not None
 
 
+def _has_command_name(command: str, names: tuple[str, ...]) -> bool:
+    alternatives = "|".join(re.escape(name) for name in names)
+    return re.search(rf"(?:^|[;|&{{(]\s*)(?:{alternatives})\b", command) is not None
+
+
 def _classification_from_patterns(
     command: str,
     *,
@@ -199,14 +251,34 @@ def classify_command(command: str, *, shell_kind: str) -> CommandClassification:
     # Check command / process substitution FIRST, before base classification —
     # otherwise a read-only or workspace-write outer token (``cat $(...)``,
     # ``echo `...```) returns early and the substituted command is never seen.
-    if any(marker in normalized for marker in _SUBSTITUTION_MARKERS):
+    substitution_markers = _SUBSTITUTION_MARKERS
+    if shell_kind != "powershell":
+        substitution_markers = substitution_markers + ("`",)
+    if any(marker in normalized for marker in substitution_markers):
         return CommandClassification(category="unknown", touches_workspace=True)
+
+    if shell_kind == "powershell":
+        if _has_command_name(normalized, _POWERSHELL_DESTRUCTIVE_COMMANDS):
+            return CommandClassification(
+                category="destructive",
+                is_destructive=True,
+                touches_workspace=True,
+            )
+        if _has_command_name(normalized, _POWERSHELL_WRITE_COMMANDS):
+            return CommandClassification(category="workspace_write", touches_workspace=True)
+        if _has_command_name(normalized, _POWERSHELL_READ_ONLY_COMMANDS):
+            return CommandClassification(category="read_only")
 
     destructive_patterns = DESTRUCTIVE_PATTERNS
     workspace_write_patterns = WORKSPACE_WRITE_PATTERNS
     if shell_kind == "powershell":
-        destructive_patterns = destructive_patterns + ("clear-item", "set-itemproperty")
-        workspace_write_patterns = workspace_write_patterns + ("set-content", "add-content", "out-file")
+        destructive_patterns = destructive_patterns + ("clear-item",)
+        workspace_write_patterns = workspace_write_patterns + (
+            "set-content",
+            "add-content",
+            "out-file",
+            "set-itemproperty",
+        )
 
     base = _classification_from_patterns(
         normalized,

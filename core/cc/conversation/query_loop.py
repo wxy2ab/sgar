@@ -8,7 +8,7 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-from ..command_runner import CheckVerdict, run_check_command_async
+from ..command_runner import CheckVerdict, default_shell_kind, run_check_command_async
 from ..tools.base import ToolCall, ToolResult
 from ..tools.context import ToolUseContext
 from ..tools.result_mapper import ToolResultMapper
@@ -115,7 +115,12 @@ async def _run_post_edit_verification(
     ):
         return None
     timeout_ms = int(getattr(config, "post_edit_verify_timeout_ms", 0) or 120_000)
-    return await run_check_command_async(command=command, cwd=cwd, timeout_ms=timeout_ms)
+    return await run_check_command_async(
+        command=command,
+        cwd=cwd,
+        shell_kind=default_shell_kind(),
+        timeout_ms=timeout_ms,
+    )
 
 
 def _post_edit_verdict_note(verdict: CheckVerdict) -> str:
