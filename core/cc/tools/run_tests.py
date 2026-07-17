@@ -19,13 +19,13 @@ interactive loop's post-edit auto-verify step share ONE primitive (and so this
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from .base import BaseTool, ToolCall, ToolResult, ToolSpec, ValidationResult
 from .context import ToolUseContext
 from ..command_runner import default_shell_kind, run_check_command_async
 from ..safety import classify_command_permission
+from ..safety.file_rules import resolve_under_cwd
 
 
 _DEFAULT_VERIFY_TIMEOUT_MS = 120_000
@@ -100,8 +100,9 @@ class RunTestsTool(BaseTool):
     def check_permissions(self, ctx: ToolUseContext, arguments: dict[str, Any]):
         # A verification command is still an arbitrary command — route it
         # through the SAME permission classifier as the shell tool so this tool
-        # can't become a way to bypass command permissions.
-        target_cwd = str(Path(arguments.get("cwd") or ctx.cwd).resolve())
+        # can't become a way to bypass command permissions. Relative cwd must
+        # resolve under the session workspace, not the process CWD.
+        target_cwd = str(resolve_under_cwd(arguments.get("cwd") or ctx.cwd, ctx.cwd))
         resolved_kind = _resolve_kind(arguments.get("kind"))
         return classify_command_permission(
             command=str(arguments.get("command") or ""),
@@ -114,7 +115,7 @@ class RunTestsTool(BaseTool):
         )
 
     async def execute(self, tool_call: ToolCall, ctx: ToolUseContext) -> ToolResult:
-        cwd = str(Path(tool_call.arguments.get("cwd") or ctx.cwd).resolve())
+        cwd = str(resolve_under_cwd(tool_call.arguments.get("cwd") or ctx.cwd, ctx.cwd))
         timeout_ms = int(
             tool_call.arguments.get("timeout_ms") or _DEFAULT_VERIFY_TIMEOUT_MS
         )

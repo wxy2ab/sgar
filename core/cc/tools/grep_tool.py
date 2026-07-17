@@ -100,6 +100,18 @@ _FILE_TYPE_GLOB_SUFFIXES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _is_rg_match_line(line: str) -> bool:
+    """True for rg match lines (``path:line:text``), not context (``path-line-text``)."""
+    parts = line.split(":", 2)
+    if len(parts) != 3:
+        return False
+    try:
+        int(parts[1])
+    except ValueError:
+        return False
+    return True
+
+
 def _parse_rg_match_lines(stdout: str, root: Path) -> list[dict[str, object]]:
     """Parse rg ``path:line:text`` output into structured matches.
 
@@ -126,6 +138,32 @@ def _parse_rg_match_lines(stdout: str, root: Path) -> list[dict[str, object]]:
             }
         )
     return matches
+
+
+def _limit_rg_context_content(stdout: str, max_matches: int) -> str:
+    """Keep rg ``-C`` stdout covering only the first ``max_matches`` match lines.
+
+    Context lines belonging to kept matches are preserved; later match groups
+    (and any excess matches in a shared group) are dropped so ``content`` obeys
+    the same global cap as structured ``matches``.
+    """
+    text = stdout.strip()
+    if not text or max_matches <= 0:
+        return ""
+    kept: list[str] = []
+    seen = 0
+    for line in text.splitlines():
+        if line == "--":
+            if seen >= max_matches:
+                break
+            kept.append(line)
+            continue
+        if _is_rg_match_line(line):
+            if seen >= max_matches:
+                break
+            seen += 1
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 class GrepTool(BaseTool):
@@ -326,6 +364,13 @@ class GrepTool(BaseTool):
                                     if fp not in seen_files:
                                         seen_files.add(fp)
                                         matches.append({"file_path": fp})
+                                        if len(matches) >= max_results:
+                                            return (
+                                                matches,
+                                                skipped_large_files,
+                                                False,
+                                                entries_visited,
+                                            )
                                     break
                                 matches.append(
                                     {
@@ -368,15 +413,18 @@ class GrepTool(BaseTool):
                 "grep python fallback done elapsed=%.2fs entries_visited=%d matches=%d",
                 fallback_elapsed, entries_visited, len(matches),
             )
+        truncated = len(matches) >= max_results
         if files_only:
             content = "\n".join(str(item["file_path"]) for item in matches)
+            if truncated:
+                content = f"{content}\n\n[truncated to {max_results} files]"
         else:
             content = "\n".join(
                 f"{item['file_path']}:{item['line_number']}:{item['line']}"
                 for item in matches
             )
-        if not files_only and len(matches) >= max_results:
-            content = f"{content}\n\n[truncated to {max_results} matches]"
+            if truncated:
+                content = f"{content}\n\n[truncated to {max_results} matches]"
         if timed_out:
             timeout_note = (
                 f"\n\n[python fallback hit {_PYTHON_FALLBACK_TIMEOUT_SECONDS}s deadline after "
@@ -394,13 +442,13 @@ class GrepTool(BaseTool):
                 "count": len(matches),
                 "cwd": str(root),
                 "max_results": max_results,
-                "truncated": not files_only and len(matches) >= max_results,
+                "truncated": truncated,
                 "engine": "python",
                 "skipped_large_files": skipped_large_files,
                 "timed_out": timed_out,
                 "entries_visited": entries_visited,
             },
-            truncated=not files_only and len(matches) >= max_results,
+            truncated=truncated,
         )
 
     async def _run_fallback_off_loop(
@@ -606,24 +654,35 @@ class GrepTool(BaseTool):
 
         if files_only:
             file_list = [line.strip() for line in stdout.splitlines() if line.strip()]
+            truncated = len(file_list) > max_results
+            if truncated:
+                file_list = file_list[:max_results]
             content = "\n".join(str((root / f).resolve()) for f in file_list)
+            if truncated:
+                content = f"{content}\n\n[truncated to {max_results} files]"
             return {
                 "matches": [{"file_path": str((root / f).resolve())} for f in file_list],
                 "count": len(file_list),
                 "cwd": str(root),
                 "max_results": max_results,
-                "truncated": False,
+                "truncated": truncated,
                 "engine": "rg",
                 "stderr": stderr.strip(),
                 "content": content,
             }
 
         if context_lines and context_lines > 0:
-            content = stdout.strip()
             matches = _parse_rg_match_lines(stdout, root)
             truncated = len(matches) > max_results
             if truncated:
                 matches = matches[:max_results]
+            content = _limit_rg_context_content(stdout, max_results)
+            if truncated:
+                content = (
+                    f"{content}\n\n[truncated to {max_results} matches]"
+                    if content
+                    else f"[truncated to {max_results} matches]"
+                )
             return {
                 "matches": matches,
                 "count": len(matches),
@@ -632,8 +691,8 @@ class GrepTool(BaseTool):
                 "truncated": truncated,
                 "engine": "rg",
                 "stderr": stderr.strip(),
-                # Full rg output (with the surrounding context lines) is kept for
-                # display; ``matches`` holds just the structured match lines.
+                # Context stdout is capped to the same global match limit as
+                # structured ``matches`` so display content cannot bypass it.
                 "content": content if content else "(no matches)",
             }
 

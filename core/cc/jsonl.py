@@ -71,7 +71,12 @@ class JsonlTailReader:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                payload = json.loads(stripped.decode("utf-8"))
+                try:
+                    payload = json.loads(stripped.decode("utf-8"))
+                except json.JSONDecodeError:
+                    # A torn/corrupt trailing line must not sink the whole
+                    # replay (mirrors core.ccx.sgar.tracing.read_trace).
+                    continue
                 if isinstance(payload, dict):
                     payloads.append(payload)
             return payloads

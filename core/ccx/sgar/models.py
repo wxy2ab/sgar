@@ -7,7 +7,7 @@ needed to validate hard transitions.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any
 
@@ -30,6 +30,33 @@ class StageStatus(str, Enum):
     EXECUTION = "execution"
     VERIFICATION = "verification"
     CLOSED = "closed"
+
+
+def _known_field_names(cls: type) -> frozenset[str]:
+    return frozenset(f.name for f in fields(cls))
+
+
+def _extract_extras(data: dict[str, Any], known: frozenset[str]) -> dict[str, Any]:
+    """Capture unknown keys (and an explicit ``extras`` map) for round-trip."""
+    extras: dict[str, Any] = {}
+    nested = data.get("extras")
+    if isinstance(nested, dict):
+        extras.update(nested)
+    for key, value in data.items():
+        if key in known or key == "extras":
+            continue
+        extras[key] = value
+    return extras
+
+
+def _merge_extras(payload: dict[str, Any], extras: dict[str, Any]) -> dict[str, Any]:
+    """Flatten ``extras`` into the serialized payload (no nested ``extras`` key)."""
+    out = dict(payload)
+    out.pop("extras", None)
+    for key, value in extras.items():
+        if key not in out:
+            out[key] = value
+    return out
 
 
 @dataclass(slots=True)
@@ -63,13 +90,27 @@ class CriterionResult:
     criterion_id: str
     passed: bool
     evidence: str = ""
+    # Forward-compat: unknown keys from newer writers survive load→mutate→save.
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return _merge_extras(
+            {
+                "criterion_id": self.criterion_id,
+                "passed": self.passed,
+                "evidence": self.evidence,
+            },
+            self.extras,
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CriterionResult":
+        known = _known_field_names(cls)
         return cls(
             criterion_id=str(data.get("criterion_id") or ""),
             passed=bool(data.get("passed", False)),
             evidence=str(data.get("evidence") or ""),
+            extras=_extract_extras(data, known),
         )
 
 
@@ -78,16 +119,21 @@ class VerificationReport:
     stage_id: str
     results: list[CriterionResult] = field(default_factory=list)
     notes: str = ""
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "stage_id": self.stage_id,
-            "results": [asdict(result) for result in self.results],
-            "notes": self.notes,
-        }
+        return _merge_extras(
+            {
+                "stage_id": self.stage_id,
+                "results": [result.to_dict() for result in self.results],
+                "notes": self.notes,
+            },
+            self.extras,
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "VerificationReport":
+        known = _known_field_names(cls)
         return cls(
             stage_id=str(data.get("stage_id") or ""),
             results=[
@@ -96,6 +142,7 @@ class VerificationReport:
                 if isinstance(item, dict)
             ],
             notes=str(data.get("notes") or ""),
+            extras=_extract_extras(data, known),
         )
 
 
@@ -115,12 +162,24 @@ class StageRecord:
     # never-attempted state so pre-existing state.json rows load unchanged.
     repair_attempts: int = 0
     last_failure_detail: str | None = None
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _merge_extras(
+            {
+                "stage_id": self.stage_id,
+                "status": self.status,
+                "started_at": self.started_at,
+                "closed_at": self.closed_at,
+                "repair_attempts": self.repair_attempts,
+                "last_failure_detail": self.last_failure_detail,
+            },
+            self.extras,
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StageRecord":
+        known = _known_field_names(cls)
         return cls(
             stage_id=str(data.get("stage_id") or ""),
             status=str(data.get("status") or StageStatus.PLANNED.value),
@@ -131,6 +190,7 @@ class StageRecord:
                 str(data["last_failure_detail"])
                 if data.get("last_failure_detail") is not None else None
             ),
+            extras=_extract_extras(data, known),
         )
 
 
@@ -148,17 +208,33 @@ class ProjectState:
     roadmap_review_required: bool = False
     future_stage_validation_required: bool = False
     stages: dict[str, StageRecord] = field(default_factory=dict)
+    extras: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        data["stages"] = {
-            stage_id: record.to_dict()
-            for stage_id, record in self.stages.items()
-        }
-        return data
+        return _merge_extras(
+            {
+                "project_name": self.project_name,
+                "mode": self.mode,
+                "current_stage_id": self.current_stage_id,
+                "next_stage_id": self.next_stage_id,
+                "last_closed_stage_id": self.last_closed_stage_id,
+                "closed_stage_ids": list(self.closed_stage_ids),
+                "accepted_blueprint_hash": self.accepted_blueprint_hash,
+                "accepted_roadmap_hash": self.accepted_roadmap_hash,
+                "validated_stage_spec_hashes": dict(self.validated_stage_spec_hashes),
+                "roadmap_review_required": self.roadmap_review_required,
+                "future_stage_validation_required": self.future_stage_validation_required,
+                "stages": {
+                    stage_id: record.to_dict()
+                    for stage_id, record in self.stages.items()
+                },
+            },
+            self.extras,
+        )
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ProjectState":
+        known = _known_field_names(cls)
         stages = {
             str(stage_id): StageRecord.from_dict(record)
             for stage_id, record in (data.get("stages") or {}).items()
@@ -188,6 +264,7 @@ class ProjectState:
                 data.get("future_stage_validation_required", False)
             ),
             stages=stages,
+            extras=_extract_extras(data, known),
         )
 
 

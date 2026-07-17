@@ -51,6 +51,16 @@ class EscalationPolicy:
         ctx: EscalationContext,
     ) -> Scope:
         # Non-retryable failures jump straight to local replanning.
+        # Budget exhaustion is checked first: even when marked retryable=False
+        # (parallel mid-batch halt), classify as GLOBAL so callers that only
+        # look at Scope see "budget" — EngineV5._handle_failures defers these
+        # nodes back to READY instead of abandoning.
+        if failure.kind == FailureKind.BUDGET_EXHAUSTED:
+            return Scope(
+                level=ScopeLevel.GLOBAL,
+                reason="budget exhausted",
+            )
+
         if not failure.retryable:
             if ctx.local_replans_used >= self.local_to_global_threshold:
                 return Scope(
@@ -61,13 +71,6 @@ class EscalationPolicy:
                 level=ScopeLevel.LOCAL,
                 node_id=ctx.node_id,
                 reason=f"non-retryable: {failure.kind.value}",
-            )
-
-        # Budget exhaustion never retries.
-        if failure.kind == FailureKind.BUDGET_EXHAUSTED:
-            return Scope(
-                level=ScopeLevel.GLOBAL,
-                reason="budget exhausted",
             )
 
         # Worker lost (UNKNOWN_EFFECT path) — single retry of the same node

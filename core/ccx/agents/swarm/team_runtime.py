@@ -7,8 +7,9 @@
    successful node still routes two ``task_completed`` envelopes into
    the mailbox via the ``node.succeeded`` + ``node.completed`` kind
    mapping, but :meth:`collect_worker_results` now dedups them per
-   worker so callers see one result per success. Reconcile the envelope
-   direction before building on this layer.
+   (worker, run_id) so one assignment yields one result while successive
+   assign_task calls on the same worker are preserved. Reconcile the
+   envelope direction before building on this layer.
 
 cc's TeamRuntime is built around long-lived **worker controllers** that
 sit idle in subprocesses waiting for task assignments delivered via a
@@ -290,17 +291,23 @@ class TeamRuntime:
         # A single successful node emits BOTH node.succeeded (dispatcher) and
         # node.completed (engine, only on SUCCEEDED), each mapped to
         # task_completed with DISTINCT sequences — so the bridge's
-        # (run_id, sequence) dedup cannot collapse them. Dedup per worker node
-        # (``to_runtime_id`` = the v5 node_id) here so one success yields exactly
-        # one result envelope instead of two.
-        seen: set[str] = set()
+        # (run_id, sequence) dedup cannot collapse them. Dedup per
+        # (to_runtime_id, run_id): one assignment → one envelope, but a later
+        # assign_task on the same worker (same runtime_id / node_id, new v5
+        # run_id) is kept. MailboxBridge stamps bus-level run_id onto the
+        # envelope payload so node.completed carries it too.
+        seen: set[tuple[str, str]] = set()
         results: list[MailboxEnvelope] = []
         for env in self.collect_worker_events(
             message_types={"task_completed"}, ack=ack,
         ):
-            if env.to_runtime_id in seen:
+            run_id = ""
+            if isinstance(env.payload, dict) and env.payload.get("run_id") is not None:
+                run_id = str(env.payload.get("run_id"))
+            key = (env.to_runtime_id, run_id)
+            if key in seen:
                 continue
-            seen.add(env.to_runtime_id)
+            seen.add(key)
             results.append(env)
         return results
 

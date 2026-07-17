@@ -141,16 +141,23 @@ def _post_edit_verdict_note(verdict: CheckVerdict) -> str:
 
 
 def _post_edit_blocks_autocomplete(
-    config: Any, latest_verify_passed: bool | None
+    config: Any,
+    latest_verify_passed: bool | None,
+    *,
+    unrunnable: bool = False,
 ) -> bool:
     """Whether to block implementation-task auto-completion this round.
 
     True only when post-edit verification is enabled AND the most recent verdict
-    was RED (``latest_verify_passed is False``). When the feature is off,
-    ``latest_verify_passed`` stays ``None`` and this is always False, so the
-    auto-complete grace logic behaves byte-identically to before.
+    was a genuine RED (``latest_verify_passed is False`` and not ``unrunnable``).
+    An unrunnable harness/config defect must not stall auto-completion — the
+    model is already told via ``_post_edit_verdict_note`` that the failure is
+    not a code failure. When the feature is off, ``latest_verify_passed`` stays
+    ``None`` and this is always False.
     """
     if not getattr(config, "auto_post_edit_verify", False):
+        return False
+    if unrunnable:
         return False
     return latest_verify_passed is False
 
@@ -179,7 +186,21 @@ _TOOL_RESULT_CONTENT_LIMIT = 2000
 # model knows when a read is still partial — the old bare "[truncated]" hid
 # that, so the model assumed it had seen the whole file.
 _READ_TOOL_RESULT_CONTENT_LIMIT = 100_000
-_CONTENT_DELIVERY_TOOLS = frozenset({"file_read", "grep", "glob"})
+_CONTENT_DELIVERY_TOOLS = frozenset({
+    "file_read",
+    "grep",
+    "glob",
+    # Story Insight's restricted child intentionally does not receive the
+    # generic filesystem tools.  Its sealed equivalents are still read tools
+    # and must not be truncated at the small side-effect-result limit: exact
+    # edits and reviewer decisions depend on seeing the authoritative body and
+    # the actual diff.  The shared 100k read cap remains in force.
+    "story_edit_get_context",
+    "story_edit_read_authoritative_state",
+    "story_edit_read_working_file",
+    "story_edit_grep_working_set",
+    "story_edit_preview_diff",
+})
 # Token-budget-aware compaction. When the LLM client advertises a context
 # window (context_window_tokens), compaction triggers on the estimated prompt
 # size approaching that window rather than a fixed message count — so 1M-context
@@ -337,11 +358,13 @@ def _reconcile_tool_call_pairing(
     """Return ``messages`` with tool_call ↔ tool_result pairing guaranteed.
 
     For every assistant ``tool_calls`` id that has no answering ``role:"tool"``
-    message, synthesise a failure result immediately after the assistant turn;
-    drop any ``role:"tool"`` message whose ``tool_call_id`` is declared by no
-    assistant turn. Order is otherwise preserved (system stays at index 0), so
-    the result is safe to assign back over ``conversation_messages`` — which
-    also permanently repairs the in-memory list for later rounds.
+    message, synthesise a failure result. Drop any ``role:"tool"`` message whose
+    ``tool_call_id`` is declared by no assistant turn.
+
+    Results are always emitted immediately after their assistant turn in the
+    same order as ``tool_calls`` (OpenAI/Anthropic requirement). Existing
+    answers are relocated into that slot when necessary so a partial round
+    cannot become ``assistant → synthetic c2 → real c1``.
     """
     declared_ids: set[str] = set()
     for m in messages:
@@ -349,33 +372,40 @@ def _reconcile_tool_call_pairing(
             for tc in m["tool_calls"]:
                 if isinstance(tc, dict) and tc.get("id"):
                     declared_ids.add(str(tc["id"]))
-    answered_ids: set[str] = {
-        str(m["tool_call_id"])
-        for m in messages
-        if m.get("role") == "tool" and m.get("tool_call_id")
-    }
+    # First answer wins; later duplicates are treated as noise and dropped.
+    results_by_id: dict[str, dict[str, Any]] = {}
+    for m in messages:
+        if m.get("role") != "tool" or not m.get("tool_call_id"):
+            continue
+        tc_id = str(m["tool_call_id"])
+        if tc_id in declared_ids and tc_id not in results_by_id:
+            results_by_id[tc_id] = m
+
     reconciled: list[dict[str, Any]] = []
     for m in messages:
         if m.get("role") == "tool":
-            if str(m.get("tool_call_id") or "") not in declared_ids:
-                continue  # orphan tool result — no assistant call declares it
-            reconciled.append(m)
+            # Re-emitted in tool_calls order after the owning assistant turn.
             continue
         reconciled.append(m)
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            for tc in m["tool_calls"]:
-                if not isinstance(tc, dict):
-                    continue
-                tc_id = str(tc.get("id") or "")
-                if tc_id and tc_id not in answered_ids:
-                    reconciled.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc_id,
-                            "content": _ORPHAN_TOOL_RESULT_PLACEHOLDER,
-                        }
-                    )
-                    answered_ids.add(tc_id)
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            continue
+        for tc in m["tool_calls"]:
+            if not isinstance(tc, dict):
+                continue
+            tc_id = str(tc.get("id") or "")
+            if not tc_id:
+                continue
+            existing = results_by_id.get(tc_id)
+            if existing is not None:
+                reconciled.append(existing)
+            else:
+                reconciled.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": _ORPHAN_TOOL_RESULT_PLACEHOLDER,
+                    }
+                )
     return reconciled
 
 
@@ -535,9 +565,11 @@ async def run_single_turn(
     generic_stall_reprompts = 0
     # Most recent opt-in post-edit verification verdict. None until a
     # verification actually runs (feature on + code mutated + command set); a
-    # RED verdict here blocks implementation-task auto-completion (see
-    # ``_post_edit_blocks_autocomplete``). Stays None when the feature is off.
+    # genuine RED verdict here blocks implementation-task auto-completion (see
+    # ``_post_edit_blocks_autocomplete``). Stays None / unrunnable=False when
+    # the feature is off.
     latest_post_edit_verify_passed: bool | None = None
+    latest_post_edit_verify_unrunnable: bool = False
     # Per-identical-call validation-failure counters + one-shot warned set for
     # the validation-retry loop guard (#2). Persist across rounds of this turn.
     validation_retry_counts: dict[str, int] = {}
@@ -962,6 +994,7 @@ async def run_single_turn(
         )
         if post_edit_verdict is not None:
             latest_post_edit_verify_passed = post_edit_verdict.passed
+            latest_post_edit_verify_unrunnable = bool(post_edit_verdict.unrunnable)
             _verdict_note = _post_edit_verdict_note(post_edit_verdict)
             if use_messages_mode:
                 conversation_messages.append({"role": "user", "content": _verdict_note})
@@ -983,6 +1016,13 @@ async def run_single_turn(
                     },
                 ),
             )
+        else:
+            # No fresh verdict this round (read-only / shell-only / feature off).
+            # Clear any prior RED so a stale failure cannot permanently block
+            # ``_auto_complete_tasks`` after the model fixed things outside
+            # ``_CODE_MUTATION_TOOLS`` (e.g. via shell) without re-triggering verify.
+            latest_post_edit_verify_passed = None
+            latest_post_edit_verify_unrunnable = False
 
         exited_mode = _mode_exited(pre_tool_state, dict(session.metadata.state))
         current_tasks_snapshot = _implementation_tasks_snapshot(session)
@@ -1093,7 +1133,9 @@ async def run_single_turn(
                 implementation_code_only_rounds += 1
                 implementation_stall_rounds = 0
                 if implementation_code_only_rounds >= _MAX_CODE_ONLY_GRACE_ROUNDS and not _post_edit_blocks_autocomplete(
-                    tool_ctx.config, latest_post_edit_verify_passed
+                    tool_ctx.config,
+                    latest_post_edit_verify_passed,
+                    unrunnable=latest_post_edit_verify_unrunnable,
                 ):
                     _auto_complete_tasks(session)
                     current_tasks_snapshot = _implementation_tasks_snapshot(session)
@@ -1104,7 +1146,9 @@ async def run_single_turn(
                 implementation_code_only_rounds += 1
                 implementation_stall_rounds = 0
                 if implementation_code_only_rounds >= _MAX_CODE_ONLY_GRACE_ROUNDS and not _post_edit_blocks_autocomplete(
-                    tool_ctx.config, latest_post_edit_verify_passed
+                    tool_ctx.config,
+                    latest_post_edit_verify_passed,
+                    unrunnable=latest_post_edit_verify_unrunnable,
                 ):
                     _auto_complete_tasks(session)
                     current_tasks_snapshot = _implementation_tasks_snapshot(session)

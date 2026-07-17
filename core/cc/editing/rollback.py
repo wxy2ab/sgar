@@ -2,13 +2,45 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import logging
+import os
 from pathlib import Path
 import shutil
+import tempfile
 import time
 import uuid
 
 from .file_state import compute_file_hash
 from .requests import RollbackResult
+
+logger = logging.getLogger(__name__)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` via temp file + ``os.replace`` (same dir).
+
+    Mirrors ``core.ccx.sgar.store._atomic_write_text`` so a crash mid-write
+    cannot leave a truncated ``checkpoints.json`` / ``.bak`` that would wipe
+    the rollback index on the next load.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=path.name + ".",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass(slots=True)
@@ -51,7 +83,7 @@ class RollbackManager:
     def create_checkpoint(self, *, file_path: str, content: str, existed_before: bool) -> RollbackCheckpoint:
         checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
         backup_path = self.checkpoint_root / f"{checkpoint_id}.bak"
-        backup_path.write_text(content, encoding="utf-8")
+        _atomic_write_text(backup_path, content)
         checkpoint = RollbackCheckpoint(
             checkpoint_id=checkpoint_id,
             file_path=file_path,
@@ -132,7 +164,10 @@ class RollbackManager:
 
     def _persist(self) -> None:
         payload = [checkpoint.to_dict() for checkpoint in self._index.values()]
-        self.index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(
+            self.index_path,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
 
     def _load(self) -> None:
         if not self.index_path.exists():
@@ -140,6 +175,11 @@ class RollbackManager:
         try:
             payload = json.loads(self.index_path.read_text(encoding="utf-8"))
             if not isinstance(payload, list):
+                logger.warning(
+                    "Checkpoint index at %s is not a JSON list; resetting index",
+                    self.index_path,
+                )
+                self._index = {}
                 return
             self._index = {
                 item["checkpoint_id"]: RollbackCheckpoint(**item)
@@ -147,4 +187,9 @@ class RollbackManager:
                 if isinstance(item, dict) and "checkpoint_id" in item
             }
         except (OSError, json.JSONDecodeError, TypeError, KeyError):
+            logger.warning(
+                "Corrupt checkpoint index at %s; resetting index",
+                self.index_path,
+                exc_info=True,
+            )
             self._index = {}

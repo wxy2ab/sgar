@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -92,6 +93,12 @@ class RuntimeV5:
             event_store=self.event_store,
             snapshot_store=self.snapshot_store,
         )
+        # Shared across every EngineV5 from this Runtime. Budget soft-defer
+        # orphans + parking HB outlive a single EngineV5 instance
+        # (``rt.engine()`` creates a new one each call); resume must see them
+        # so it does not ``drop_for_node`` a still-live parking fence.
+        self._engine_inflight_orphans: dict[str, dict[str, Any]] = {}
+        self._engine_orphans_lock = threading.Lock()
         self._wire_compaction_events()
 
     def _wire_compaction_events(self) -> None:

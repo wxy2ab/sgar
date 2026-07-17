@@ -5,6 +5,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 
 from ..utils.config_setting import Config
 from ..utils.log import logger
+from ._empty_content_retry import is_blank
 from ._llm_api_client import LLMApiClient
 from .openai_chat_client import OpenAIChatClient
 
@@ -129,6 +130,125 @@ class VolcCodingClient(OpenAIChatClient):
             self.extra_body.pop("format", None)
         else:
             self.extra_body["format"] = fmt
+
+    def _create_chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        is_stream: bool,
+        tools: List[Dict[str, Any]] = None,
+        raw_response: bool = False,
+    ):
+        """Prefer streaming for durable text/JSON against ark idle-close.
+
+        The coding endpoint idle-closes a *non-stream* request that stays silent
+        for ~60s while the model works. Story Insight architect packets routinely
+        exceed that window, so ``one_chat``'s non-stream path used to hang and
+        burn the base client's 12 connection retries. Tool calls already stream
+        via ``_streaming_tool_completion``; text/JSON now matches that contract.
+        ``tools`` / ``raw_response`` keep the base non-stream shape for callers
+        that inspect Completion objects directly.
+        """
+
+        if tools or raw_response:
+            return super()._create_chat_completion(
+                messages, is_stream, tools, raw_response
+            )
+        if is_stream:
+            return super()._create_chat_completion(
+                messages, True, tools, raw_response
+            )
+        text = self._streaming_text_completion(messages)
+        retries = self._EMPTY_CONTENT_RETRIES
+        attempt = 0
+        while attempt < retries and is_blank(text):
+            force_no_thinking = attempt == retries - 1
+            logger.warning(
+                "VolcCodingClient.one_chat/text: empty visible content "
+                "(reasoning_effort=%s); re-issuing (attempt %d/%d%s)",
+                self.reasoning_effort,
+                attempt + 1,
+                retries,
+                ", thinking disabled" if force_no_thinking else "",
+            )
+            if force_no_thinking and self.enable_thinking is not False:
+                prev = self.enable_thinking
+                self.enable_thinking = False
+                try:
+                    text = self._streaming_text_completion(messages)
+                finally:
+                    self.enable_thinking = prev
+            else:
+                text = self._streaming_text_completion(messages)
+            attempt += 1
+        return text or ""
+
+    @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
+    def _streaming_text_completion(
+        self, messages: List[Dict[str, str]]
+    ) -> str:
+        """Stream a plain chat completion and return the visible content."""
+
+        kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "stream": True,
+            "timeout": 600,
+            "stream_options": {"include_usage": True},
+        }
+        if self.max_tokens is not None:
+            kwargs["max_tokens"] = self.max_tokens
+        extra_body = dict(self.extra_body) if self.extra_body else {}
+        if self.enable_thinking is not None:
+            extra_body["enable_thinking"] = self.enable_thinking
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.verbosity is not None:
+            kwargs["verbosity"] = self.verbosity
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        if self.top_p is not None:
+            kwargs["top_p"] = self.top_p
+        if self.presence_penalty is not None:
+            kwargs["presence_penalty"] = self.presence_penalty
+        if self.frequency_penalty is not None:
+            kwargs["frequency_penalty"] = self.frequency_penalty
+        if self.stop is not None:
+            kwargs["stop"] = self.stop
+        if self.seed is not None:
+            kwargs["seed"] = self.seed
+        if self.service_tier is not None:
+            kwargs["service_tier"] = self.service_tier
+
+        content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        usage = None
+        stream = self.client.chat.completions.create(**kwargs)
+        for chunk in stream:
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage
+            model_id = getattr(chunk, "model", None)
+            if model_id:
+                self.observed_backend_model = model_id
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            reasoning_delta = getattr(delta, "reasoning_content", None)
+            if reasoning_delta:
+                reasoning_parts.append(reasoning_delta)
+            piece = getattr(delta, "content", None)
+            if piece:
+                content_parts.append(piece)
+        if reasoning_parts:
+            self._last_reasoning_content = "".join(reasoning_parts)
+        if usage is not None:
+            try:
+                self._update_stats(usage)
+            except Exception:  # noqa: BLE001 — stats are best-effort
+                pass
+        else:
+            self._update_stats(None)
+        return "".join(content_parts)
 
     def tool_invoke(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Mirror the base classes' "no forced-JSON-mode on tool paths" rule
@@ -278,7 +398,7 @@ class VolcCodingClient(OpenAIChatClient):
     # finish_reason="stop" (no exception -> one_chat's @retry never fires). That
     # empty propagates to ccx as an empty final_text. Setting max_tokens does NOT
     # bound the reasoning trace on this endpoint, so the token budget in the
-    # class docstring cannot prevent it. The re-issue-on-empty guard now lives in
-    # the shared base ``OpenAIChatClient._create_chat_completion`` (see
-    # ``_empty_content_retry``), so every OpenAI-compatible client — not just
-    # this one — is covered. VolcCodingClient inherits it unchanged.
+    # class docstring cannot prevent it. Text/JSON completions stream and then
+    # re-issue on empty in ``_create_chat_completion`` (mirroring the shared
+    # ``_empty_content_retry`` contract); tool_invoke keeps its own empty+no-
+    # tool-calls guard above.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import asyncio
 import time
 import uuid
 
@@ -106,7 +107,10 @@ class QueryEngine:
             self._record_memory_recall_event(turn_id)
             turn_timeout = self.session.config.max_turn_timeout_seconds
             turn_start = time.monotonic()
-            async for event in run_single_turn(
+            # Drive the turn via explicit anext + wait_for so a budget miss
+            # cancels the suspended generator (LLM/tool await) instead of
+            # ``break``-ing an async-for while work keeps running and writing.
+            turn_gen = run_single_turn(
                 session=self.session,
                 turn_id=turn_id,
                 user_input=user_input,
@@ -118,39 +122,126 @@ class QueryEngine:
                 context_assembler=self.context_assembler,
                 prompt_builder=self.prompt_builder,
                 max_tool_rounds=prepared_turn.effective_max_tool_rounds,
-            ):
-                if event.message is not None:
-                    self.message_store.append(event.message)
+            )
+            try:
+                while True:
+                    wait_budget: float | None = None
+                    if turn_timeout is not None:
+                        remaining = turn_timeout - (time.monotonic() - turn_start)
+                        if remaining <= 0:
+                            elapsed = int(time.monotonic() - turn_start)
+                            timeout_event = self._build_turn_timeout_event(
+                                turn_id=turn_id,
+                                elapsed_seconds=elapsed,
+                                limit_seconds=int(turn_timeout),
+                            )
+                            if timeout_event.message is not None:
+                                self.message_store.append(timeout_event.message)
+                            self._record_session_event(timeout_event)
+                            yield timeout_event
+                            timed_out = True
+                            break
+                        wait_budget = remaining
                     try:
-                        continue_count = max(continue_count, int(event.message.metadata.get("continue_count", 0) or 0))
-                    except (ValueError, TypeError):
-                        pass
-                    if event.message.role == "assistant" and event.message.kind == "assistant_text":
-                        final_assistant_text = str(event.message.content)
-                if event.event_type == "assistant_tool_use":
-                    tool_call_count += 1
-                self._record_session_event(event)
-                yield event
-                # Skip the timeout guard for terminal completion events: the turn
-                # has already produced its result, so a slow-but-completed turn
-                # must be finalized as success, not mismarked FAILED/QE1008 (which
-                # also dropped its memory store). The guard still fires for
-                # non-terminal events so a genuinely long-running turn aborts.
-                if (
-                    turn_timeout is not None
-                    and event.event_type not in _TERMINAL_COMPLETION_EVENT_TYPES
-                    and (time.monotonic() - turn_start) >= turn_timeout
-                ):
-                    elapsed = int(time.monotonic() - turn_start)
-                    timeout_event = self._build_turn_timeout_event(
-                        turn_id=turn_id, elapsed_seconds=elapsed, limit_seconds=int(turn_timeout),
-                    )
-                    if timeout_event.message is not None:
-                        self.message_store.append(timeout_event.message)
-                    self._record_session_event(timeout_event)
-                    yield timeout_event
-                    timed_out = True
-                    break
+                        if wait_budget is not None:
+                            event = await asyncio.wait_for(
+                                turn_gen.__anext__(), timeout=wait_budget
+                            )
+                        else:
+                            event = await turn_gen.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed = int(time.monotonic() - turn_start)
+                        timeout_event = self._build_turn_timeout_event(
+                            turn_id=turn_id,
+                            elapsed_seconds=elapsed,
+                            limit_seconds=int(turn_timeout or 0),
+                        )
+                        if timeout_event.message is not None:
+                            self.message_store.append(timeout_event.message)
+                        self._record_session_event(timeout_event)
+                        yield timeout_event
+                        timed_out = True
+                        break
+
+                    if event.message is not None:
+                        self.message_store.append(event.message)
+                        try:
+                            continue_count = max(
+                                continue_count,
+                                int(event.message.metadata.get("continue_count", 0) or 0),
+                            )
+                        except (ValueError, TypeError):
+                            pass
+                        if (
+                            event.message.role == "assistant"
+                            and event.message.kind == "assistant_text"
+                        ):
+                            final_assistant_text = str(event.message.content)
+                    if event.event_type == "assistant_tool_use":
+                        tool_call_count += 1
+                    self._record_session_event(event)
+                    yield event
+                    # Terminal completion ends the turn. Do not loop again: a
+                    # pre-anext budget check would otherwise mismark a slow-but
+                    # completed turn as QE1008 after the terminal event.
+                    if event.event_type in _TERMINAL_COMPLETION_EVENT_TYPES:
+                        break
+                    # Non-terminal events: abort if the global budget is already
+                    # exhausted so a genuinely long-running turn stops promptly.
+                    if (
+                        turn_timeout is not None
+                        and (time.monotonic() - turn_start) >= turn_timeout
+                    ):
+                        elapsed = int(time.monotonic() - turn_start)
+                        timeout_event = self._build_turn_timeout_event(
+                            turn_id=turn_id,
+                            elapsed_seconds=elapsed,
+                            limit_seconds=int(turn_timeout),
+                        )
+                        if timeout_event.message is not None:
+                            self.message_store.append(timeout_event.message)
+                        self._record_session_event(timeout_event)
+                        yield timeout_event
+                        timed_out = True
+                        break
+            finally:
+                await turn_gen.aclose()
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException (not Exception) since 3.8; without
+            # this branch, turn-end persistence is skipped and the session is left
+            # with a dangling active_turn_id. Persist an abort record, then re-raise.
+            abort_event = SessionEvent(
+                event_type="turn_aborted",
+                turn_id=turn_id,
+                payload={
+                    "error_code": "QE1007",
+                    "error_message": "turn cancelled",
+                    "turn_state": TurnState.ABORTED.value,
+                },
+            )
+            self._record_session_event(abort_event)
+            self.turn_state = TurnState.ABORTED
+            self.session.active_turn_id = None
+            if self.session.config.persist_sessions:
+                record = TurnRecord(
+                    turn_id=turn_id,
+                    state=self.turn_state.value,
+                    tool_call_count=tool_call_count,
+                    compact_applied=compact_applied,
+                    continue_count=continue_count,
+                    error_code="QE1007",
+                )
+                await self.persistence.persist_turn_end(
+                    record,
+                    extra={
+                        "last_error": "turn_cancelled",
+                        "last_error_code": "QE1007",
+                        "last_error_message": "turn cancelled",
+                    },
+                )
+            raise
         except Exception as exc:
             failed_event = self._build_turn_failed_event(turn_id=turn_id, exc=exc)
             self._record_session_event(failed_event)

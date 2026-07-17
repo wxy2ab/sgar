@@ -160,6 +160,8 @@ def _debug_advisories(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         "succeeded": int(snap.get("succeeded", 0) or 0),
         "failed": int(snap.get("failed", 0) or 0),
         "abandoned": int(snap.get("abandoned", 0) or 0),
+        "skipped": int(snap.get("skipped", 0) or 0),
+        "cancelled": int(snap.get("cancelled", 0) or 0),
     }
     advisories: list[dict[str, Any]] = []
 
@@ -177,10 +179,7 @@ def _debug_advisories(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     if perf:
         advisories.append(perf)
 
-    degraded = degraded_completion(
-        snap.get("status"),
-        {"abandoned": counts["abandoned"], "failed": counts["failed"]},
-    )
+    degraded = degraded_completion(snap.get("status"), counts)
     if degraded:
         advisories.append(
             {"rule": "degraded_completion", "severity": "warn", "detail": degraded}
@@ -2584,14 +2583,19 @@ class CodeAgent:
                 "command": extras.get("sgar_command"),
             })
 
-        # Lift the spawn-contract verdict (governed_spawn) the same way as
-        # ``artifact_path`` above. It lives only in per-node ``extras``; the
-        # v5-graph -> AgentRunResult projection drops per-node extras and the
-        # ``ccx.node.completed`` event truncates ``result_summary`` at 200
-        # chars, so without this the machine-derived verdict is invisible to
-        # the CLI / output_json path. Last non-empty wins (mirroring
-        # artifact_path); stays ``None`` when no node carried a contract, so
-        # the no-contract path keeps a byte-identical snapshot.
+        # Lift the spawn-contract verdict (governed_spawn) from per-node
+        # ``extras``. The v5-graph -> AgentRunResult projection drops per-node
+        # extras and the ``ccx.node.completed`` event truncates
+        # ``result_summary`` at 200 chars, so without this the machine-derived
+        # verdict is invisible to the CLI / output_json path.
+        #
+        # Aggregation (NOT plain last-wins like ``artifact_path``): a
+        # not-passed verdict always beats a later passed one, so a multi-node
+        # DAG cannot greenwash an earlier spawn-contract failure into the
+        # run-level ``ccx.governance.verdict`` / ``--governance`` aggregate.
+        # Same polarity keeps last non-empty wins. Stays ``None`` when no node
+        # carried a contract, so the no-contract path keeps a byte-identical
+        # snapshot.
         contract_verdict: dict[str, Any] | None = None
         for row in all_nodes:
             res = memory_results.get(row["node_id"])
@@ -2603,7 +2607,15 @@ class CodeAgent:
             if not isinstance(extras, dict):
                 continue
             cv = extras.get("contract_verdict")
-            if cv:
+            if not isinstance(cv, dict) or not cv:
+                continue
+            if contract_verdict is None:
+                contract_verdict = cv
+                continue
+            cv_passed = bool(cv.get("passed"))
+            cur_passed = bool(contract_verdict.get("passed"))
+            if not cv_passed or cur_passed:
+                # Prefer any not-passed; among same polarity, last wins.
                 contract_verdict = cv
 
         session_snapshot = {
@@ -2613,6 +2625,10 @@ class CodeAgent:
             "succeeded": verdict.succeeded,
             "failed": verdict.failed,
             "abandoned": verdict.abandoned,
+            # Align with Verdict / RunSpecResult.succeeded / watch.degraded_completion:
+            # skipped+cancelled are non-SUCCEEDED terminals that COMPLETED can mask.
+            "skipped": int(getattr(verdict, "skipped", 0) or 0),
+            "cancelled": int(getattr(verdict, "cancelled", 0) or 0),
             "iterations": verdict.iterations,
             "elapsed_s": verdict.elapsed_s,
             "artifact_path": artifact_path,
@@ -2632,18 +2648,28 @@ class CodeAgent:
             CCX_GOAL_VERDICT_SNAPSHOT_KEY: None,
         }
 
-        # v5 reports "some succeeded, some abandoned" as COMPLETED on purpose
-        # (best-effort completion; the abandoned count stays on the Verdict).
-        # That is a partial/degraded outcome a caller can easily miss, so we
-        # surface it: a warning log + an additive snapshot flag. This is
-        # observe-only — we deliberately do NOT flip ``failed`` (preserving
-        # v5's best-effort contract and keeping the result byte-equivalent
-        # for callers that already inspect ``abandoned``).
-        if verdict.status == RunStatus.COMPLETED and verdict.abandoned > 0:
+        # v5 reports partial completion (succeeded + abandoned/skipped/cancelled)
+        # as COMPLETED on purpose (best-effort; counts stay on the Verdict).
+        # That is a degraded outcome a caller can easily miss, so we surface it:
+        # a warning log + additive ``abandoned_warning`` (name kept for
+        # governance/watch consumers). Observe-only — do NOT flip ``failed``.
+        # Predicate matches ``watch.degraded_completion`` /
+        # ``RunSpecResult.succeeded``.
+        if verdict.status == RunStatus.COMPLETED and (
+            verdict.abandoned > 0
+            or verdict.failed > 0
+            or int(getattr(verdict, "skipped", 0) or 0) > 0
+            or int(getattr(verdict, "cancelled", 0) or 0) > 0
+        ):
             logger.warning(
-                "ccx run %s COMPLETED with %d abandoned node(s); "
+                "ccx run %s COMPLETED with degraded nodes "
+                "(abandoned=%d failed=%d skipped=%d cancelled=%d); "
                 "treating as a partial/degraded run",
-                run_id, verdict.abandoned,
+                run_id,
+                verdict.abandoned,
+                verdict.failed,
+                int(getattr(verdict, "skipped", 0) or 0),
+                int(getattr(verdict, "cancelled", 0) or 0),
             )
             session_snapshot["abandoned_warning"] = True
 

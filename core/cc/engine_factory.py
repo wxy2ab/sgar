@@ -20,7 +20,7 @@ from .conversation.turn_pipeline import (
 from .llm import DefaultLLMClientProvider, LLMClientProvider
 from .memory import MemoryRuntime, build_default_memory_provider_registry
 from .providers import Environment, default_environment
-from .tools import ToolOrchestrator
+from .tools import ToolOrchestrator, ToolRegistry
 from .tools.builtin import build_builtin_tool_registry
 
 
@@ -51,11 +51,14 @@ class EngineFactory:
         config: CCConfig | None = None,
         llm_client_provider: LLMClientProvider | None = None,
         session: QuerySession | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> QueryEngine:
         """Assemble the default QueryEngine stack.
 
         This method is intentionally low-level. Keep external integrations on
         ``CodeAgent`` unless they explicitly need direct engine/session control.
+        Passing ``tool_registry`` replaces the built-in code-tool registry;
+        omitting it preserves the default composition exactly.
         """
 
         resolved_config = config or load_cc_config()
@@ -70,13 +73,15 @@ class EngineFactory:
             config=resolved_config,
             provider=memory_provider_registry.resolve(resolved_config),
         )
-        registry = build_builtin_tool_registry(
-            resolved_config,
-            llm_client_provider=provider,
-            runtime_registry=runtime_registry,
-            memory_runtime=memory_runtime,
-            cwd=resolved_cwd,
-        )
+        registry = tool_registry
+        if registry is None:
+            registry = build_builtin_tool_registry(
+                resolved_config,
+                llm_client_provider=provider,
+                runtime_registry=runtime_registry,
+                memory_runtime=memory_runtime,
+                cwd=resolved_cwd,
+            )
         orchestrator = ToolOrchestrator(registry)
         context_assembler = ContextAssembler(environment=self.environment)
         prompt_builder = SystemPromptBuilder(prompt_catalog)

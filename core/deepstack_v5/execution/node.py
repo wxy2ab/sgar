@@ -117,6 +117,32 @@ class NodeExecution:
     def current_attempt(self) -> Attempt | None:
         return self.attempts[-1] if self.attempts else None
 
+    def discard_open_attempt(self) -> Attempt | None:
+        """Drop the current open attempt without counting it toward retries.
+
+        Used for run-level interrupts (parallel budget halt) that must not burn
+        ``max_attempts`` the way a real tool failure does.
+        """
+        with self._lock:
+            att = self.attempts[-1] if self.attempts else None
+            if att is None or att.outcome is not None:
+                return None
+            self.attempts.pop()
+            self.updated_at_ms = now_ms()
+            return att
+
+    def discard_last_attempt_with_failure(
+        self, kind: FailureKind
+    ) -> Attempt | None:
+        """Pop the latest attempt if it closed with ``kind`` (budget interrupt)."""
+        with self._lock:
+            att = self.attempts[-1] if self.attempts else None
+            if att is None or att.failure is None or att.failure.kind != kind:
+                return None
+            self.attempts.pop()
+            self.updated_at_ms = now_ms()
+            return att
+
     def finish_attempt(
         self,
         *,

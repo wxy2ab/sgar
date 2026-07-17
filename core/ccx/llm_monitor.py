@@ -6,8 +6,9 @@ two layers of supervision over each snapshot:
 
 1. **Heuristics** (always on, zero LLM cost) — cheap rules over a
    snapshot/diff that fire alerts for obvious problems: failed nodes,
-   expired or starving leases, abandoned/approval-hang nodes, runs that
-   stop making progress.
+   expired or starving leases, abandoned/approval-hang nodes, COMPLETED
+   runs that still carry skipped/cancelled/abandoned/failed nodes
+   (``degraded_completion``), runs that stop making progress.
 
 2. **LLM assessment** (opt-in via ``--enable-llm``) — at a configurable
    cadence, or on heuristic escalation, send a compact snapshot + delta
@@ -52,6 +53,7 @@ from core.ccx.modes.parsing import parse_llm_json
 from core.ccx.watch import (
     build_watch_snapshot,
     connect_ro,
+    degraded_completion,
     list_runs,
     resolve_db_path,
 )
@@ -419,6 +421,32 @@ def evaluate_heuristics(
             }
         )
 
+    # Snapshot-level catch-all aligned with watch/report/session_snapshot /
+    # RunSpecResult.succeeded. Transition rules (failed_increased /
+    # abandoned_appeared) miss skipped/cancelled entirely and also miss
+    # degradation already present when the monitor attaches mid/post-run;
+    # without this, a COMPLETED run with only abandoned_warning / skipped
+    # nodes and a passing governance verdict looks clean to heuristics.
+    degraded = degraded_completion(run_status, counts)
+    if degraded is not None:
+        parts = [
+            f"{degraded[k]} {k}"
+            for k in ("abandoned", "failed", "skipped", "cancelled")
+            if degraded.get(k)
+        ]
+        hits.append(
+            {
+                "rule": "degraded_completion",
+                "severity": "warn",
+                "message": (
+                    "run completed with degraded nodes "
+                    f"({', '.join(parts)})"
+                ),
+                "node_ids": [],
+                "detail": degraded,
+            }
+        )
+
     perf = _heuristic_performative_completion(counts, governance_verdict)
     if perf is not None:
         hits.append(perf)
@@ -440,11 +468,11 @@ def _heuristic_performative_completion(
 
     Fires only on an EXPLICIT not-passed run-level verdict
     (``governance_verdict["passed"] is False``) with a clean node view
-    (≥1 succeeded, 0 failed, 0 abandoned). The negative control is the Goodhart
-    guard: all-green + ``passed=True`` (or no governance verdict at all) must NOT
-    fire. A run that already has a failed/abandoned node is covered by the
-    ``failed_increased`` / ``abandoned_appeared`` rules, so we stay silent there
-    to avoid redundant noise.
+    (≥1 succeeded, 0 failed/abandoned/skipped/cancelled). The negative control
+    is the Goodhart guard: all-green + ``passed=True`` (or no governance
+    verdict at all) must NOT fire. A run that already has a non-success
+    terminal is covered by ``failed_increased`` / ``abandoned_appeared`` /
+    ``degraded_completion``, so we stay silent there to avoid redundant noise.
     """
     if not isinstance(governance_verdict, dict):
         return None
@@ -453,7 +481,15 @@ def _heuristic_performative_completion(
     succeeded = int(counts.get("succeeded", 0) or 0)
     failed = int(counts.get("failed", 0) or 0)
     abandoned = int(counts.get("abandoned", 0) or 0)
-    if succeeded <= 0 or failed > 0 or abandoned > 0:
+    skipped = int(counts.get("skipped", 0) or 0)
+    cancelled = int(counts.get("cancelled", 0) or 0)
+    if (
+        succeeded <= 0
+        or failed > 0
+        or abandoned > 0
+        or skipped > 0
+        or cancelled > 0
+    ):
         return None
     reasons: list[str] = []
     for label, key in (

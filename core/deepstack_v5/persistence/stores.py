@@ -755,10 +755,40 @@ class GraphStore:
         )
         return cur.rowcount > 0
 
+    def renew_lease_for_node(
+        self,
+        run_id: str,
+        node_id: str,
+        expires_at_ms: int,
+        *,
+        worker_id: str,
+    ) -> bool:
+        """Extend lease for (run_id, node_id) even when already expired.
+
+        Only renews when ``worker_id`` matches the row owner so a late engine
+        parking heartbeat cannot extend a harness-stolen lease.
+        """
+        cur = self.db.execute(
+            """
+            UPDATE leases SET heartbeat_at_ms = ?, expires_at_ms = ?
+            WHERE run_id = ? AND node_id = ? AND worker_id = ?
+            """,
+            (now_ms(), expires_at_ms, run_id, node_id, worker_id),
+        )
+        return cur.rowcount > 0
+
     def release_lease(self, lease_id: str) -> bool:
         cur = self.db.execute(
             "DELETE FROM leases WHERE lease_id = ? AND expires_at_ms > ?",
             (lease_id, now_ms()),
+        )
+        return cur.rowcount > 0
+
+    def drop_lease_for_node(self, run_id: str, node_id: str) -> bool:
+        """Delete the lease row for ``(run_id, node_id)`` even when expired."""
+        cur = self.db.execute(
+            "DELETE FROM leases WHERE run_id = ? AND node_id = ?",
+            (run_id, node_id),
         )
         return cur.rowcount > 0
 
@@ -770,12 +800,40 @@ class GraphStore:
         return [_row_to_lease(r) for r in rows]
 
     def reclaim_expired(
-        self, *, now: int, run_id: str | None = None
+        self,
+        *,
+        now: int,
+        run_id: str | None = None,
+        exclude_node_ids: tuple[str, ...] | list[str] | None = None,
     ) -> list[Lease]:
+        exclude = tuple(exclude_node_ids or ())
         if run_id is None:
+            if exclude:
+                placeholders = ",".join("?" * len(exclude))
+                rows = self.db.query(
+                    f"""
+                    DELETE FROM leases
+                    WHERE expires_at_ms <= ?
+                      AND node_id NOT IN ({placeholders})
+                    RETURNING *
+                    """,
+                    (now, *exclude),
+                )
+            else:
+                rows = self.db.query(
+                    "DELETE FROM leases WHERE expires_at_ms <= ? RETURNING *",
+                    (now,),
+                )
+        elif exclude:
+            placeholders = ",".join("?" * len(exclude))
             rows = self.db.query(
-                "DELETE FROM leases WHERE expires_at_ms <= ? RETURNING *",
-                (now,),
+                f"""
+                DELETE FROM leases
+                WHERE expires_at_ms <= ? AND run_id = ?
+                  AND node_id NOT IN ({placeholders})
+                RETURNING *
+                """,
+                (now, run_id, *exclude),
             )
         else:
             rows = self.db.query(
@@ -789,16 +847,43 @@ class GraphStore:
         return [_row_to_lease(r) for r in rows]
 
     def find_lease_for(self, run_id: str, node_id: str) -> Lease | None:
+        """Return the *active* lease for (run_id, node_id), if any.
+
+        Expired rows are ignored so callers (patrol, lease grant conflict
+        reporting) do not treat a stale lease as a live worker.
+        """
         row = self.db.query_one(
-            "SELECT * FROM leases WHERE run_id = ? AND node_id = ?",
+            """
+            SELECT * FROM leases
+            WHERE run_id = ? AND node_id = ? AND expires_at_ms > ?
+            """,
+            (run_id, node_id, now_ms()),
+        )
+        return _row_to_lease(row) if row else None
+
+    def find_lease_row(self, run_id: str, node_id: str) -> Lease | None:
+        """Return any lease row for (run_id, node_id), including expired."""
+        row = self.db.query_one(
+            """
+            SELECT * FROM leases
+            WHERE run_id = ? AND node_id = ?
+            """,
             (run_id, node_id),
         )
         return _row_to_lease(row) if row else None
 
     def count_leases(self, run_id: str) -> int:
+        """Count *active* leases for a run (expired rows are ignored).
+
+        Matches ``find_lease_for`` so WAIT / in-flight decisions do not treat
+        stale lease rows (not yet reclaimed) as live workers.
+        """
         row = self.db.query_one(
-            "SELECT COUNT(*) AS n FROM leases WHERE run_id = ?",
-            (run_id,),
+            """
+            SELECT COUNT(*) AS n FROM leases
+            WHERE run_id = ? AND expires_at_ms > ?
+            """,
+            (run_id, now_ms()),
         )
         return int(row["n"]) if row else 0
 

@@ -18,6 +18,11 @@ class ToolRegistry:
     def get(self, name: str) -> BaseTool | None:
         return self._tools.get(name)
 
+    def names(self) -> tuple[str, ...]:
+        """Return the sealed registry surface without requiring a runtime context."""
+
+        return tuple(sorted(self._tools))
+
     def list_visible(self, ctx: ToolUseContext) -> list[BaseTool]:
         # The LLM-facing schema = enabled AND not hidden. ``is_enabled`` gates
         # both visibility and dispatch (a disabled tool is rejected at the
