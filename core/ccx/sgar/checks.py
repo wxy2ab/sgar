@@ -71,9 +71,12 @@ assumption.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shlex
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -147,6 +150,40 @@ def _hermetic_env() -> dict[str, str] | None:
     return env
 
 
+def _fingerprint_mapping(mapping: dict[str, str] | None) -> str:
+    """Stable short hash of an env mapping (or the literal ``inherit``)."""
+    if mapping is None:
+        return "inherit"
+    payload = json.dumps(dict(sorted(mapping.items())), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _checker_signature(command: str) -> str:
+    """Bind this check to interpreter + command text (not the workspace)."""
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    raw = f"{sys.executable}|{version}|{command}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _cwd_fingerprint(cwd: str | Path) -> str:
+    """Best-effort workspace identity: git HEAD when available, else cwd path."""
+    resolved = str(Path(cwd).resolve())
+    try:
+        proc = subprocess.run(
+            ["git", "-C", resolved, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        head = (proc.stdout or "").strip()
+        if proc.returncode == 0 and head:
+            return f"git:{head[:16]}"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "path:" + hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(slots=True)
 class CheckOutcome:
     """Result of running one criterion's machine check."""
@@ -158,6 +195,10 @@ class CheckOutcome:
     output_tail: str = ""
     timed_out: bool = False
     error: str | None = None  # spawn-time error (bad command, not found, …)
+    # Syndrome-binding metadata (optional; old consumers ignore these fields).
+    hermetic_env_fingerprint: str | None = None
+    checker_signature: str | None = None
+    cwd_fingerprint: str | None = None
 
     def evidence_line(self) -> str:
         """One-line (+ optional output tail) machine-evidence summary."""
@@ -169,9 +210,43 @@ class CheckOutcome:
             status = f"exit={self.returncode}"
         verdict = "PASS" if self.passed else "FAIL"
         head = f"machine check `{self.command}` -> {verdict} ({status})"
+        bind_parts = [
+            f"env={self.hermetic_env_fingerprint}" if self.hermetic_env_fingerprint else "",
+            f"checker={self.checker_signature}" if self.checker_signature else "",
+            f"cwd={self.cwd_fingerprint}" if self.cwd_fingerprint else "",
+        ]
+        bind = " ".join(part for part in bind_parts if part)
+        if bind:
+            head = f"{head} [{bind}]"
         if self.output_tail:
             return f"{head}\n{self.output_tail}"
         return head
+
+
+def _bind_outcome(
+    *,
+    criterion_id: str,
+    command: str,
+    passed: bool,
+    returncode: int | None,
+    output_tail: str = "",
+    timed_out: bool = False,
+    error: str | None = None,
+    cwd: str | Path,
+    hermetic_env: dict[str, str] | None,
+) -> CheckOutcome:
+    return CheckOutcome(
+        criterion_id=criterion_id,
+        command=command,
+        passed=passed,
+        returncode=returncode,
+        output_tail=output_tail,
+        timed_out=timed_out,
+        error=error,
+        hermetic_env_fingerprint=_fingerprint_mapping(hermetic_env),
+        checker_signature=_checker_signature(command),
+        cwd_fingerprint=_cwd_fingerprint(cwd),
+    )
 
 
 def check_unrunnable(outcome: CheckOutcome) -> bool:
@@ -239,23 +314,28 @@ def run_criterion_check(
         raise SgarError(
             f"criterion {criterion.criterion_id} has no machine check to run"
         )
+    hermetic_env = _hermetic_env()
     try:
         argv = shlex.split(command)
     except ValueError as exc:
-        return CheckOutcome(
+        return _bind_outcome(
             criterion_id=criterion.criterion_id,
             command=command,
             passed=False,
             returncode=None,
             error=f"could not parse check command: {exc}",
+            cwd=cwd,
+            hermetic_env=hermetic_env,
         )
     if not argv:
-        return CheckOutcome(
+        return _bind_outcome(
             criterion_id=criterion.criterion_id,
             command=command,
             passed=False,
             returncode=None,
             error="empty check command",
+            cwd=cwd,
+            hermetic_env=hermetic_env,
         )
     try:
         proc = subprocess.run(
@@ -264,33 +344,39 @@ def run_criterion_check(
             capture_output=True,
             text=True,
             timeout=timeout_s,
-            env=_hermetic_env(),
+            env=hermetic_env,
         )
     except subprocess.TimeoutExpired as exc:
         tail = _tail(_coerce_stream(exc.stdout) + _coerce_stream(exc.stderr))
-        return CheckOutcome(
+        return _bind_outcome(
             criterion_id=criterion.criterion_id,
             command=command,
             passed=False,
             returncode=None,
             output_tail=tail,
             timed_out=True,
+            cwd=cwd,
+            hermetic_env=hermetic_env,
         )
     except (OSError, ValueError) as exc:
-        return CheckOutcome(
+        return _bind_outcome(
             criterion_id=criterion.criterion_id,
             command=command,
             passed=False,
             returncode=None,
             error=str(exc),
+            cwd=cwd,
+            hermetic_env=hermetic_env,
         )
     tail = _tail(_coerce_stream(proc.stdout) + _coerce_stream(proc.stderr))
-    return CheckOutcome(
+    return _bind_outcome(
         criterion_id=criterion.criterion_id,
         command=command,
         passed=proc.returncode == 0,
         returncode=proc.returncode,
         output_tail=tail,
+        cwd=cwd,
+        hermetic_env=hermetic_env,
     )
 
 

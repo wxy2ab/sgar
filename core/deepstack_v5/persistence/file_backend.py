@@ -382,6 +382,33 @@ class InMemoryGraphStore:
             self._leases[lease_id] = new_lease
             return True
 
+    def renew_lease_for_node(
+        self,
+        run_id: str,
+        node_id: str,
+        expires_at_ms: int,
+        *,
+        worker_id: str,
+    ) -> bool:
+        with self._lock:
+            for lease_id, lease in list(self._leases.items()):
+                if (
+                    lease.run_id == run_id
+                    and lease.node_id == node_id
+                    and lease.worker_id == worker_id
+                ):
+                    self._leases[lease_id] = Lease(
+                        lease_id=lease.lease_id,
+                        run_id=lease.run_id,
+                        node_id=lease.node_id,
+                        worker_id=lease.worker_id,
+                        granted_at_ms=lease.granted_at_ms,
+                        expires_at_ms=expires_at_ms,
+                        heartbeat_at_ms=now_ms(),
+                    )
+                    return True
+            return False
+
     def release_lease(self, lease_id: str) -> bool:
         with self._lock:
             lease = self._leases.get(lease_id)
@@ -389,23 +416,52 @@ class InMemoryGraphStore:
                 return False
             return self._leases.pop(lease_id, None) is not None
 
+    def drop_lease_for_node(self, run_id: str, node_id: str) -> bool:
+        with self._lock:
+            for lease_id, lease in list(self._leases.items()):
+                if lease.run_id == run_id and lease.node_id == node_id:
+                    self._leases.pop(lease_id, None)
+                    return True
+            return False
+
     def find_expired(self, *, now: int) -> list[Lease]:
         with self._lock:
             return [l for l in self._leases.values() if l.expires_at_ms <= now]
 
     def reclaim_expired(
-        self, *, now: int, run_id: str | None = None
+        self,
+        *,
+        now: int,
+        run_id: str | None = None,
+        exclude_node_ids: tuple[str, ...] | list[str] | None = None,
     ) -> list[Lease]:
+        exclude = set(exclude_node_ids or ())
         with self._lock:
             expired = [
                 l for l in self._leases.values()
-                if l.expires_at_ms <= now and (run_id is None or l.run_id == run_id)
+                if l.expires_at_ms <= now
+                and (run_id is None or l.run_id == run_id)
+                and l.node_id not in exclude
             ]
             for lease in expired:
                 self._leases.pop(lease.lease_id, None)
             return expired
 
     def find_lease_for(self, run_id: str, node_id: str) -> Lease | None:
+        """Return the *active* lease for (run_id, node_id), if any."""
+        ts = now_ms()
+        with self._lock:
+            for lease in self._leases.values():
+                if (
+                    lease.run_id == run_id
+                    and lease.node_id == node_id
+                    and lease.expires_at_ms > ts
+                ):
+                    return lease
+            return None
+
+    def find_lease_row(self, run_id: str, node_id: str) -> Lease | None:
+        """Return any lease row for (run_id, node_id), including expired."""
         with self._lock:
             for lease in self._leases.values():
                 if lease.run_id == run_id and lease.node_id == node_id:
@@ -413,8 +469,14 @@ class InMemoryGraphStore:
             return None
 
     def count_leases(self, run_id: str) -> int:
+        """Count *active* leases for a run (expired rows are ignored)."""
+        ts = now_ms()
         with self._lock:
-            return sum(1 for lease in self._leases.values() if lease.run_id == run_id)
+            return sum(
+                1
+                for lease in self._leases.values()
+                if lease.run_id == run_id and lease.expires_at_ms > ts
+            )
 
 
 class InMemoryEventStore:

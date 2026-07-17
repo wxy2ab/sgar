@@ -353,6 +353,9 @@ def _run_coro_sync(coro: Any, *, timeout_seconds: float | None = None) -> Any:
     simple synchronous callers. ``timeout_seconds`` bounds the nested-loop
     thread join (``None`` waits indefinitely); callers derive it from the turn
     budget via ``_turn_join_timeout``.
+
+    On join timeout the nested-loop task is cancelled so the daemon thread does
+    not keep mutating session state after the caller has already failed.
     """
 
     try:
@@ -361,17 +364,42 @@ def _run_coro_sync(coro: Any, *, timeout_seconds: float | None = None) -> Any:
         return asyncio.run(coro)
 
     outcome: dict[str, Any] = {}
+    loop_holder: dict[str, Any] = {}
 
     def run_in_thread() -> None:
+        loop = asyncio.new_event_loop()
+        loop_holder["loop"] = loop
+        asyncio.set_event_loop(loop)
+        main_task = loop.create_task(coro)
+        loop_holder["task"] = main_task
         try:
-            outcome["result"] = asyncio.run(coro)
+            outcome["result"] = loop.run_until_complete(main_task)
         except BaseException as exc:
             outcome["error"] = exc
+        finally:
+            try:
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
+            loop.close()
+            asyncio.set_event_loop(None)
 
     thread = threading.Thread(target=run_in_thread, daemon=True)
     thread.start()
     thread.join(timeout=timeout_seconds)
     if thread.is_alive():
+        loop = loop_holder.get("loop")
+        task = loop_holder.get("task")
+        if loop is not None and task is not None and loop.is_running():
+            loop.call_soon_threadsafe(task.cancel)
+        # Brief grace so cancellation can unwind before we abandon the thread.
+        thread.join(timeout=2.0)
         raise RuntimeError(
             f"_run_coro_sync timed out after {timeout_seconds}s — possible deadlock in nested event loop"
         )

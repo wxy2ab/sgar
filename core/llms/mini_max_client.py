@@ -49,16 +49,65 @@ class MiniMaxClient(LLMApiClient):
         self._last_id = ""
         self.observed_backend_model = None
         self.request_timeout = (30, 600)
-        self.max_retries = 4
-        self.retry_backoff_base_seconds = 2
+        self.max_retries = self._config_positive_int(
+            config,
+            ("minimax_max_retries", "mini_max_client_max_retries"),
+            default=6,
+        )
+        self.retry_backoff_base_seconds = self._config_positive_int(
+            config,
+            ("minimax_retry_backoff_base_seconds", "mini_max_client_retry_backoff_base_seconds"),
+            default=3,
+        )
+        self.retry_backoff_cap_seconds = self._config_positive_int(
+            config,
+            ("minimax_retry_backoff_cap_seconds", "mini_max_client_retry_backoff_cap_seconds"),
+            default=90,
+        )
         self.session = requests.Session()
+
+    @staticmethod
+    def _config_positive_int(config: Config, keys: tuple[str, ...], *, default: int) -> int:
+        raw = config.get_with_fallback(keys, str(default))
+        try:
+            value = int(float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     def _is_retryable_exception(self, exc: Exception) -> bool:
         if isinstance(exc, (RequestsConnectionError, ProxyError, Timeout, ChunkedEncodingError)):
             return True
         if isinstance(exc, HTTPError) and exc.response is not None:
-            return exc.response.status_code in {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524}
+            return exc.response.status_code in {
+                408,
+                409,
+                425,
+                429,
+                500,
+                502,
+                503,
+                504,
+                520,
+                521,
+                522,
+                524,
+                525,
+                526,
+                527,
+                529,
+            }
         return False
+
+    def _retry_delay_seconds(self, attempt: int, response: requests.Response | None = None) -> int:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return max(1, min(self.retry_backoff_cap_seconds, int(float(retry_after))))
+                except (TypeError, ValueError):
+                    pass
+        return max(1, min(self.retry_backoff_cap_seconds, self.retry_backoff_base_seconds * (2 ** (attempt - 1))))
 
     def _request_with_retry(self, payload: Dict[str, Any], stream: bool) -> requests.Response:
         last_error: Exception | None = None
@@ -78,7 +127,8 @@ class MiniMaxClient(LLMApiClient):
                 last_error = exc
                 if not self._is_retryable_exception(exc) or attempt >= self.max_retries:
                     raise
-                delay_seconds = min(20, self.retry_backoff_base_seconds * (2 ** (attempt - 1)))
+                response = exc.response if isinstance(exc, HTTPError) else None
+                delay_seconds = self._retry_delay_seconds(attempt, response)
                 logger.warning(
                     f"MiniMax request failed (attempt={attempt}/{self.max_retries}, error_type={type(exc).__name__}), retrying in {delay_seconds}s: {exc}"
                 )
@@ -123,7 +173,7 @@ class MiniMaxClient(LLMApiClient):
 
                 if self._is_retryable_api_error(result) and attempt < self.max_retries:
                     msg = result.get("base_resp", {}).get("status_msg", "unknown")
-                    delay = min(20, self.retry_backoff_base_seconds * (2 ** (attempt - 1)))
+                    delay = self._retry_delay_seconds(attempt)
                     logger.warning(
                         "MiniMax API error (attempt=%d/%d): %s, retrying in %ds",
                         attempt, self.max_retries, msg, delay,
@@ -136,7 +186,8 @@ class MiniMaxClient(LLMApiClient):
                 last_error = exc
                 if attempt >= self.max_retries:
                     raise
-                delay = min(20, self.retry_backoff_base_seconds * (2 ** (attempt - 1)))
+                response = exc.response if isinstance(exc, HTTPError) else None
+                delay = self._retry_delay_seconds(attempt, response)
                 logger.warning(
                     "MiniMax request failed (attempt=%d/%d): %s, retrying in %ds",
                     attempt, self.max_retries, exc, delay,
@@ -270,7 +321,7 @@ class MiniMaxClient(LLMApiClient):
                 break
             if attempt >= self.max_retries:
                 raise Exception(f"MiniMax API returned invalid response after {self.max_retries} attempts: {str(response)[:200]}")
-            delay = min(20, self.retry_backoff_base_seconds * (2 ** (attempt - 1)))
+            delay = self._retry_delay_seconds(attempt)
             logger.warning("MiniMax tool_invoke got empty choices (attempt=%d/%d), retrying in %ds", attempt, self.max_retries, delay)
             time.sleep(delay)
 

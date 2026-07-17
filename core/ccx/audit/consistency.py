@@ -105,9 +105,9 @@ def assemble_ground_truth(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     The snapshot is the harness-produced machine truth (the same source
     ``_debug_advisories`` reads): ``goal_verdict`` (with ``passed`` and the
     per-criterion ``check_evidence`` list), the run ``status``, and the node
-    ``succeeded/failed/abandoned`` counts. ``check_evidence`` is snapshot-only
-    (it is not in the ``runtime.db`` tables), so the snapshot — not the DB — is
-    the authoritative source for kinds 1-2.
+    ``succeeded/failed/abandoned/skipped/cancelled`` counts. ``check_evidence``
+    is snapshot-only (it is not in the ``runtime.db`` tables), so the
+    snapshot — not the DB — is the authoritative source for kinds 1-2.
 
     Returns a flat dict the kind-specific re-checks consume:
     ``{passed, status, counts, check_evidence (by criterion_id), degraded}``.
@@ -126,14 +126,16 @@ def assemble_ground_truth(snapshot: dict[str, Any] | None) -> dict[str, Any]:
         "succeeded": int(snap.get("succeeded", 0) or 0),
         "failed": int(snap.get("failed", 0) or 0),
         "abandoned": int(snap.get("abandoned", 0) or 0),
+        # Match watch.degraded_completion / RunSpecResult.succeeded — older
+        # snapshots without these keys default to 0 (not degraded on them).
+        "skipped": int(snap.get("skipped", 0) or 0),
+        "cancelled": int(snap.get("cancelled", 0) or 0),
     }
     status = snap.get("status")
 
     from ..watch import degraded_completion  # light; reuse the kind-3 detector
 
-    degraded = degraded_completion(
-        status, {"abandoned": counts["abandoned"], "failed": counts["failed"]}
-    )
+    degraded = degraded_completion(status, counts)
     return {
         "passed": gv.get("passed"),
         "status": status,

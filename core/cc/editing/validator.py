@@ -4,7 +4,11 @@ import ast
 from pathlib import Path
 from typing import Iterable
 
-from ..command_runner import default_shell_kind, execute_command
+from ..command_runner import (
+    _result_unrunnable,
+    default_shell_kind,
+    execute_command,
+)
 from .requests import EditValidationResult, FileEditRequest
 
 
@@ -85,11 +89,14 @@ class EditValidator:
         )
         if not completed.success:
             messages = [msg for msg in [completed.stdout.strip(), completed.stderr.strip()] if msg]
+            # ED1009: harness/config defect (unrunnable) — not a semantic fail.
+            # ED1006: command ran and reported a real non-zero / business failure.
+            error_code = "ED1009" if _result_unrunnable(completed) else "ED1006"
             return EditValidationResult(
                 ok=False,
                 stage="runtime",
                 messages=messages or [f"Runtime command failed: {runtime_command}"],
-                error_code="ED1006",
+                error_code=error_code,
             )
         return EditValidationResult(
             ok=True,

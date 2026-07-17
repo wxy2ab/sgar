@@ -7,6 +7,28 @@ from ..tools.base import ToolResult
 from .prompt_catalog import PromptCatalog
 
 
+_CONTENT_DELIVERY_TOOLS = frozenset({
+    "file_read",
+    "grep",
+    "glob",
+    "story_edit_get_context",
+    "story_edit_read_authoritative_state",
+    "story_edit_read_working_file",
+    "story_edit_grep_working_set",
+    "story_edit_preview_diff",
+})
+
+
+def _follow_up_tool_content(result: ToolResult) -> str:
+    limit = 100_000 if result.tool_name in _CONTENT_DELIVERY_TOOLS else 1_000
+    if len(result.content) <= limit:
+        return result.content
+    return (
+        result.content[:limit]
+        + f"\n[truncated: showing {limit} of {len(result.content)} chars]"
+    )
+
+
 def implementation_followup_instruction(*, prompt_catalog: PromptCatalog, prompt_language: str) -> str:
     try:
         return prompt_catalog.resolve("system.implementation_followup", prompt_language)
@@ -60,7 +82,7 @@ def serialize_follow_up_prompt(
                 "tool_use_id": result.tool_use_id,
                 "tool_name": result.tool_name,
                 "success": result.success,
-                "content": result.content[:1000],
+                "content": _follow_up_tool_content(result),
                 "error_code": result.error_code,
                 "data_summary": summarize_tool_data(result.data),
             }

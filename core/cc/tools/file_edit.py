@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 from typing import Any
 
 from ..command_runner import default_shell_kind
@@ -96,9 +95,23 @@ class FileEditTool(BaseTool):
         result = await asyncio.to_thread(self.facade.apply_precise_edit, request)
         return self._to_tool_result(tool_call, result)
 
-    def build_patch_preview(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def build_patch_preview(
+        self,
+        arguments: dict[str, Any],
+        *,
+        cwd: str | None = None,
+        ctx: ToolUseContext | None = None,
+    ) -> dict[str, Any]:
+        """Build an edit preview using the same path resolution as ``execute``.
+
+        ``cwd`` / ``ctx.cwd`` is required so relative ``file_path`` values resolve
+        under the session workspace, not the Python process working directory.
+        """
+        session_cwd = cwd if cwd is not None else (ctx.cwd if ctx is not None else None)
+        if not session_cwd:
+            raise ValueError("cwd or ctx is required to resolve file_path for preview")
         request = FileEditRequest(
-            file_path=str(Path(arguments["file_path"]).resolve()),
+            file_path=str(resolve_under_cwd(arguments["file_path"], session_cwd)),
             old_string=str(arguments.get("old_string", "")),
             new_string=str(arguments.get("new_string", "")),
             replace_all=bool(arguments.get("replace_all", False)),

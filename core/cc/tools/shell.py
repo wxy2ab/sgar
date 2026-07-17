@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from .base import BaseTool, ToolCall, ToolResult, ToolSpec, ValidationResult
 from ..safety import classify_command_permission
+from ..safety.file_rules import resolve_under_cwd
 from ..command_runner import default_shell_kind, execute_command, execute_command_async
 from .context import ToolUseContext
 
@@ -68,7 +68,9 @@ class ShellTool(BaseTool):
         return ValidationResult(ok=True)
 
     def check_permissions(self, ctx: ToolUseContext, arguments: dict[str, Any]):
-        target_cwd = str(Path(arguments.get("cwd") or ctx.cwd).resolve())
+        # Relative cwd must resolve against the session workspace (ctx.cwd), not
+        # the Python process CWD — same contract as file_read/grep/file_edit.
+        target_cwd = str(resolve_under_cwd(arguments.get("cwd") or ctx.cwd, ctx.cwd))
         resolved_kind = _resolve_kind(arguments.get("kind"))
         return classify_command_permission(
             command=str(arguments["command"]),
@@ -81,7 +83,7 @@ class ShellTool(BaseTool):
         )
 
     async def execute(self, tool_call: ToolCall, ctx: ToolUseContext) -> ToolResult:
-        cwd = str(Path(tool_call.arguments.get("cwd") or ctx.cwd).resolve())
+        cwd = str(resolve_under_cwd(tool_call.arguments.get("cwd") or ctx.cwd, ctx.cwd))
         effective_timeout = int(tool_call.arguments.get("timeout_ms") or _DEFAULT_COMMAND_TIMEOUT_MS)
         resolved_kind = _resolve_kind(tool_call.arguments.get("kind"))
         shell = ctx.get_shell()

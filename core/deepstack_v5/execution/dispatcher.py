@@ -55,8 +55,9 @@ class DispatchResult:
     skip_reason: str = ""
     tokens_reported: int = 0
     cost_reported: float = 0.0
-    # Children added via SpawnResult during this dispatch. Caller (engine
-    # or harness) is responsible for persisting these new nodes.
+    # Children added via SpawnResult during this dispatch. Prefer persisting
+    # them via the ``on_spawned`` hook (before parent finish-persist); this
+    # field is still returned for idempotent re-persist by callers.
     spawned_node_ids: tuple[str, ...] = ()
 
 
@@ -84,8 +85,11 @@ class Dispatcher:
         on_node_started_with_lease: LeasePersistCallback | None = None,
         on_node_finished_with_lease: LeasePersistCallback | None = None,
         on_toolcall_started_with_lease: LeasePersistCallback | None = None,
+        on_spawned: Callable[[tuple[str, ...]], None] | None = None,
         budget_reporter: Callable[[int, float], None] | None = None,
         interaction_fn: Callable[[Any], Any] | None = None,
+        preempt_check: Callable[[str], bool] | None = None,
+        retain_lease_check: Callable[[str], bool] | None = None,
     ) -> None:
         self.run_id = run_id
         self.graph = graph
@@ -98,8 +102,19 @@ class Dispatcher:
         self._on_started_with_lease = on_node_started_with_lease
         self._on_finished_with_lease = on_node_finished_with_lease
         self._on_toolcall_started_with_lease = on_toolcall_started_with_lease
+        # Called after the parent is marked SUCCEEDED in memory and children
+        # are added to the graph, but BEFORE parent finish-persist. Callers
+        # must durable-write children here so a later persist_under_lease
+        # failure cannot drop the spawned DAG (especially WorkerHarness's
+        # per-tick ephemeral WorkGraph). Parent memory-SUCCEEDED first so a
+        # spawn-persist error cannot look like an incomplete tool run.
+        self._on_spawned = on_spawned
         self._budget_reporter = budget_reporter
         self._interaction_fn = interaction_fn
+        self._preempt_check = preempt_check
+        # When true at exit, skip release so the engine parking/drain path
+        # keeps the fence until the orphan entry is reaped.
+        self._retain_lease_check = retain_lease_check
 
     def dispatch_one(
         self,
@@ -122,6 +137,13 @@ class Dispatcher:
                 skipped=True,
                 skip_reason=f"not READY (was {node.state.value})",
             )
+        if self._preempt_check is not None and self._preempt_check(node_id):
+            return DispatchResult(
+                node_id=node_id,
+                final_state=node.state,
+                skipped=True,
+                skip_reason="budget preempted before dispatch",
+            )
 
         if pre_leased_id is not None:
             lease_id = pre_leased_id
@@ -136,6 +158,21 @@ class Dispatcher:
                 )
             lease_id = lease_result.lease.lease_id
 
+        # Re-check after lease: engine may have preempted during the grant.
+        if self._preempt_check is not None and self._preempt_check(node_id):
+            # Budget soft-defer parks the lease; do not drop the fence here.
+            if not (
+                self._retain_lease_check is not None
+                and self._retain_lease_check(node_id)
+            ):
+                self.assignment.release(lease_id)
+            return DispatchResult(
+                node_id=node_id,
+                final_state=node.state,
+                skipped=True,
+                skip_reason="budget preempted after lease",
+            )
+
         stop_hb = threading.Event()
         hb_thread = self._start_heartbeat(lease_id, stop_hb)
         try:
@@ -143,7 +180,18 @@ class Dispatcher:
         finally:
             stop_hb.set()
             hb_thread.join(timeout=2.0)
-            self.assignment.release(lease_id)
+            # Soft-deferred budget orphans must keep the parking lease until
+            # EngineV5 drains the orphan entry; releasing here opens a
+            # READY/no-lease window for WorkerHarness.
+            # Do not ``return`` here: a finally return would swallow exceptions
+            # from ``_execute`` (e.g. persist failures) and replace a normal
+            # DispatchResult with None.
+            retain = (
+                self._retain_lease_check is not None
+                and self._retain_lease_check(node_id)
+            )
+            if not retain:
+                self.assignment.release(lease_id)
 
     # -- internal ------------------------------------------------------------
 
@@ -199,12 +247,61 @@ class Dispatcher:
         return t
 
     def _execute(self, node: NodeExecution, lease_id: str) -> DispatchResult:
-        node.transition(NodeState.RUNNING, reason="dispatched")
-        attempt = node.new_attempt(worker_id=self.worker_id)
+        # Budget halt may soft-preempt after lease grant but before
+        # READY→RUNNING. Hold the node lock across the preempt check and
+        # transition so we cannot race `_defer_for_budget_halt` (which marks
+        # preempted while state is still READY and returns early).
+        with node._lock:
+            if (
+                self._preempt_check is not None
+                and self._preempt_check(node.node_id)
+            ):
+                return DispatchResult(
+                    node_id=node.node_id,
+                    final_state=node.state,
+                    skipped=True,
+                    skip_reason="budget preempted before running",
+                )
+            if node.state != NodeState.READY:
+                return DispatchResult(
+                    node_id=node.node_id,
+                    final_state=node.state,
+                    skipped=True,
+                    skip_reason=f"not READY before running (was {node.state.value})",
+                )
+            node.transition(NodeState.RUNNING, reason="dispatched")
+            attempt = node.new_attempt(worker_id=self.worker_id)
         if self._on_started_with_lease:
             self._on_started_with_lease(node, lease_id)
         elif self._on_started:
             self._on_started(node)
+        # Soft-defer may flip memory to READY and persist READY while this
+        # thread still holds the lease and just wrote RUNNING above. Re-check
+        # under the node lock and rewrite durable state to memory truth so a
+        # lease-fenced RUNNING row cannot clobber the deferred READY fence.
+        with node._lock:
+            preempted = (
+                self._preempt_check is not None
+                and self._preempt_check(node.node_id)
+            )
+            state = node.state
+        if state != NodeState.RUNNING or preempted:
+            if state != NodeState.RUNNING:
+                if self._on_started_with_lease is not None:
+                    self._on_started_with_lease(node, lease_id)
+                elif self._on_started is not None:
+                    self._on_started(node)
+            return DispatchResult(
+                node_id=node.node_id,
+                final_state=state,
+                attempt_id=attempt.attempt_id,
+                skipped=True,
+                skip_reason=(
+                    "budget preempted after start persist"
+                    if preempted
+                    else f"state changed after start (was {state.value})"
+                ),
+            )
         self._emit("node.running", {
             "run_id": self.run_id, "node_id": node.node_id,
             "attempt_id": attempt.attempt_id, "worker_id": self.worker_id,
@@ -391,6 +488,49 @@ class Dispatcher:
                 cost_reported=cost_reported,
             )
 
+        # Engine may have soft-deferred this node (budget halt restored READY,
+        # optionally keeping a parking lease) while the tool was still running.
+        # Do not claim SUCCEEDED over a soft-deferred node — that would strand
+        # READY with a success attempt and risk double-dispatch of
+        # non-idempotent tools.
+        if node.state != NodeState.RUNNING:
+            return DispatchResult(
+                node_id=node.node_id,
+                final_state=node.state,
+                attempt_id=attempt.attempt_id,
+                skipped=True,
+                skip_reason=(
+                    f"preempted while tool running (was {node.state.value})"
+                ),
+                tokens_reported=tokens_reported,
+                cost_reported=cost_reported,
+            )
+        live = self.assignment.find_for(self.run_id, node.node_id)
+        if live is None or live.lease_id != lease_id:
+            return DispatchResult(
+                node_id=node.node_id,
+                final_state=node.state,
+                attempt_id=attempt.attempt_id,
+                skipped=True,
+                skip_reason="lease released under worker",
+                tokens_reported=tokens_reported,
+                cost_reported=cost_reported,
+            )
+        if self._preempt_check is not None and self._preempt_check(node.node_id):
+            return DispatchResult(
+                node_id=node.node_id,
+                final_state=node.state,
+                attempt_id=attempt.attempt_id,
+                skipped=True,
+                skip_reason="budget preempted before succeed",
+                tokens_reported=tokens_reported,
+                cost_reported=cost_reported,
+            )
+
+        # Mark SUCCEEDED in memory BEFORE durable spawn/finish persist.
+        # Tool side effects already happened; if on_spawned / finish-persist
+        # then raises, callers must treat this as a persistence miss on a
+        # completed node — not a crash that re-runs the tool.
         tc.mark_completed(outcome)
         node.finish_attempt(outcome="success", result=outcome)
         node.transition(NodeState.SUCCEEDED, reason="tool returned")
@@ -399,6 +539,13 @@ class Dispatcher:
             "attempt_id": attempt.attempt_id,
             "spawned": list(spawned_ids),
         })
+        # Durable-write children BEFORE parent finish-persist. If
+        # on_node_finished_with_lease raises (_PersistDbError / fence),
+        # dispatch_one never returns a DispatchResult carrying
+        # spawned_node_ids — harness ephemeral graphs would otherwise
+        # drop the children when the tick ends.
+        if spawned_ids and self._on_spawned is not None:
+            self._on_spawned(spawned_ids)
         if self._on_finished_with_lease:
             self._on_finished_with_lease(node, lease_id)
         elif self._on_finished:
@@ -509,6 +656,35 @@ class Dispatcher:
                 tokens_reported=tokens_reported,
                 cost_reported=cost_reported,
             )
+        if node.state not in (
+            NodeState.RUNNING,
+            NodeState.APPROVAL_HANG,
+        ):
+            return DispatchResult(
+                node_id=node.node_id,
+                final_state=node.state,
+                attempt_id=attempt.attempt_id,
+                failure=failure,
+                skipped=True,
+                skip_reason=(
+                    f"preempted while failing (was {node.state.value})"
+                ),
+                tokens_reported=tokens_reported,
+                cost_reported=cost_reported,
+            )
+        if lease_id is not None:
+            live = self.assignment.find_for(self.run_id, node.node_id)
+            if live is None or live.lease_id != lease_id:
+                return DispatchResult(
+                    node_id=node.node_id,
+                    final_state=node.state,
+                    attempt_id=attempt.attempt_id,
+                    failure=failure,
+                    skipped=True,
+                    skip_reason="lease released under worker",
+                    tokens_reported=tokens_reported,
+                    cost_reported=cost_reported,
+                )
         node.finish_attempt(outcome="failure", failure=failure)
         target = NodeState.FAILED
         if node.state == NodeState.APPROVAL_HANG:

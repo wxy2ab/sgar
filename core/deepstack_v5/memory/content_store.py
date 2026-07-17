@@ -763,6 +763,9 @@ class ContentStore:
             try:
                 chunks = chunk_markdown(req.body)
                 if not chunks:
+                    # Match sync ``index()``: empty/whitespace upsert must
+                    # clear stale FTS rows for this source_id (defect 8).
+                    self._delete_source(req.source_id)
                     continue
                 self._write_chunks(
                     run_id=req.run_id,

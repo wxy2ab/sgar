@@ -56,13 +56,19 @@ class _CommandInvocation:
 
 
 def _powershell_script(command: str) -> str:
-    # -EncodedCommand removes the host shell/CRT quoting layer.  The preamble
-    # makes redirected output deterministic on both pwsh and Windows PowerShell
-    # 5.1; the trailer propagates native-command and cmdlet failures.
+    # -EncodedCommand removes the host shell/CRT quoting layer. The user
+    # command is carried as opaque UTF-8 base64 so an unbalanced `}` (or a
+    # `<#` comment) cannot close/comment-out the wrapper and skip the exit
+    # trailer. ScriptBlock::Create parses the payload in isolation.
+    # Preamble: deterministic UTF-8 redirected output on pwsh and Windows
+    # PowerShell 5.1. Trailer: propagate native-command and cmdlet failures.
+    payload = base64.b64encode(command.encode("utf-8")).decode("ascii")
     return (
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
         "$OutputEncoding = [Console]::OutputEncoding; "
-        f"& {{ {command} }}; "
+        f"$__cc_cmd = [System.Text.Encoding]::UTF8.GetString("
+        f"[System.Convert]::FromBase64String('{payload}')); "
+        "& ([ScriptBlock]::Create($__cc_cmd)); "
         "$__cc_success = $?; $__cc_native_exit = $LASTEXITCODE; "
         "if ($null -ne $__cc_native_exit) { exit $__cc_native_exit }; "
         "if (-not $__cc_success) { exit 1 }"

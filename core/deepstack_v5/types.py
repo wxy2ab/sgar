@@ -60,6 +60,9 @@ LEGAL_NODE_TRANSITIONS: dict[NodeState, frozenset[NodeState]] = {
     NodeState.RUNNING: frozenset({
         NodeState.SUCCEEDED, NodeState.FAILED, NodeState.BLOCKED,
         NodeState.APPROVAL_HANG, NodeState.TIMER_HANG, NodeState.CANCELLED,
+        # Soft preempt (parallel budget halt): release back to READY without
+        # burning a FAILED attempt slot; orphan workers must not claim SUCCEEDED.
+        NodeState.READY,
     }),
     NodeState.FAILED: frozenset({
         NodeState.READY, NodeState.ABANDONED, NodeState.CANCELLED,
@@ -288,14 +291,18 @@ class Budget:
             return None
         return max(0.0, self.max_cost - self.consumed_cost)
 
-    def is_exhausted(self) -> bool:
+    def is_exhausted(self, *, ignore_iterations: bool = False) -> bool:
         if self.max_tokens is not None and self.consumed_tokens >= self.max_tokens:
             return True
         if self.max_cost is not None and self.consumed_cost >= self.max_cost:
             return True
         if self.max_wallclock_s is not None and self.elapsed_s >= self.max_wallclock_s:
             return True
-        if self.max_iterations is not None and self.iterations >= self.max_iterations:
+        if (
+            not ignore_iterations
+            and self.max_iterations is not None
+            and self.iterations >= self.max_iterations
+        ):
             return True
         return False
 

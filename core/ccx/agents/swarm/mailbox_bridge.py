@@ -91,7 +91,14 @@ class MailboxBridge:
                 "MailboxBridge: no mapping for event kind %r; dropping", kind,
             )
             return None
-        payload = event.get("payload") or {}
+        payload = dict(event.get("payload") or {})
+        # Stamp the bus-level run_id onto the envelope payload when absent.
+        # ``node.succeeded`` already carries it; ``node.completed`` does not.
+        # Downstream collectors (e.g. TeamRuntime.collect_worker_results) key
+        # on (to_runtime_id, run_id) so one worker's successive assign_task
+        # runs are not collapsed together.
+        if "run_id" not in payload and event.get("run_id") is not None:
+            payload["run_id"] = event.get("run_id")
         runtime_id = (
             payload.get("node_id")
             or payload.get("runtime_id")
@@ -110,7 +117,7 @@ class MailboxBridge:
             from_runtime_id=self.coordinator_runtime_id,
             to_runtime_id=str(runtime_id),
             message_type=message_type,
-            payload=dict(payload),
+            payload=payload,
         )
         with self._lock:
             if dedup_key is not None:
