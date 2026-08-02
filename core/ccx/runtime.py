@@ -34,6 +34,7 @@ from core.deepstack_v5 import (
 
 from .agents.metadata_inheritance import (
     SPAWN_DEPTH_METADATA_KEY,
+    apply_constraint_ceiling,
     coerce_spawn_depth,
 )
 from .agents.subagent import (
@@ -690,6 +691,34 @@ def _make_mode_tool(
                 sub.metadata.setdefault(
                     SPAWN_DEPTH_METADATA_KEY, inherited_depth,
                 )
+        # Constraint ceilings (write/read scope + invariants): mode runners
+        # often rebuild child metadata from scratch, which would drop a
+        # plan-declared footprint / invariant set at the plan→spec hop.
+        # Clamp here — child may narrow, never widen / drop parent invariants.
+        if result.subtasks:
+            clamped: list[SubagentInvocation] = []
+            changed = False
+            for sub in result.subtasks:
+                new_meta, new_goal = apply_constraint_ceiling(
+                    meta_dict, dict(sub.metadata or {}), goal=sub.goal,
+                )
+                if new_meta != dict(sub.metadata or {}) or (
+                    new_goal is not None and new_goal != sub.goal
+                ):
+                    changed = True
+                    clamped.append(SubagentInvocation(
+                        goal=new_goal if new_goal is not None else sub.goal,
+                        mode=sub.mode,
+                        metadata=new_meta,
+                        requires_approval=sub.requires_approval,
+                        max_attempts=sub.max_attempts,
+                        timeout_s=sub.timeout_s,
+                        preferred_model=sub.preferred_model,
+                    ))
+                else:
+                    clamped.append(sub)
+            if changed:
+                result = dataclasses.replace(result, subtasks=clamped)
         # Children to spawn.
         return to_spawn_result(
             result,

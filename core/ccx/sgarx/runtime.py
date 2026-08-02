@@ -25,6 +25,12 @@ during an active stage whose spec lists that criterion, sgarx upserts
 an *auto-pending* record into ``verification.json`` (passed=False with
 ``auto_pending: true`` + the source mission id). Close-stage will reject
 it until a human/agent runs the explicit ``verify --pass`` to overwrite.
+
+Stage E: stage-internal Multi-Candidate Frontier ops (propose → audit →
+patch/select → promote). ``start_stage`` ensures ``frontier.json``;
+``close_stage`` requires a promoted candidate when a frontier exists
+(grandfather: missing frontier file → no extra gate). ProjectMode FSM
+stays linear; the tree lives only inside one stage.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from ..sgar.models import (
     ProjectMode,
@@ -46,6 +53,8 @@ from ..sgar.runtime import ALLOWED_TRANSITIONS, SgarRuntime
 from ..sgar.store import utc_now
 from ..sgar.tracing import SgarTracer
 from ..sgar.validation import parse_exit_criteria
+from .candidates.models import AuditRecord, CandidateRecord, FrontierState
+from .candidates.ops import CandidateOps
 from .store import SgarxStore
 
 
@@ -102,6 +111,317 @@ class SgarxRuntime(SgarRuntime):
                 f"invalid SGARX transition: {state.mode} -> {new_mode}"
             )
         state.mode = new_mode
+
+    @property
+    def candidate_ops(self) -> CandidateOps:
+        return CandidateOps(self.store)
+
+    # ------------------------------------------------------------------ #
+    # Stage E: candidate frontier
+    # ------------------------------------------------------------------ #
+
+    def start_stage(self, stage_id: str) -> ProjectState:
+        state = super().start_stage(stage_id)
+        self.ensure_frontier(stage_id)
+        return state
+
+    def close_stage(self, stage_id: str) -> ProjectState:
+        self.candidate_ops.assert_close_frontier_gate(stage_id)
+        return super().close_stage(stage_id)
+
+    def status(self) -> str:
+        base = super().status()
+        state = self.store.load_state()
+        stage_id = state.current_stage_id
+        if not stage_id:
+            return base
+        frontier_path = self.store.frontier_path(stage_id)
+        if not frontier_path.is_file():
+            return base
+        frontier = self.list_frontier(stage_id)
+        candidates = self.list_candidates(stage_id)
+        promoted = frontier.promoted_candidate_id or "-"
+        block = "\n".join([
+            f"Frontier ({stage_id}):",
+            f"  policy: {frontier.policy}",
+            f"  active: {len(frontier.active_candidate_ids)}",
+            f"  promoted: {promoted}",
+            f"  budgets: candidates {len(candidates)}/{frontier.max_candidates}, "
+            f"audits {frontier.audit_count}/{frontier.max_audits}, "
+            f"patches {frontier.patch_count}/{frontier.max_patches}",
+        ])
+        return f"{base}\n{block}"
+
+    def ensure_frontier(self, stage_id: str) -> FrontierState:
+        with self.tracer.operation(
+            "ensure_frontier",
+            inputs={"stage_id": stage_id},
+        ) as trace:
+            frontier = self.candidate_ops.ensure_frontier(stage_id)
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+            )
+            return frontier
+
+    def propose_candidate(
+        self,
+        stage_id: str,
+        *,
+        candidate_id: str,
+        summary: str,
+        artifact_paths: list[str] | None = None,
+        candidate_hash: str | None = None,
+        git_head: str | None = None,
+        origin: str = "propose",
+        extras: dict[str, Any] | None = None,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "propose_candidate",
+            inputs={
+                "stage_id": stage_id,
+                "candidate_id": candidate_id,
+                "origin": origin,
+            },
+        ) as trace:
+            record = self.candidate_ops.propose_candidate(
+                stage_id,
+                candidate_id=candidate_id,
+                summary=summary,
+                artifact_paths=artifact_paths,
+                candidate_hash=candidate_hash,
+                git_head=git_head,
+                origin=origin,
+                extras=extras,
+            )
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+            )
+            return record
+
+    def audit_candidate(
+        self,
+        stage_id: str,
+        candidate_id: str,
+        *,
+        passed: bool = False,
+        findings: list[str] | None = None,
+        method: str = "criterion_checks",
+        evidence_paths: list[str] | None = None,
+        raw_ref: str | None = None,
+        bound_candidate_hash: str | None = None,
+        audit: AuditRecord | None = None,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "audit_candidate",
+            inputs={
+                "stage_id": stage_id,
+                "candidate_id": candidate_id,
+                "passed": passed if audit is None else audit.passed,
+            },
+        ) as trace:
+            record = self.candidate_ops.audit_candidate(
+                stage_id,
+                candidate_id,
+                passed=passed,
+                findings=findings,
+                method=method,
+                evidence_paths=evidence_paths,
+                raw_ref=raw_ref,
+                bound_candidate_hash=bound_candidate_hash,
+                audit=audit,
+            )
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+                (
+                    "candidate_audit",
+                    self.store.candidate_dir(stage_id, candidate_id) / "audit.json",
+                ),
+            )
+            return record
+
+    def audit_candidate_from_checks(
+        self,
+        stage_id: str,
+        candidate_id: str,
+        *,
+        timeout_s: float | None = None,
+        changed_paths: list[str] | None = None,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "audit_candidate_from_checks",
+            inputs={"stage_id": stage_id, "candidate_id": candidate_id},
+        ) as trace:
+            record = self.candidate_ops.audit_candidate_from_checks(
+                stage_id,
+                candidate_id,
+                timeout_s=(
+                    float(timeout_s)
+                    if timeout_s is not None
+                    else float(self.criterion_check_timeout_s)
+                ),
+                changed_paths=changed_paths,
+            )
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+                (
+                    "candidate_audit",
+                    self.store.candidate_dir(stage_id, candidate_id) / "audit.json",
+                ),
+            )
+            return record
+
+    def promote_candidate(
+        self,
+        stage_id: str,
+        candidate_id: str,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "promote_candidate",
+            inputs={"stage_id": stage_id, "candidate_id": candidate_id},
+        ) as trace:
+            record = self.candidate_ops.promote_candidate(stage_id, candidate_id)
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+            )
+            return record
+
+    def patch_candidate(
+        self,
+        stage_id: str,
+        *,
+        parent_id: str,
+        candidate_id: str,
+        summary: str,
+        artifact_paths: list[str] | None = None,
+        candidate_hash: str | None = None,
+        git_head: str | None = None,
+        extras: dict[str, Any] | None = None,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "patch_candidate",
+            inputs={
+                "stage_id": stage_id,
+                "parent_id": parent_id,
+                "candidate_id": candidate_id,
+            },
+        ) as trace:
+            record = self.candidate_ops.patch_candidate(
+                stage_id,
+                parent_id=parent_id,
+                candidate_id=candidate_id,
+                summary=summary,
+                artifact_paths=artifact_paths,
+                candidate_hash=candidate_hash,
+                git_head=git_head,
+                extras=extras,
+            )
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+            )
+            return record
+
+    def discard_candidate(
+        self,
+        stage_id: str,
+        candidate_id: str,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "discard_candidate",
+            inputs={"stage_id": stage_id, "candidate_id": candidate_id},
+        ) as trace:
+            record = self.candidate_ops.discard_candidate(stage_id, candidate_id)
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+            )
+            return record
+
+    def force_discard_candidate(
+        self,
+        stage_id: str,
+        candidate_id: str,
+    ) -> CandidateRecord:
+        """Autobuild recovery: discard even a promoted node after hash drift."""
+        with self.tracer.operation(
+            "force_discard_candidate",
+            inputs={"stage_id": stage_id, "candidate_id": candidate_id},
+        ) as trace:
+            record = self.candidate_ops.force_discard_candidate(
+                stage_id, candidate_id
+            )
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+            )
+            return record
+
+    def list_frontier(self, stage_id: str) -> FrontierState:
+        return self.candidate_ops.list_frontier(stage_id)
+
+    def get_candidate(self, stage_id: str, candidate_id: str) -> CandidateRecord:
+        return self.candidate_ops.get_candidate(stage_id, candidate_id)
+
+    def list_candidates(self, stage_id: str) -> list[CandidateRecord]:
+        return self.candidate_ops.list_candidates(stage_id)
+
+    def import_candidate_from_mission(
+        self,
+        stage_id: str,
+        *,
+        mission_id: str,
+        candidate_id: str,
+        summary: str | None = None,
+        artifact_paths: list[str] | None = None,
+    ) -> CandidateRecord:
+        with self.tracer.operation(
+            "import_candidate_from_mission",
+            inputs={
+                "stage_id": stage_id,
+                "mission_id": mission_id,
+                "candidate_id": candidate_id,
+            },
+        ) as trace:
+            record = self.candidate_ops.import_candidate_from_mission(
+                stage_id,
+                mission_id=mission_id,
+                candidate_id=candidate_id,
+                summary=summary,
+                artifact_paths=artifact_paths,
+            )
+            trace["artifacts"] = self._artifacts(
+                ("frontier", self.store.frontier_path(stage_id)),
+                (
+                    "candidate_meta",
+                    self.store.candidate_dir(stage_id, candidate_id) / "meta.json",
+                ),
+            )
+            return record
 
     # ------------------------------------------------------------------ #
     # Stage B: reopen / abandon
@@ -382,10 +702,10 @@ class SgarxRuntime(SgarRuntime):
                 )
             return manifest
 
+        # Upsert auto-pending BEFORE marking the mission completed: if CAS /
+        # abandon guards raise, the mission stays active and can be retried.
+        # (Completing first left "already completed" + missing pending.)
         verification_path = self.store.verification_json_path(stage_id)
-        if verification_path.exists():
-            self.store.read_json(verification_path)
-        manifest = super().complete_mission(mission_id, result_path=result_path)
         with self.tracer.operation(
             "mission_pending_verification",
             inputs=trace_inputs,
@@ -395,6 +715,7 @@ class SgarxRuntime(SgarRuntime):
                 criterion_id=target,
                 mission_id=mission_id,
             )
+            manifest = super().complete_mission(mission_id, result_path=result_path)
             trace["artifacts"] = self._artifacts(
                 ("verification_json", verification_path),
                 ("mission_manifest", manifest_path),
@@ -414,13 +735,15 @@ class SgarxRuntime(SgarRuntime):
         it apart from a real failure. Returns None — verification.json is
         rewritten in place; nothing is archived.
 
+        Called by ``complete_mission`` *before* marking the mission completed,
+        so a failed upsert leaves the mission ``active`` and retryable.
+
         Single-writer contract (see core/ccx/docs/supervised/
         sgarx_concurrency_2026-06-24.md): this is the lock-free read-modify-write
         that, under *emergent* concurrency (two sibling sgarx nodes on one
         cwd+session), could silently lose a co-racer's update (P1) or resurrect
-        a record for an abandoned stage (P5), with the loser's trace lying
-        ``completed``. The write below is therefore guarded so the loser is
-        *loud and honest* instead of silent:
+        a record for an abandoned stage (P5). The write below is therefore
+        guarded so the loser is *loud and honest* instead of silent:
           - CAS on the verification.json generation captured before the read →
             a concurrent ``complete_mission`` that wrote it first is detected
             (P1); we abort with SgarError rather than clobber its record.
@@ -428,10 +751,10 @@ class SgarxRuntime(SgarRuntime):
             ``abandon``/transition that revoked the stage is detected (P5); we
             refuse to write an orphan auto-pending record.
         Both raise SgarError, which ``complete_mission``'s tracer records as a
-        FAILED ``mission_pending_verification`` (no completed+artifact lie) and
-        the dispatch catches. On the single-writer path the token matches and
-        the stage stays current, so this is byte-for-byte equivalent to the
-        old unguarded ``write_json``."""
+        FAILED ``mission_pending_verification`` (mission not yet completed;
+        no completed+artifact lie) and the dispatch catches. On the
+        single-writer path the token matches and the stage stays current, so
+        this is byte-for-byte equivalent to the old unguarded ``write_json``."""
         path = self.store.verification_json_path(stage_id)
         # Capture the generation BEFORE the read so the guarded write can tell
         # a concurrent writer apart from our own no-op. None == absent at read.

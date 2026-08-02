@@ -55,15 +55,22 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
+from ..agents.patch_first import append_patch_first_hint, install_patch_first_guard
+from ..agents.progress import EverPassedTracker, monotone_progress_enabled, observe_progress
 from ..agents.read_only_runner import restrict_tool_registry
 from ..agents.subagent import (
     ModeRunner,
     SubagentInvocation,
     SubagentResult,
+)
+from ..agents.write_scope_guard import (
+    FIX_SCOPE_VIOLATION,
+    WriteScopeGuard,
+    install_write_scope_guard,
+    path_matches_any_glob,
 )
 from .llm_client import LLMCallable, text_of
 from .parsing import parse_llm_json
@@ -71,6 +78,7 @@ from .prompts import PromptLoadError, load_mode_prompts
 from .watch_checks import (
     CheckResult,
     ObservationDigest,
+    plan_check_ids,
     run_verification_plan,
     supported_kinds,
     validate_check,
@@ -550,46 +558,8 @@ def _coerce_fix_scope(raw: Any) -> list[str]:
 
 
 def _path_matches_any_glob(path: str, globs: list[str], cwd: str) -> bool:
-    """Match ``path`` against the fix_scope globs. The LLM may give
-    either repo-relative paths (``src/foo/bar.py``) or absolute
-    paths; we normalize before matching. Empty ``globs`` → never
-    matches (= no permission to edit anything).
-
-    Matching happens on the NORMALIZED path (``..`` collapsed) — never
-    on the raw string. fnmatch's ``**`` happily matches ``../../..``,
-    so a raw match would let ``scope/**/*.py`` approve
-    ``scope/../../outside.py`` while the downstream file tool resolves
-    the traversal and writes outside the scope. Paths that escape
-    ``cwd`` are rejected outright."""
-    if not globs:
-        return False
-    p = Path(path)
-    candidates: set[str] = set()
-    if cwd:
-        cwd_norm = Path(os.path.normpath(str(Path(cwd))))
-        absolute = p if p.is_absolute() else cwd_norm / p
-        norm = Path(os.path.normpath(str(absolute)))
-        try:
-            rel = norm.relative_to(cwd_norm)
-        except ValueError:
-            # Normalized path escapes the workspace — never in scope.
-            return False
-        candidates.add(str(rel))
-        candidates.add(rel.as_posix())
-        candidates.add(str(norm))
-        candidates.add(norm.as_posix())
-    else:
-        norm = Path(os.path.normpath(str(p)))
-        if ".." in norm.parts:
-            # Cannot anchor a traversal without a cwd — reject.
-            return False
-        candidates.add(str(norm))
-        candidates.add(norm.as_posix())
-    for cand in candidates:
-        for glob in globs:
-            if fnmatch(cand, glob):
-                return True
-    return False
+    """Watch-facing alias of :func:`path_matches_any_glob`."""
+    return path_matches_any_glob(path, globs, cwd)
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -967,91 +937,44 @@ def _detect_files_touched(cwd: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Fix-scope guard tool wrapper
+# Fix-scope guard tool wrapper (shared WriteScopeGuard + watch aliases)
 # --------------------------------------------------------------------------- #
 
-class _FixScopeGuard:
-    """Composable guard that wraps a cc tool's ``execute`` method.
+class _FixScopeGuard(WriteScopeGuard):
+    """Watch-facing alias of :class:`WriteScopeGuard`.
 
-    The wrapper looks at ``arguments["file_path"]`` and rejects the
-    call with ``success=False, error_code=FIX_SCOPE_VIOLATION`` when
-    the path doesn't match any glob in ``fix_scope``. Otherwise it
-    forwards to the underlying tool's ``execute`` unchanged.
-
-    Implemented as a wrapper *instance* (not a subclass) so we don't
-    have to know the exact concrete tool class shape — we replace
-    the cc ``BaseTool`` in the registry's ``_tools`` dict with this
-    object, which forwards every other attribute back through
-    ``__getattr__``. The orchestrator only depends on duck-typed
-    ``spec`` / ``execute`` / ``is_concurrency_safe`` / ``validate_input``
-    / ``check_permissions``, all of which keep working.
+    Accepts the historical ``fix_scope=`` kwarg and emits
+    ``FIX_SCOPE_VIOLATION`` so existing tests / prompts stay stable.
     """
 
     def __init__(
         self,
         wrapped: Any,
         *,
-        fix_scope: list[str],
-        cwd: str,
+        fix_scope: list[str] | None = None,
+        cwd: str = "",
+        write_scope: list[str] | None = None,
+        error_code: str = FIX_SCOPE_VIOLATION,
+        scope_label: str = "fix_scope",
     ) -> None:
-        self._wrapped = wrapped
-        self._fix_scope = list(fix_scope)
-        self._cwd = cwd
+        scope = list(
+            fix_scope if fix_scope is not None else (write_scope or [])
+        )
+        super().__init__(
+            wrapped,
+            write_scope=scope,
+            cwd=cwd,
+            error_code=error_code,
+            scope_label=scope_label,
+        )
 
-    # cc duck-typed attributes — delegate everything except execute.
     @property
-    def spec(self) -> Any:
-        return self._wrapped.spec
+    def _fix_scope(self) -> list[str]:
+        return self._write_scope
 
-    def is_enabled(self, ctx: Any) -> bool:
-        return self._wrapped.is_enabled(ctx)
-
-    def is_concurrency_safe(self, arguments: dict[str, Any]) -> bool:
-        # Mutating tools are not concurrency-safe; the wrapped tool
-        # already reports False, but we mirror that explicitly so
-        # behavior is obvious from this class.
-        return False
-
-    def validate_input(self, arguments: dict[str, Any]) -> Any:
-        return self._wrapped.validate_input(arguments)
-
-    def check_permissions(self, ctx: Any, arguments: dict[str, Any]) -> Any:
-        return self._wrapped.check_permissions(ctx, arguments)
-
-    def to_model_schema(self) -> dict[str, Any]:
-        return self._wrapped.to_model_schema()
-
-    def __getattr__(self, name: str) -> Any:
-        # Fallback for anything else (e.g. ``build_patch_preview``).
-        return getattr(self._wrapped, name)
-
-    async def execute(self, tool_call: Any, ctx: Any) -> Any:
-        from core.cc.tools.base import ToolResult
-
-        arguments = getattr(tool_call, "arguments", None) or {}
-        path = str(arguments.get("file_path") or "")
-        if not path:
-            return ToolResult(
-                tool_use_id=getattr(tool_call, "tool_use_id", ""),
-                tool_name=getattr(tool_call, "tool_name", ""),
-                success=False,
-                content="file_path is required",
-                error_code="FIX_SCOPE_VIOLATION",
-            )
-        if not _path_matches_any_glob(path, self._fix_scope, self._cwd):
-            return ToolResult(
-                tool_use_id=getattr(tool_call, "tool_use_id", ""),
-                tool_name=getattr(tool_call, "tool_name", ""),
-                success=False,
-                content=(
-                    f"path {path!r} is outside fix_scope. "
-                    f"You may only edit files matching: {self._fix_scope}. "
-                    "Pick a different file or report in your final message "
-                    "that the fix requires touching out-of-scope code."
-                ),
-                error_code="FIX_SCOPE_VIOLATION",
-            )
-        return await self._wrapped.execute(tool_call, ctx)
+    @_fix_scope.setter
+    def _fix_scope(self, value: list[str]) -> None:
+        self._write_scope = list(value)
 
 
 def _install_fix_scope_guard(
@@ -1059,29 +982,19 @@ def _install_fix_scope_guard(
     *,
     fix_scope: list[str],
     cwd: str,
-) -> None:
-    """Wrap ``file_edit`` / ``file_write`` in the engine's registry
-    with ``_FixScopeGuard``. After this call, every file_edit /
-    file_write the LLM emits is path-checked before the underlying
-    tool runs. Idempotent — if the tool is already guarded (instance
-    of ``_FixScopeGuard``), we update the scope on it in place
-    instead of double-wrapping."""
-    orchestrator = getattr(engine, "tool_orchestrator", None)
-    registry = getattr(orchestrator, "registry", None)
-    if registry is None:
-        return
-    tools = getattr(registry, "_tools", None)
-    if not isinstance(tools, dict):
-        return
-    for name in ("file_edit", "file_write"):
-        existing = tools.get(name)
-        if existing is None:
-            continue
-        if isinstance(existing, _FixScopeGuard):
-            existing._fix_scope = list(fix_scope)
-            existing._cwd = cwd
-            continue
-        tools[name] = _FixScopeGuard(existing, fix_scope=fix_scope, cwd=cwd)
+) -> bool:
+    """Wrap ``file_edit`` / ``file_write`` with :class:`_FixScopeGuard`.
+
+    Returns whether the shared installer landed at least one wrapper.
+    """
+    return bool(install_write_scope_guard(
+        engine,
+        write_scope=list(fix_scope),
+        cwd=cwd,
+        error_code=FIX_SCOPE_VIOLATION,
+        scope_label="fix_scope",
+        guard_cls=_FixScopeGuard,
+    ))
 
 
 def _remove_writer_tools(engine: Any) -> None:
@@ -1408,6 +1321,7 @@ class WatchModeRunner(ModeRunner):
     FIXER_MAX_ROUNDS: int = 30
     FIXER_WALL_CLOCK_TIMEOUT_S: float = 600.0
     DEFAULT_MAX_ITERATIONS: int = 5
+    DEFAULT_NO_PROGRESS_STOP: int = 2
     DEFAULT_MAX_WALLCLOCK_S: float = 1800.0
     DEFAULT_PER_ITERATION_TIMEOUT_S: float = _DEFAULT_PER_ITERATION_TIMEOUT_S
 
@@ -1433,6 +1347,11 @@ class WatchModeRunner(ModeRunner):
         caller_hints = str(md.get("caller_hints") or "").strip()
         fix_scope = _coerce_fix_scope(md.get("fix_scope"))
         max_iterations = int(md.get("max_iterations") or self.DEFAULT_MAX_ITERATIONS)
+        no_progress_stop = int(
+            md.get("no_progress_stop") or self.DEFAULT_NO_PROGRESS_STOP
+        )
+        if no_progress_stop < 1:
+            no_progress_stop = self.DEFAULT_NO_PROGRESS_STOP
         per_iteration_timeout_s = float(
             md.get("per_iteration_timeout_s")
             or self.DEFAULT_PER_ITERATION_TIMEOUT_S
@@ -1527,6 +1446,13 @@ class WatchModeRunner(ModeRunner):
         prior_commit_failure: _CommitResult | None = None
         last_failures: list[CheckResult] = []
         last_digest: ObservationDigest | None = None
+        # Monotone progress (principle 5): same measure as governed
+        # spawn/run/goal — default ON via CCX_MONOTONE_PROGRESS.
+        monotone = monotone_progress_enabled()
+        progress_tracker = EverPassedTracker() if monotone else None
+        prev_failing_count: int | None = None
+        prev_failing_ids: frozenset[str] | None = None
+        no_progress = 0
 
         for iter_idx in range(max_iterations):
             spool_manager.start_iteration()
@@ -1582,6 +1508,14 @@ class WatchModeRunner(ModeRunner):
 
             failures = run_verification_plan(plan, digest)
             last_failures = failures
+            all_ids = plan_check_ids(plan)
+            failing_id_list = [
+                str(f.check_id or f.kind) for f in failures
+            ]
+            failing_id_set = frozenset(failing_id_list)
+            passed_id_list = [
+                cid for cid in all_ids if cid not in failing_id_set
+            ]
             iteration_log.append({
                 "iteration": iter_idx + 1,
                 "exit_code": digest.exit_code,
@@ -1609,6 +1543,46 @@ class WatchModeRunner(ModeRunner):
                         nested=nested,
                         budget=budget_extras,
                         commit_each_fix=commit_each_fix,
+                    ),
+                )
+
+            made_progress, failing_ids = observe_progress(
+                monotone=monotone,
+                ever_tracker=progress_tracker,
+                prev_failing_ids=prev_failing_ids,
+                passed_ids=passed_id_list,
+                failing_ids=failing_id_list,
+                prev_failing_count=prev_failing_count,
+            )
+            if prev_failing_count is not None:
+                no_progress = 0 if made_progress else no_progress + 1
+            prev_failing_count = len(failures)
+            prev_failing_ids = failing_ids
+            if no_progress >= no_progress_stop:
+                iteration_log[-1]["stop_reason"] = "no_progress"
+                return SubagentResult(
+                    final_text=(
+                        f"watch mode: stopped after {iter_idx + 1} "
+                        f"iteration(s) with no monotone progress "
+                        f"(no_progress_stop={no_progress_stop}). "
+                        f"{len(failures)} check(s) still failing."
+                    ),
+                    subtasks=[],
+                    extras=self._make_extras(
+                        status="failed",
+                        phase="loop",
+                        via="watch_no_progress",
+                        plan=plan,
+                        iterations=iteration_log,
+                        last_digest=digest,
+                        failed_checks=failures,
+                        nested=nested,
+                        budget=budget_extras,
+                        commit_each_fix=commit_each_fix,
+                        extra={
+                            "stop_reason": "no_progress",
+                            "no_progress_stop": no_progress_stop,
+                        },
                     ),
                 )
 
@@ -2148,10 +2122,70 @@ class WatchModeRunner(ModeRunner):
             llm_client_provider=self.llm_provider,
         )
         _strip_to_fixer_tools(engine)
-        _install_fix_scope_guard(engine, fix_scope=fix_scope, cwd=self.cwd)
+        scope_ok = _install_fix_scope_guard(
+            engine, fix_scope=fix_scope, cwd=self.cwd,
+        )
+        # Second, orthogonal guard (principle 1): fix_scope bounds WHICH files
+        # may be touched, patch-first bounds HOW — a fixer may still create new
+        # in-scope files, but never full-rewrite an existing one.
+        patch_ok = install_patch_first_guard(engine)
+        from ..agents.read_before_write import install_read_before_write_guard
+        rbw_ok = install_read_before_write_guard(engine, cwd=self.cwd)
+        if not scope_ok or not patch_ok or not rbw_ok:
+            # Fail loud — do not continue as if the fixer were guarded.
+            missing = []
+            if not scope_ok:
+                missing.append("fix_scope")
+            if not patch_ok:
+                missing.append("patch_first")
+            if not rbw_ok:
+                missing.append("read_before_write")
+            raise _FixerError(
+                "guard install failed — stamped discipline not enforced: "
+                + ", ".join(missing)
+            )
 
-        system = _load_fixer_system(self.language)
+        system = append_patch_first_hint(
+            _load_fixer_system(self.language), language=self.language,
+        )
+        # Principle 2: bind the residual to the CURRENT candidate so the
+        # fixer does not patch against a stale diagnosis.
+        from ..agents.syndrome import (
+            Syndrome,
+            format_syndrome_detail,
+            workspace_fingerprint,
+        )
+        candidate_hash, git_head = workspace_fingerprint(self.cwd)
+        syndrome = Syndrome(
+            candidate_hash=candidate_hash,
+            failing_criterion_ids=[
+                str(
+                    getattr(f, "check_id", None)
+                    or getattr(f, "name", None)
+                    or i
+                )
+                for i, f in enumerate(failures)
+            ],
+            evidence=[
+                {
+                    "criterion_id": str(
+                        getattr(f, "check_id", None)
+                        or getattr(f, "name", None)
+                        or i
+                    ),
+                    "line": (
+                        getattr(f, "summary", None)
+                        or getattr(f, "message", None)
+                        or getattr(f, "reason", None)
+                        or str(f)
+                    ),
+                }
+                for i, f in enumerate(failures)
+            ],
+            git_head=git_head,
+        )
         user_parts = [
+            format_syndrome_detail(syndrome),
             _format_plan_for_prompt(plan),
             _format_digest_for_prompt(digest),
             _format_failures_for_prompt(failures),

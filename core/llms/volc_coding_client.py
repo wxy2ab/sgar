@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import RetryCallState, retry, wait_fixed
 
 from ..utils.config_setting import Config
 from ..utils.log import logger
@@ -57,6 +57,14 @@ def _resolve_reasoning_effort() -> str:
     return "high"
 
 
+def _stop_stream_retry(retry_state: RetryCallState) -> bool:
+    """Use the calling client's retry ceiling instead of a fixed decorator."""
+
+    client = retry_state.args[0] if retry_state.args else None
+    maximum = max(1, int(getattr(client, "_stream_retry_max_attempts", 4)))
+    return retry_state.attempt_number >= maximum
+
+
 class VolcCodingClient(LLMApiClient):
     pass
 
@@ -101,6 +109,9 @@ class VolcCodingClient(OpenAIChatClient):
         resolved_model = config.resolve_value(
             model, ("volc_coding_client_model",), self.DEFAULT_MODEL,
         )
+        self._stream_retry_max_attempts = 4
+        self._empty_content_retries = self._EMPTY_CONTENT_RETRIES
+        self._tool_empty_content_retries = self._TOOL_EMPTY_CONTENT_RETRIES
         super().__init__(
             api_key, base_url, max_tokens=16000,
             enable_thinking=_resolve_enable_thinking(),
@@ -117,7 +128,28 @@ class VolcCodingClient(OpenAIChatClient):
             context_window_tokens=(
                 224_000 if resolved_model == self.DEFAULT_MODEL else None
             ),
+            # Tenacity below owns stream retries. SDK retries would multiply
+            # latency and hide provider attempts from outer usage meters.
+            max_retries=0,
+            # The Ark endpoint is directly reachable in its target region.
+            # Inheriting desktop HTTP(S)_PROXY routed long requests through a
+            # local proxy that repeatedly disconnected before response headers.
+            trust_env=False,
+            # High-constraint long-form units have legitimately taken just
+            # over the old 600-second response-header/read ceiling on Ark.
+            # Keep one observable outer attempt instead of timing it out and
+            # repeating the entire expensive unit generation.
+            request_timeout_s=1_200.0,
         )
+
+    def disable_internal_retries(self) -> None:
+        """Delegate retry ownership to an outer, observable runtime."""
+
+        self._chat_retry_max_attempts = 1
+        self._tool_retry_max_attempts = 1
+        self._stream_retry_max_attempts = 1
+        self._empty_content_retries = 0
+        self._tool_empty_content_retries = 0
 
     def set_response_format(self, fmt: Optional[Dict[str, Any]]) -> None:
         if fmt is not None and not isinstance(fmt, dict):
@@ -158,31 +190,22 @@ class VolcCodingClient(OpenAIChatClient):
                 messages, True, tools, raw_response
             )
         text = self._streaming_text_completion(messages)
-        retries = self._EMPTY_CONTENT_RETRIES
+        retries = self._empty_content_retries
         attempt = 0
         while attempt < retries and is_blank(text):
-            force_no_thinking = attempt == retries - 1
             logger.warning(
                 "VolcCodingClient.one_chat/text: empty visible content "
-                "(reasoning_effort=%s); re-issuing (attempt %d/%d%s)",
+                "(reasoning_effort=%s); re-issuing with reasoning enabled "
+                "(attempt %d/%d)",
                 self.reasoning_effort,
                 attempt + 1,
                 retries,
-                ", thinking disabled" if force_no_thinking else "",
             )
-            if force_no_thinking and self.enable_thinking is not False:
-                prev = self.enable_thinking
-                self.enable_thinking = False
-                try:
-                    text = self._streaming_text_completion(messages)
-                finally:
-                    self.enable_thinking = prev
-            else:
-                text = self._streaming_text_completion(messages)
+            text = self._streaming_text_completion(messages)
             attempt += 1
         return text or ""
 
-    @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
+    @retry(stop=_stop_stream_retry, wait=wait_fixed(5))
     def _streaming_text_completion(
         self, messages: List[Dict[str, str]]
     ) -> str:
@@ -193,7 +216,7 @@ class VolcCodingClient(OpenAIChatClient):
             "messages": messages,
             "temperature": self.temperature,
             "stream": True,
-            "timeout": 600,
+            "timeout": self.request_timeout_s,
             "stream_options": {"include_usage": True},
         }
         if self.max_tokens is not None:
@@ -264,37 +287,26 @@ class VolcCodingClient(OpenAIChatClient):
             # ENTIRE turn on hidden reasoning and return empty visible content
             # with NO tool_calls (finish_reason "stop") — a pathological
             # "finished but said nothing" turn. Empty AND no tool_calls is never
-            # legitimate, so re-issue. The first re-issue keeps full reasoning
-            # (preserve depth); the LAST forces enable_thinking=False so a
-            # visible answer must appear. ``get_client`` builds a fresh client
-            # per turn (core/cc/llm.py:96), so this instance is not shared across
-            # threads and the temporary enable_thinking toggle is race-free.
-            retries = self._TOOL_EMPTY_CONTENT_RETRIES
+            # legitimate, so re-issue. Every re-issue preserves the configured
+            # reasoning mode; callers that require reasoning must never receive
+            # a silently downgraded non-thinking answer.
+            retries = self._tool_empty_content_retries
             attempt = 0
             while attempt < retries and _blank_and_no_tool_calls(result):
-                force_no_thinking = attempt == retries - 1
                 logger.warning(
                     "VolcCodingClient.tool_invoke: empty content + no tool_calls "
-                    "(reasoning_effort=%s); re-issuing (attempt %d/%d%s)",
+                    "(reasoning_effort=%s); re-issuing with reasoning enabled "
+                    "(attempt %d/%d)",
                     self.reasoning_effort, attempt + 1, retries,
-                    ", thinking disabled" if force_no_thinking else "",
                 )
-                if force_no_thinking and self.enable_thinking is not False:
-                    prev = self.enable_thinking
-                    self.enable_thinking = False
-                    try:
-                        result = self._streaming_tool_completion(messages, tools)
-                    finally:
-                        self.enable_thinking = prev
-                else:
-                    result = self._streaming_tool_completion(messages, tools)
+                result = self._streaming_tool_completion(messages, tools)
                 attempt += 1
             return result
         finally:
             if saved_format is not None:
                 self.extra_body["format"] = saved_format
 
-    @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
+    @retry(stop=_stop_stream_retry, wait=wait_fixed(5))
     def _streaming_tool_completion(
         self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -317,7 +329,7 @@ class VolcCodingClient(OpenAIChatClient):
             "messages": messages,
             "temperature": self.temperature,
             "stream": True,
-            "timeout": 600,
+            "timeout": self.request_timeout_s,
             "tools": tools,
             "stream_options": {"include_usage": True},
         }
@@ -383,13 +395,15 @@ class VolcCodingClient(OpenAIChatClient):
                 self._update_stats(usage)
             except Exception:  # noqa: BLE001 — stats are best-effort
                 pass
+        else:
+            self._update_stats(None)
         return self._normalize_tool_invoke_response(
             "".join(content_parts), tool_calls or None
         )
 
     #: Re-issues on a pathological empty-content-with-no-tool-calls turn. Kept
     #: to 2 (vs the base ``_EMPTY_CONTENT_RETRIES=3``) because each high-effort
-    #: re-issue is expensive; the 2nd (final) one disables thinking and is fast.
+    #: reasoning-preserving re-issue is expensive.
     _TOOL_EMPTY_CONTENT_RETRIES = 2
 
     # NOTE on "ccx occasionally emits empty output" with this client:

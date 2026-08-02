@@ -28,59 +28,54 @@ Drives a multi-stage SGAR project to completion from a project plan
   ``max_verify_attempts`` (the cost-amplifier that defeated "bounded repair").
   A stage that has already exhausted its budget is not silently granted more on
   re-run; raise ``max_verify_attempts`` to deliberately extend it.
+* **Optional candidate frontier (sgarx).** With ``use_candidate_frontier=True``,
+  the repair loop proposes/patches/audits/promotes nodes under ``.sgarx/``
+  instead of an anonymous workspace trajectory. Default remains False so stable
+  sgar callers are byte-compatible.
 
 This module has no LLM or task.py dependency — it's pure orchestration over
-``SgarRuntime`` + a callback, so it is unit-testable with a stub implementer.
+``SgarRuntime`` / ``SgarxRuntime`` + a callback, so it is unit-testable with a
+stub implementer.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
+from ..agents.patch_first import patch_first_hint
+from ..agents.syndrome import workspace_fingerprint
 from .checks import stop_on_unrunnable_enabled
 from .models import CriterionResult, SgarError, StageRecord
 from .runtime import SgarRuntime
 from .validation import parse_exit_criteria
 
 
-# Cap on the persisted failure detail so a long, repeatedly-refused stage cannot
-# bloat state.json. The [check:] evidence tail is already bounded in
-# checks.py (~2k chars); this is a belt-and-suspenders ceiling on the whole
-# SgarError text.
 _FAILURE_DETAIL_MAX_CHARS = 2000
 
-
-# A failing ``[check:]`` whose evidence carries one of these markers did not
-# legitimately fail — it could not EXECUTE (a harness defect: missing binary,
-# timeout, or an unparseable command). These are exactly the signatures
-# ``CheckOutcome.evidence_line()`` emits (see ``sgar/checks.py``) and the basis
-# of the ``check_unrunnable`` predicate the three governed loops act on.
-# autobuild cannot consult that predicate directly: ``record_verification`` /
-# ``close_stage`` SHORT-CIRCUIT and raise the first failing criterion's outcome
-# as a flat ``SgarError`` string, so a sound "every failure is unrunnable"
-# decision is impossible from here without reworking that pinned refusal path.
-# We therefore scan the string and use it ONLY to LABEL the refusal — never to
-# change control flow. The bounded repair budget still does all the stopping.
 _UNRUNNABLE_MARKERS = ("(TIMEOUT)", "(ERROR:", "(exit=127)")
+
+_FRONTIER_BUDGET_MARKERS = (
+    "candidate budget exhausted",
+    "audit budget exhausted",
+    "patch budget exhausted",
+)
 
 
 def _looks_unrunnable(detail: str | None) -> bool:
-    """Best-effort: does this refusal's text look like an unrunnable ``[check:]``
-    (a harness defect) rather than a candidate that legitimately failed the gate?
-
-    Conservative — mirrors ``checks.check_unrunnable``'s notion over the
-    flattened ``SgarError`` string (the structured ``CheckOutcome`` is not
-    reachable here; see ``_UNRUNNABLE_MARKERS``). A check that ran and exited
-    non-zero for a real reason (e.g. ``exit=1``) is NOT flagged.
-    """
+    """Best-effort: does this refusal's text look like an unrunnable ``[check:]``."""
     if not detail:
         return False
     if any(marker in detail for marker in _UNRUNNABLE_MARKERS):
         return True
-    # rc=2 + "syntax error" in the captured tail == the shell could not parse it.
     return "(exit=2)" in detail and "syntax error" in detail.lower()
+
+
+def _looks_frontier_budget_exhausted(detail: str | None) -> bool:
+    if not detail:
+        return False
+    return any(marker in detail for marker in _FRONTIER_BUDGET_MARKERS)
 
 
 @dataclass(slots=True)
@@ -97,20 +92,22 @@ class ProjectPlan:
 
 
 @dataclass(slots=True)
+class ImplementResult:
+    """Optional richer return from an implementer under frontier mode."""
+
+    artifact_paths: list[str]
+    summary: str = ""
+
+
+@dataclass(slots=True)
 class StageReport:
     stage_id: str
     closed: bool
     attempts: int
     last_error: str | None = None
     harness_defect_suspected: bool = False
-    """Advisory, observability-only. Set True only when ``CCX_STOP_ON_UNRUNNABLE``
-    is enabled AND the final refusal looks like an exit-criterion ``[check:]``
-    that could not execute (missing binary / timeout / unparseable) rather than a
-    candidate that legitimately failed the gate. It disambiguates the two SGAR
-    failure modes — a broken/insufficient-fidelity gate vs candidate-family
-    exhaustion — in the report. It does NOT change the repair loop, the budget,
-    or whether the stage closes. Default False ⇒ byte-identical output when the
-    flag is unset."""
+    frontier_budget_exhausted: bool = False
+    last_candidate_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -120,15 +117,21 @@ class AutobuildReport:
     reason: str = ""
 
 
-# implement(stage_plan, attempt, failure_detail) -> None
-#   attempt: 1-based attempt counter for this stage.
-#   failure_detail: None on the first attempt; otherwise the SgarError text
-#     from the previous verify/close refusal (includes failing-check evidence).
-Implementer = Callable[[StagePlan, int, "str | None"], None]
+Implementer = Callable[[StagePlan, int, "str | None"], Any]
 
 
 def _noop_log(_message: str) -> None:
     return None
+
+
+def _parse_implement_result(result: Any) -> tuple[list[str], str]:
+    if result is None:
+        return [], ""
+    if isinstance(result, ImplementResult):
+        return [str(p) for p in result.artifact_paths], str(result.summary or "")
+    if isinstance(result, (list, tuple)):
+        return [str(p) for p in result], ""
+    return [], ""
 
 
 def autobuild(
@@ -140,23 +143,31 @@ def autobuild(
     max_verify_attempts: int = 4,
     check_timeout_s: float = 120.0,
     log: Callable[[str], None] = _noop_log,
+    use_candidate_frontier: bool = False,
 ) -> AutobuildReport:
     """Drive ``plan`` to completion. Returns a structured report.
 
-    Never raises for an ordinary build failure (a stage that exhausts its
-    repair attempts) — that is reported as ``success=False`` with the offending
-    stage's ``last_error``. SgarError still propagates for *structural*
-    problems (e.g. a malformed plan that can't even bootstrap), which are
-    programmer errors, not build outcomes.
+    ``use_candidate_frontier`` (default False) opts into sgarx frontier
+    propose → audit-from-checks → patch → promote before verify/close.
     """
     if max_verify_attempts < 1:
         raise ValueError("max_verify_attempts must be >= 1")
-    runtime = SgarRuntime(
-        cwd,
-        session_id=session,
-        run_criterion_checks=True,
-        criterion_check_timeout_s=check_timeout_s,
-    )
+    if use_candidate_frontier:
+        from ..sgarx.runtime import SgarxRuntime
+
+        runtime: SgarRuntime = SgarxRuntime(
+            cwd,
+            session_id=session,
+            run_criterion_checks=True,
+            criterion_check_timeout_s=check_timeout_s,
+        )
+    else:
+        runtime = SgarRuntime(
+            cwd,
+            session_id=session,
+            run_criterion_checks=True,
+            criterion_check_timeout_s=check_timeout_s,
+        )
     _bootstrap(runtime, plan, log)
 
     reports: list[StageReport] = []
@@ -166,10 +177,22 @@ def autobuild(
             log(f"{stage.stage_id}: already closed — skip")
             reports.append(StageReport(stage.stage_id, True, 0))
             continue
-        report = _drive_stage(runtime, stage, implement, max_verify_attempts, log)
+        if use_candidate_frontier:
+            report = _drive_stage_with_frontier(
+                runtime, stage, implement, max_verify_attempts, log
+            )
+        else:
+            report = _drive_stage(
+                runtime, stage, implement, max_verify_attempts, log
+            )
         reports.append(report)
         if not report.closed:
-            if report.harness_defect_suspected:
+            if report.frontier_budget_exhausted:
+                reason = (
+                    f"{stage.stage_id} not closed (frontier_budget_exhausted: "
+                    f"{report.last_error})"
+                )
+            elif report.harness_defect_suspected:
                 reason = (
                     f"{stage.stage_id} not closed (harness_defect suspected — the "
                     f"exit-criterion check could not execute, not a candidate "
@@ -201,6 +224,42 @@ def _bootstrap(runtime: SgarRuntime, plan: ProjectPlan, log: Callable[[str], Non
         log("roadmap accepted")
 
 
+def _bind_detail_to_candidate(
+    detail: str | None,
+    *,
+    cwd: Path | str,
+    attempt: int,
+    prev_candidate_hash: str | None,
+) -> tuple[str | None, str]:
+    candidate_hash, git_head = workspace_fingerprint(cwd)
+    if not detail:
+        return detail, candidate_hash
+    lines = [
+        f"VERSION-BOUND SYNDROME (residual of the CURRENT candidate) — "
+        f"attempt {attempt}",
+        f"candidate_hash={candidate_hash}",
+    ]
+    if git_head:
+        lines.append(f"git_head={git_head}")
+    if prev_candidate_hash and prev_candidate_hash != candidate_hash:
+        lines.append(
+            f"NOTE: the workspace changed since the last refusal "
+            f"(was {prev_candidate_hash}). The evidence below was produced "
+            "against the PREVIOUS candidate — re-read the files it names "
+            "before acting on it."
+        )
+    lines.append(
+        "The failing criteria below apply to this candidate version only; "
+        "do not reuse an older syndrome."
+    )
+    lines.append("")
+    lines.append(detail)
+    if attempt >= 2:
+        lines.append("")
+        lines.append(patch_first_hint())
+    return "\n".join(lines), candidate_hash
+
+
 def _drive_stage(
     runtime: SgarRuntime,
     stage: StagePlan,
@@ -209,7 +268,6 @@ def _drive_stage(
     log: Callable[[str], None],
 ) -> StageReport:
     state = runtime.store.load_state()
-    # Set up + start only if this isn't already the current (resumed) stage.
     if state.current_stage_id != stage.stage_id:
         runtime.set_stage_spec(stage.stage_id, stage.spec_text)
         runtime.validate_stage_spec(stage.stage_id).require_ok()
@@ -218,13 +276,6 @@ def _drive_stage(
         prior_attempts = 0
         detail: str | None = None
     else:
-        # Resume a started-but-unclosed stage. The repair-loop budget and the
-        # last refusal's evidence live on the stage record (persisted on every
-        # refusal below), so we CONTINUE the loop from where the killed run left
-        # off — the budget is consumed, not silently refilled with a fresh
-        # max_attempts every restart — and re-feed the failing-[check:] detail
-        # the Implementer contract promises (previously both were lost: attempt
-        # reset to 1, detail to None).
         record = state.stages.get(stage.stage_id)
         prior_attempts = record.repair_attempts if record else 0
         detail = record.last_failure_detail if record else None
@@ -234,8 +285,15 @@ def _drive_stage(
         )
 
     criteria = parse_exit_criteria(stage.spec_text)
+    prev_candidate_hash: str | None = None
     for attempt in range(prior_attempts + 1, max_attempts + 1):
-        implement(stage, attempt, detail)
+        fed_detail, prev_candidate_hash = _bind_detail_to_candidate(
+            detail,
+            cwd=runtime.store.cwd,
+            attempt=attempt,
+            prev_candidate_hash=prev_candidate_hash,
+        )
+        implement(stage, attempt, fed_detail)
         try:
             runtime.record_verification(
                 stage.stage_id,
@@ -245,8 +303,6 @@ def _drive_stage(
                 ],
             )
             runtime.close_stage(stage.stage_id)
-            # Closed: clear the pending failure evidence (a closed stage has no
-            # outstanding refusal) but keep the attempt count as history.
             _persist_repair_progress(runtime, stage.stage_id, attempt, None)
             log(f"{stage.stage_id}: closed on attempt {attempt}")
             return StageReport(stage.stage_id, closed=True, attempts=attempt)
@@ -260,10 +316,6 @@ def _drive_stage(
                     "harness defect (the exit-criterion check could not execute), "
                     "not a candidate failure — the repair budget cannot fix this"
                 )
-    # Budget exhausted (this run, or already-exhausted on entry → empty loop).
-    # Advisory label (opt-in, default off): distinguish a broken gate (harness
-    # defect) from genuine candidate-family exhaustion. Observability only — the
-    # budget above already did the stopping.
     suspected = stop_on_unrunnable_enabled() and _looks_unrunnable(detail)
     return StageReport(
         stage.stage_id,
@@ -274,17 +326,405 @@ def _drive_stage(
     )
 
 
+def _next_autobuild_candidate_id(runtime: SgarRuntime, stage_id: str) -> str:
+    from ..sgarx.runtime import SgarxRuntime
+
+    assert isinstance(runtime, SgarxRuntime)
+    existing = {
+        c.candidate_id for c in runtime.list_candidates(stage_id)
+    }
+    # Also treat on-disk meta as occupied even if list races.
+    for n in range(1, 10_000):
+        cid = f"ab-{n:03d}"
+        if cid in existing:
+            continue
+        meta = runtime.store.candidate_dir(stage_id, cid) / "meta.json"
+        if meta.is_file():
+            continue
+        return cid
+    raise SgarError(f"exhausted autobuild candidate ids for {stage_id!r}")
+
+
+def _pick_frontier_cursor(
+    runtime: SgarRuntime, stage_id: str
+) -> tuple[str | None, str | None]:
+    from ..sgarx.candidates.models import CandidateStatus
+    from ..sgarx.runtime import SgarxRuntime
+
+    assert isinstance(runtime, SgarxRuntime)
+    frontier = runtime.list_frontier(stage_id)
+    if frontier.promoted_candidate_id:
+        return frontier.promoted_candidate_id, None
+    candidates = [
+        c
+        for c in runtime.list_candidates(stage_id)
+        if c.status
+        not in (
+            CandidateStatus.DISCARDED.value,
+            CandidateStatus.SUPERSEDED.value,
+        )
+    ]
+    if not candidates:
+        return None, None
+    candidates.sort(
+        key=lambda c: (c.updated_at or "", c.created_at or "", c.candidate_id)
+    )
+    cur = candidates[-1]
+    detail: str | None = None
+    if cur.status == CandidateStatus.AUDITED_FAIL.value and cur.audit is not None:
+        bound = cur.audit.extras.get("bound_detail")
+        if isinstance(bound, str) and bound.strip():
+            detail = bound
+        elif cur.audit.findings:
+            detail = "\n".join(cur.audit.findings)
+    return cur.candidate_id, detail
+
+
+def _feed_frontier_detail(detail: str | None, *, attempt: int) -> str | None:
+    if not detail:
+        return None
+    return f"autobuild attempt {attempt}\n{detail}"
+
+
+def _looks_candidate_hash_drift(detail: str) -> bool:
+    text = (detail or "").lower()
+    return "hash drift" in text
+
+
+def _try_close_frontier_cursor(
+    runtime: SgarRuntime,
+    stage: StagePlan,
+    criteria: list[Any],
+    current_id: str,
+    *,
+    prior_attempts: int,
+    log: Callable[[str], None],
+) -> StageReport | tuple[str, str]:
+    """Try promote (if needed) + verify + close without calling implement.
+
+    Returns a successful :class:`StageReport`, or ``(error_detail, discarded_id)``
+    after force-discarding the stale cursor so the caller can re-propose.
+    """
+    from ..sgarx.candidates.models import CandidateStatus
+    from ..sgarx.runtime import SgarxRuntime
+
+    assert isinstance(runtime, SgarxRuntime)
+    cur = runtime.get_candidate(stage.stage_id, current_id)
+    try:
+        if cur.status == CandidateStatus.AUDITED_PASS.value:
+            runtime.promote_candidate(stage.stage_id, current_id)
+            log(f"{stage.stage_id}: promoted {current_id} (resume close)")
+        elif cur.status != CandidateStatus.PROMOTED.value:
+            raise SgarError(
+                f"resume close expected audited_pass/promoted, got {cur.status!r}"
+            )
+        runtime.record_verification(
+            stage.stage_id,
+            results=[
+                CriterionResult(c.criterion_id, True, "autobuild")
+                for c in criteria
+            ],
+        )
+        runtime.close_stage(stage.stage_id)
+        _persist_repair_progress(
+            runtime, stage.stage_id, max(prior_attempts, 1), None
+        )
+        log(f"{stage.stage_id}: closed from existing {current_id}")
+        return StageReport(
+            stage.stage_id,
+            closed=True,
+            attempts=max(prior_attempts, 1),
+            last_candidate_id=current_id,
+        )
+    except SgarError as exc:
+        detail = str(exc)
+        try:
+            runtime.force_discard_candidate(stage.stage_id, current_id)
+            log(
+                f"{stage.stage_id}: discarded stale {current_id} after "
+                f"resume-close failure: {detail}"
+            )
+        except SgarError as discard_exc:
+            detail = f"{detail}; discard failed: {discard_exc}"
+        _persist_repair_progress(
+            runtime, stage.stage_id, max(prior_attempts, 1), detail
+        )
+        return detail, current_id
+
+
+def _drive_stage_with_frontier(
+    runtime: SgarRuntime,
+    stage: StagePlan,
+    implement: Implementer,
+    max_attempts: int,
+    log: Callable[[str], None],
+) -> StageReport:
+    from ..sgarx.candidates.models import CandidateStatus
+    from ..sgarx.runtime import SgarxRuntime
+
+    assert isinstance(runtime, SgarxRuntime)
+    state = runtime.store.load_state()
+    if state.current_stage_id != stage.stage_id:
+        runtime.set_stage_spec(stage.stage_id, stage.spec_text)
+        runtime.validate_stage_spec(stage.stage_id).require_ok()
+        runtime.start_stage(stage.stage_id)
+        log(f"{stage.stage_id}: started (frontier)")
+        prior_attempts = 0
+        detail: str | None = None
+        current_id: str | None = None
+    else:
+        record = state.stages.get(stage.stage_id)
+        prior_attempts = record.repair_attempts if record else 0
+        persisted = record.last_failure_detail if record else None
+        current_id, audit_detail = _pick_frontier_cursor(runtime, stage.stage_id)
+        detail = audit_detail or persisted
+        log(
+            f"{stage.stage_id}: resuming current stage with frontier "
+            f"(repair attempt {prior_attempts + 1}/{max_attempts}; "
+            f"current={current_id or '-'})"
+        )
+
+    criteria = parse_exit_criteria(stage.spec_text)
+    last_candidate_id = current_id
+    frontier_budget_hit = False
+
+    if current_id is not None:
+        try:
+            cur = runtime.get_candidate(stage.stage_id, current_id)
+        except SgarError:
+            cur = None
+        if cur is not None and cur.status in (
+            CandidateStatus.AUDITED_PASS.value,
+            CandidateStatus.PROMOTED.value,
+        ):
+            outcome = _try_close_frontier_cursor(
+                runtime,
+                stage,
+                criteria,
+                current_id,
+                prior_attempts=prior_attempts,
+                log=log,
+            )
+            if isinstance(outcome, StageReport):
+                return outcome
+            detail, _discarded = outcome
+            frontier_budget_hit = _looks_frontier_budget_exhausted(detail)
+            current_id = None
+            last_candidate_id = None
+
+    for attempt in range(prior_attempts + 1, max_attempts + 1):
+        # Never implement on top of an already-audited/promoted cursor.
+        if current_id is not None:
+            try:
+                cur = runtime.get_candidate(stage.stage_id, current_id)
+            except SgarError:
+                cur = None
+            if cur is not None and cur.status in (
+                CandidateStatus.AUDITED_PASS.value,
+                CandidateStatus.PROMOTED.value,
+            ):
+                outcome = _try_close_frontier_cursor(
+                    runtime,
+                    stage,
+                    criteria,
+                    current_id,
+                    prior_attempts=max(prior_attempts, attempt - 1),
+                    log=log,
+                )
+                if isinstance(outcome, StageReport):
+                    return outcome
+                detail, _discarded = outcome
+                current_id = None
+                last_candidate_id = None
+
+        fed_detail = _feed_frontier_detail(detail, attempt=attempt)
+        result = implement(stage, attempt, fed_detail)
+        paths, summary = _parse_implement_result(result)
+        if not summary:
+            summary = f"autobuild attempt {attempt}"
+        try:
+            if current_id is None:
+                if not paths:
+                    raise SgarError(
+                        "propose-candidate requires --artifact / artifact_paths"
+                    )
+                cid = _next_autobuild_candidate_id(runtime, stage.stage_id)
+                record = runtime.propose_candidate(
+                    stage.stage_id,
+                    candidate_id=cid,
+                    summary=summary,
+                    artifact_paths=paths,
+                    origin="propose",
+                )
+                current_id = record.candidate_id
+                last_candidate_id = current_id
+                log(f"{stage.stage_id}: proposed {current_id}")
+            else:
+                cur = runtime.get_candidate(stage.stage_id, current_id)
+                if cur.status == CandidateStatus.AUDITED_FAIL.value:
+                    if not paths:
+                        raise SgarError(
+                            "patch-candidate requires --artifact / artifact_paths"
+                        )
+                    cid = _next_autobuild_candidate_id(runtime, stage.stage_id)
+                    record = runtime.patch_candidate(
+                        stage.stage_id,
+                        parent_id=current_id,
+                        candidate_id=cid,
+                        summary=summary,
+                        artifact_paths=paths,
+                    )
+                    current_id = record.candidate_id
+                    last_candidate_id = current_id
+                    log(f"{stage.stage_id}: patched → {current_id}")
+                elif cur.status == CandidateStatus.PROPOSED.value:
+                    last_candidate_id = current_id
+                    # Implement may have mutated artifacts after propose;
+                    # drift is detected at from-checks below.
+                else:
+                    raise SgarError(
+                        f"autobuild frontier cannot continue from status="
+                        f"{cur.status!r} candidate={current_id!r}"
+                    )
+
+            cur = runtime.get_candidate(stage.stage_id, current_id)
+            # Only skip verify/close re-checks when THIS attempt just ran
+            # from-checks successfully (same tree, no further implement).
+            audited_this_attempt = False
+            if cur.status == CandidateStatus.PROPOSED.value:
+                try:
+                    cur = runtime.audit_candidate_from_checks(
+                        stage.stage_id, current_id
+                    )
+                except SgarError as audit_exc:
+                    if _looks_candidate_hash_drift(str(audit_exc)):
+                        runtime.force_discard_candidate(
+                            stage.stage_id, current_id
+                        )
+                        log(
+                            f"{stage.stage_id}: discarded drifted "
+                            f"{current_id}: {audit_exc}"
+                        )
+                        detail = str(audit_exc)
+                        current_id = None
+                        last_candidate_id = None
+                        _persist_repair_progress(
+                            runtime, stage.stage_id, attempt, detail
+                        )
+                        continue
+                    raise
+                audited_this_attempt = (
+                    cur.status == CandidateStatus.AUDITED_PASS.value
+                )
+                log(f"{stage.stage_id}: audited {current_id} → {cur.status}")
+
+            if cur.status == CandidateStatus.AUDITED_FAIL.value:
+                if cur.audit and isinstance(cur.audit.extras.get("bound_detail"), str):
+                    detail = cur.audit.extras["bound_detail"]
+                elif cur.audit and cur.audit.findings:
+                    detail = "\n".join(cur.audit.findings)
+                else:
+                    detail = f"candidate {current_id} audited_fail"
+                _persist_repair_progress(runtime, stage.stage_id, attempt, detail)
+                log(f"{stage.stage_id}: attempt {attempt} audited_fail: {current_id}")
+                if stop_on_unrunnable_enabled() and _looks_unrunnable(detail):
+                    log(
+                        f"{stage.stage_id}: attempt {attempt} refusal looks like a "
+                        "harness defect (the exit-criterion check could not execute), "
+                        "not a candidate failure — the repair budget cannot fix this"
+                    )
+                continue
+
+            if cur.status == CandidateStatus.AUDITED_PASS.value:
+                runtime.promote_candidate(stage.stage_id, current_id)
+                log(f"{stage.stage_id}: promoted {current_id}")
+            elif cur.status != CandidateStatus.PROMOTED.value:
+                raise SgarError(
+                    f"expected audited_pass before promote, got {cur.status!r}"
+                )
+
+            # Fresh from-checks already gated [check:] criteria; avoid a second
+            # (or third) run on record_verification/close. Resume of an older
+            # audited_pass/promoted node keeps checks on.
+            skip_recheck = audited_this_attempt
+            prev_run_checks = runtime.run_criterion_checks
+            if skip_recheck:
+                runtime.run_criterion_checks = False
+            try:
+                runtime.record_verification(
+                    stage.stage_id,
+                    results=[
+                        CriterionResult(c.criterion_id, True, "autobuild")
+                        for c in criteria
+                    ],
+                )
+                runtime.close_stage(stage.stage_id)
+            finally:
+                if skip_recheck:
+                    runtime.run_criterion_checks = prev_run_checks
+            _persist_repair_progress(runtime, stage.stage_id, attempt, None)
+            log(f"{stage.stage_id}: closed on attempt {attempt} (frontier)")
+            return StageReport(
+                stage.stage_id,
+                closed=True,
+                attempts=attempt,
+                last_candidate_id=current_id,
+            )
+        except SgarError as exc:
+            detail = str(exc)
+            if _looks_frontier_budget_exhausted(detail):
+                frontier_budget_hit = True
+                _persist_repair_progress(runtime, stage.stage_id, attempt, detail)
+                log(f"{stage.stage_id}: frontier budget exhausted: {detail}")
+                return StageReport(
+                    stage.stage_id,
+                    closed=False,
+                    attempts=attempt,
+                    last_error=detail,
+                    frontier_budget_exhausted=True,
+                    last_candidate_id=last_candidate_id,
+                )
+            if (
+                current_id is not None
+                and _looks_candidate_hash_drift(detail)
+            ):
+                try:
+                    runtime.force_discard_candidate(stage.stage_id, current_id)
+                    log(
+                        f"{stage.stage_id}: discarded drifted "
+                        f"{current_id} after refuse: {detail}"
+                    )
+                    current_id = None
+                    last_candidate_id = None
+                except SgarError:
+                    pass
+            _persist_repair_progress(runtime, stage.stage_id, attempt, detail)
+            log(f"{stage.stage_id}: attempt {attempt} refused: {detail}")
+            if stop_on_unrunnable_enabled() and _looks_unrunnable(detail):
+                log(
+                    f"{stage.stage_id}: attempt {attempt} refusal looks like a "
+                    "harness defect (the exit-criterion check could not execute), "
+                    "not a candidate failure — the repair budget cannot fix this"
+                )
+
+    suspected = stop_on_unrunnable_enabled() and _looks_unrunnable(detail)
+    return StageReport(
+        stage.stage_id,
+        closed=False,
+        attempts=max(prior_attempts, max_attempts),
+        last_error=detail,
+        harness_defect_suspected=suspected,
+        frontier_budget_exhausted=frontier_budget_hit,
+        last_candidate_id=last_candidate_id,
+    )
+
+
 def _persist_repair_progress(
     runtime: SgarRuntime,
     stage_id: str,
     attempts: int,
     detail: str | None,
 ) -> None:
-    """Persist the repair-loop control-state (cumulative attempts consumed +
-    last refusal evidence) onto the stage record so a mid-stage process kill
-    resumes deterministically. ``detail=None`` clears the pending evidence (the
-    stage closed). Turnkey autobuild is the single writer of ``.sgar/`` here, so
-    a plain atomic ``write_state`` is sufficient — no CAS needed."""
     state = runtime.store.load_state()
     record = state.stages.get(stage_id) or StageRecord(stage_id=stage_id)
     record.repair_attempts = attempts
@@ -297,6 +737,7 @@ def _persist_repair_progress(
 
 __all__ = [
     "AutobuildReport",
+    "ImplementResult",
     "Implementer",
     "ProjectPlan",
     "StagePlan",

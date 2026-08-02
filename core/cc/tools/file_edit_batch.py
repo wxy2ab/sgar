@@ -6,8 +6,8 @@ from typing import Any
 
 from ..command_runner import default_shell_kind
 from ..config import CCConfig
-from ..editing import CodeEditFacade, FileEditRequest
-from ..editing.requests import EditResult
+from ..editing import CodeEditFacade
+from ..editing.batch import apply_batch_edit_to_file
 from ..editing.rollback import RollbackManager
 from ..safety import classify_command_permission, classify_file_permission
 from ..safety.file_rules import resolve_under_cwd
@@ -15,25 +15,42 @@ from .base import BaseTool, ToolCall, ToolResult, ToolSpec, ValidationResult
 from .context import ToolUseContext
 
 
-class FileEditTool(BaseTool):
+class FileEditBatchTool(BaseTool):
+    """Transactional multi-edit on one file (single checkpoint / atomic commit)."""
+
     def __init__(self, config: CCConfig | None = None, facade: CodeEditFacade | None = None) -> None:
         super().__init__(
             ToolSpec(
-                name="file_edit",
-                description="Modify file contents in place using exact-match replacement with validation and rollback.",
+                name="file_edit_batch",
+                description=(
+                    "Apply an ordered batch of exact-match edits to one file in a "
+                    "single transaction: optional expected_hash check, one checkpoint, "
+                    "all edits in memory, optional runtime_command validation, one "
+                    "atomic commit. Any edit failure leaves the file unchanged. "
+                    "Prefer this over multiple file_edit calls when changing several "
+                    "regions of the same file."
+                ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "file_path": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean"},
-                        "create_if_missing": {"type": "boolean"},
                         "expected_hash": {"type": "string"},
+                        "edits": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "address": {"type": "string"},
+                                    "old_string": {"type": "string"},
+                                    "new_string": {"type": "string"},
+                                },
+                                "required": ["old_string", "new_string"],
+                            },
+                        },
                         "runtime_command": {"type": "string"},
                         "runtime_shell": {"type": "string"},
                     },
-                    "required": ["file_path", "new_string"],
+                    "required": ["file_path", "edits"],
                 },
                 is_read_only=False,
                 needs_confirmation=False,
@@ -42,7 +59,6 @@ class FileEditTool(BaseTool):
         self.config = config or CCConfig()
         self._injected_facade = facade
         self._facade_by_cwd: dict[str, CodeEditFacade] = {}
-        # Back-compat for callers/tests that read ``.facade`` before execute.
         self.facade = facade
 
     def _facade_for(self, cwd: str) -> CodeEditFacade:
@@ -63,8 +79,17 @@ class FileEditTool(BaseTool):
     def validate_input(self, arguments: dict[str, Any]) -> ValidationResult:
         if not arguments.get("file_path"):
             return ValidationResult(ok=False, message="file_path is required.")
-        if "new_string" not in arguments:
-            return ValidationResult(ok=False, message="new_string is required.")
+        edits = arguments.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return ValidationResult(ok=False, message="edits must be a non-empty list.")
+        for i, edit in enumerate(edits):
+            if not isinstance(edit, dict):
+                return ValidationResult(ok=False, message=f"edits[{i}] must be an object.")
+            if "old_string" not in edit or "new_string" not in edit:
+                return ValidationResult(
+                    ok=False,
+                    message=f"edits[{i}] needs old_string and new_string.",
+                )
         return ValidationResult(ok=True)
 
     def check_permissions(self, ctx: ToolUseContext, arguments: dict[str, Any]):
@@ -94,52 +119,24 @@ class FileEditTool(BaseTool):
         return file_decision
 
     async def execute(self, tool_call: ToolCall, ctx: ToolUseContext) -> ToolResult:
-        request = FileEditRequest(
-            file_path=str(resolve_under_cwd(tool_call.arguments["file_path"], ctx.cwd)),
-            old_string=str(tool_call.arguments.get("old_string", "")),
-            new_string=str(tool_call.arguments.get("new_string", "")),
-            replace_all=bool(tool_call.arguments.get("replace_all", False)),
-            create_if_missing=bool(tool_call.arguments.get("create_if_missing", False)),
-            expected_hash=tool_call.arguments.get("expected_hash"),
-            runtime_command=tool_call.arguments.get("runtime_command"),
-            runtime_shell=tool_call.arguments.get("runtime_shell"),
-            metadata={"prompt_language": ctx.prompt_language, "environment": ctx.environment},
-        )
+        args = tool_call.arguments or {}
+        resolved = str(resolve_under_cwd(args["file_path"], ctx.cwd))
         facade = self._facade_for(ctx.cwd)
-        result = await asyncio.to_thread(facade.apply_precise_edit, request)
-        return self._to_tool_result(tool_call, result)
-
-    def build_patch_preview(
-        self,
-        arguments: dict[str, Any],
-        *,
-        cwd: str | None = None,
-        ctx: ToolUseContext | None = None,
-    ) -> dict[str, Any]:
-        """Build an edit preview using the same path resolution as ``execute``.
-
-        ``cwd`` / ``ctx.cwd`` is required so relative ``file_path`` values resolve
-        under the session workspace, not the Python process working directory.
-        """
-        session_cwd = cwd if cwd is not None else (ctx.cwd if ctx is not None else None)
-        if not session_cwd:
-            raise ValueError("cwd or ctx is required to resolve file_path for preview")
-        request = FileEditRequest(
-            file_path=str(resolve_under_cwd(arguments["file_path"], session_cwd)),
-            old_string=str(arguments.get("old_string", "")),
-            new_string=str(arguments.get("new_string", "")),
-            replace_all=bool(arguments.get("replace_all", False)),
-            create_if_missing=bool(arguments.get("create_if_missing", False)),
-            expected_hash=arguments.get("expected_hash"),
-            runtime_command=arguments.get("runtime_command"),
-            runtime_shell=arguments.get("runtime_shell"),
+        result = await asyncio.to_thread(
+            apply_batch_edit_to_file,
+            file_path=resolved,
+            edits=list(args.get("edits") or []),
+            expected_hash=args.get("expected_hash"),
+            rollback_manager=facade.rollback_manager,
+            validator=facade.validator,
+            runtime_command=args.get("runtime_command"),
+            runtime_shell=args.get("runtime_shell"),
         )
-        return self._facade_for(session_cwd).preview_edit(request).to_dict()
-
-    def _to_tool_result(self, tool_call: ToolCall, result: EditResult) -> ToolResult:
-        content = "File edit applied." if result.success else "File edit failed."
-        if result.preview is not None and result.preview.diff:
-            content = f"{content}\n\n{result.preview.diff}"
+        content = "File edit batch applied." if result.success else "File edit batch failed."
+        if result.diff:
+            content = f"{content}\n\n{result.diff}"
+        elif result.error_code:
+            content = f"{content} ({result.error_code})"
         data = result.to_dict()
         return ToolResult(
             tool_use_id=tool_call.tool_use_id,

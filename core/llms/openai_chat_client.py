@@ -12,7 +12,19 @@ from ._empty_content_retry import (
 from ..utils.config_setting import Config
 from ..utils.handle_max_tokens import handle_max_tokens
 from ratelimit import limits, sleep_and_retry
-from tenacity import retry, stop_after_attempt, wait_fixed
+from tenacity import RetryCallState, retry, wait_fixed
+
+
+def _stop_client_retry(retry_state: RetryCallState) -> bool:
+    client = retry_state.args[0] if retry_state.args else None
+    maximum = max(1, int(getattr(client, "_chat_retry_max_attempts", 12)))
+    return retry_state.attempt_number >= maximum
+
+
+def _stop_tool_retry(retry_state: RetryCallState) -> bool:
+    client = retry_state.args[0] if retry_state.args else None
+    maximum = max(1, int(getattr(client, "_tool_retry_max_attempts", 4)))
+    return retry_state.attempt_number >= maximum
 
 
 class OpenAIChatClient(LLMApiClient):
@@ -47,14 +59,24 @@ class OpenAIChatClient(LLMApiClient):
                  parallel_tool_calls: Optional[bool] = None, seed: Optional[int] = None,
                  service_tier: Optional[str] = None, extra_body: Optional[Dict[str, Any]] = None,
                  context_window_tokens: Optional[int] = None,
+                 max_retries: int = 5,
+                 trust_env: bool = True,
+                 request_timeout_s: float = 600.0,
                  ):
         config = Config()
         if api_key == "" and config.has_key("openai_api_key"):
             api_key = config.get("openai_api_key")
 
+        self.request_timeout_s = max(1.0, float(request_timeout_s))
         http_client = httpx.Client(
             limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
-            timeout=httpx.Timeout(timeout=600.0, connect=60.0, read=600.0, write=120.0)
+            timeout=httpx.Timeout(
+                timeout=self.request_timeout_s,
+                connect=60.0,
+                read=self.request_timeout_s,
+                write=120.0,
+            ),
+            trust_env=bool(trust_env),
         )
 
         self.client = OpenAI(
@@ -69,8 +91,11 @@ class OpenAIChatClient(LLMApiClient):
             api_key=api_key or "not-configured",
             base_url=base_url,
             http_client=http_client,
-            max_retries=5
+            max_retries=max(0, int(max_retries)),
         )
+        self._chat_retry_max_attempts = 12
+        self._tool_retry_max_attempts = 4
+        self.trust_env = bool(trust_env)
         self.chat_count = 0
         self.token_count = 0
         self.prompt_token_count = 0
@@ -134,7 +159,7 @@ class OpenAIChatClient(LLMApiClient):
 
     @sleep_and_retry
     @limits(calls=20, period=1)
-    @retry(stop=stop_after_attempt(12), wait=wait_fixed(5))
+    @retry(stop=_stop_client_retry, wait=wait_fixed(5))
     def one_chat(self, message: str, is_stream: bool = False) -> Union[str, Iterator[str]]:
         if not self.history:
             self.set_system_message()
@@ -258,7 +283,7 @@ class OpenAIChatClient(LLMApiClient):
             "messages": messages,
             "temperature": self.temperature,
             "stream": is_stream,
-            "timeout": 600,
+            "timeout": self.request_timeout_s,
         }
         if is_stream:
             kwargs["stream_options"] = {"include_usage": True}
@@ -347,7 +372,7 @@ class OpenAIChatClient(LLMApiClient):
         self._update_stats(completion.usage)
         return choice.message.content
 
-    @retry(stop=stop_after_attempt(4), wait=wait_fixed(5))
+    @retry(stop=_stop_tool_retry, wait=wait_fixed(5))
     def tool_invoke(self, messages: List[Dict[str, str]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Unlike one_chat (above), this had no retry until this decorator was
         # added: a single transient httpx.RemoteProtocolError / APIConnectionError
@@ -362,7 +387,7 @@ class OpenAIChatClient(LLMApiClient):
             "messages": messages,
             "temperature": self.temperature,
             "stream": False,
-            "timeout": 600,
+            "timeout": self.request_timeout_s,
             "tools": tools,
         }
         if self.max_tokens is not None:

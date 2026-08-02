@@ -2618,6 +2618,66 @@ class CodeAgent:
                 # Prefer any not-passed; among same polarity, last wins.
                 contract_verdict = cv
 
+        # Principle 8: observed write/read sets on concurrent siblings that
+        # conflict (no depends_on edge either way) are a race — fail loud.
+        from .agents.rwset import detect_parallel_observed_conflicts
+        observed_nodes: list[tuple[str, Any, list[str]]] = []
+        for row in all_nodes:
+            nid = str(row.get("node_id") or "")
+            if not nid or nid == root_node_id:
+                continue
+            res = memory_results.get(nid)
+            if res is None:
+                res = row.get("result")
+            extras = res.get("extras") if isinstance(res, dict) else None
+            spec = row.get("spec") if isinstance(row.get("spec"), dict) else {}
+            deps_raw = spec.get("depends_on") or row.get("depends_on") or []
+            deps = [str(d) for d in deps_raw] if isinstance(deps_raw, (list, tuple)) else []
+            observed_nodes.append((nid, extras, deps))
+        write_conflicts = detect_parallel_observed_conflicts(observed_nodes)
+
+        # Guard install failures (patch-first / write_scope): metadata was
+        # stamped but the tool wrapper never landed — the turn ran ungarded.
+        # Surface at run level so CLI / ``result.failed`` cannot greenwash it
+        # (mirrors write_conflicts elevation below).
+        guard_install_failures: list[dict[str, Any]] = []
+        for row in all_nodes:
+            nid = str(row.get("node_id") or "")
+            if not nid:
+                continue
+            res = memory_results.get(nid)
+            if res is None:
+                res = row.get("result")
+            if not isinstance(res, dict):
+                continue
+            extras = res.get("extras")
+            if not isinstance(extras, dict):
+                continue
+            failed_guards = extras.get("ccx_guard_install_failed")
+            if not failed_guards:
+                continue
+            if isinstance(failed_guards, str):
+                guards = [failed_guards]
+            elif isinstance(failed_guards, (list, tuple)):
+                guards = [str(g) for g in failed_guards if str(g).strip()]
+            else:
+                continue
+            if not guards:
+                continue
+            guard_install_failures.append({
+                "node_id": nid,
+                "guards": guards,
+            })
+            governance_errors.append({
+                "node_id": nid,
+                "error": (
+                    "guard install failed — stamped discipline not enforced: "
+                    + ", ".join(guards)
+                ),
+                "error_code": "CCX_GUARD_INSTALL_FAILED",
+                "command": None,
+            })
+
         session_snapshot = {
             "run_id": run_id,
             "status": verdict.status.value,
@@ -2635,6 +2695,10 @@ class CodeAgent:
             "child_artifacts": child_artifacts,
             "governance_errors": governance_errors,
             "contract_verdict": contract_verdict,
+            "write_conflicts": write_conflicts,
+            "ccx_write_conflict": bool(write_conflicts),
+            "guard_install_failures": guard_install_failures,
+            "ccx_guard_install_failed": bool(guard_install_failures),
             # Run-level audit verdict. Default ``None`` (no run-level contract);
             # set once from the outer verify-repair loop (``_run_with_run_audit``
             # → ``_stamp``), NOT scavenged from node extras — kept distinct from
@@ -2679,6 +2743,22 @@ class CodeAgent:
             and memory_results.get(root_node_id) is None
         )
         failed = verdict.status not in (RunStatus.COMPLETED,) or degraded_result
+        write_conflict_failed = bool(write_conflicts) and not failed
+        if write_conflict_failed:
+            failed = True
+            logger.warning(
+                "ccx run %s COMPLETED but concurrent siblings raced on "
+                "overlapping write/read sets (%d conflict pair(s))",
+                run_id, len(write_conflicts),
+            )
+        guard_install_failed = bool(guard_install_failures) and not failed
+        if guard_install_failed:
+            failed = True
+            logger.warning(
+                "ccx run %s COMPLETED but %d node(s) stamped guards that "
+                "failed to install (ungarded turn)",
+                run_id, len(guard_install_failures),
+            )
         tool_call_count = 0
         try:
             tool_call_count = sum(
@@ -2690,6 +2770,27 @@ class CodeAgent:
             )
         except Exception:
             logger.debug("ccx: failed to count cc.tool_use events", exc_info=True)
+        if write_conflict_failed:
+            error_code = "CCX_WRITE_CONFLICT"
+            error_message = (
+                f"{len(write_conflicts)} concurrent sibling write/read "
+                "conflict(s) observed"
+            )
+        elif guard_install_failed:
+            error_code = "CCX_GUARD_INSTALL_FAILED"
+            error_message = (
+                f"{len(guard_install_failures)} node(s) failed to install "
+                "stamped write guards"
+            )
+        elif not failed:
+            error_code = None
+            error_message = None
+        elif degraded_result:
+            error_code = "CCX_RESULT_DEGRADED"
+            error_message = "verdict completed but root result is unavailable"
+        else:
+            error_code = "CCX_VERDICT_NOT_COMPLETED"
+            error_message = f"verdict status: {verdict.status.value}"
         return AgentRunResult(
             final_text=final_text,
             session_id=run_id,
@@ -2700,24 +2801,8 @@ class CodeAgent:
             messages=[],
             tool_call_count=tool_call_count,
             failed=failed,
-            error_code=(
-                None
-                if not failed
-                else (
-                    "CCX_RESULT_DEGRADED"
-                    if degraded_result
-                    else "CCX_VERDICT_NOT_COMPLETED"
-                )
-            ),
-            error_message=(
-                None
-                if not failed
-                else (
-                    "verdict completed but root result is unavailable"
-                    if degraded_result
-                    else f"verdict status: {verdict.status.value}"
-                )
-            ),
+            error_code=error_code,
+            error_message=error_message,
         )
 
 

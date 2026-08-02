@@ -57,6 +57,7 @@ from .metadata_inheritance import (
     DEFAULT_MAX_SPAWN_FANOUT,
     INHERITABLE_METADATA_KEYS,
     SPAWN_DEPTH_METADATA_KEY,
+    apply_constraint_ceiling,
     coerce_spawn_depth,
 )
 
@@ -925,6 +926,63 @@ class CcAgentRunner(ModeRunner):
             timeout_s=self.interaction_timeout_s,
         )
 
+        # Patch-first (principle 1): on repair/iteration turns, refuse
+        # file_write overwrites unless rewrite was explicitly authorized.
+        from .patch_first import (
+            append_patch_first_hint,
+            install_patch_first_guard,
+            patch_first_enabled,
+            rewrite_allowed,
+        )
+        caller_meta_early = invocation.metadata or {}
+        guard_install_failed: list[str] = []
+        if patch_first_enabled(caller_meta_early):
+            # allow_rewrite ⇒ install returns False intentionally (no guard).
+            pf_ok = install_patch_first_guard(
+                engine, allow_rewrite=rewrite_allowed(caller_meta_early),
+            )
+            if not pf_ok and not rewrite_allowed(caller_meta_early):
+                guard_install_failed.append("patch_first")
+                logger.warning(
+                    "ccx patch-first: metadata stamped but guard install "
+                    "failed (registry/_tools missing?) — write discipline "
+                    "is NOT enforced this turn"
+                )
+        # Declared write_scope (principle 8): refuse file_edit/file_write
+        # outside ccx_write_scope when the caller stamped a non-empty list.
+        from .write_scope_guard import (
+            install_write_scope_guard,
+            write_scope_from_metadata,
+        )
+        declared_write_scope = write_scope_from_metadata(caller_meta_early)
+        if declared_write_scope:
+            ws_ok = install_write_scope_guard(
+                engine,
+                write_scope=declared_write_scope,
+                cwd=str(self.cwd or ""),
+            )
+            if not ws_ok:
+                guard_install_failed.append("write_scope")
+                logger.warning(
+                    "ccx write_scope: metadata stamped %s but guard install "
+                    "failed (registry/_tools missing?) — path ceiling is "
+                    "NOT enforced this turn",
+                    declared_write_scope,
+                )
+        # Write-without-read (principle 1/6): governance turns must read the
+        # candidate before file_edit. Same stamp set as patch-first / scope.
+        if patch_first_enabled(caller_meta_early) or declared_write_scope:
+            from .read_before_write import install_read_before_write_guard
+            rbw_ok = install_read_before_write_guard(
+                engine, cwd=str(self.cwd or ""),
+            )
+            if not rbw_ok:
+                guard_install_failed.append("read_before_write")
+                logger.warning(
+                    "ccx read-before-write: governance stamp present but "
+                    "guard install failed — file_edit may run unread"
+                )
+
         # Build the cc→v5 event bridge sink. Inside a real v5 dispatch
         # the sink resolves to the dispatcher's emit callback (so cc
         # SessionEvents become persisted v5 events tagged with this
@@ -945,6 +1003,10 @@ class CcAgentRunner(ModeRunner):
         caller_meta = invocation.metadata or {}
         caller_system_prompt = str(caller_meta.get("system_prompt") or "")
         caller_language = str(caller_meta.get("language") or "en")
+        if patch_first_enabled(caller_meta):
+            caller_system_prompt = append_patch_first_hint(
+                caller_system_prompt, language=caller_language,
+            )
         effective_goal = invocation.goal
         if caller_system_prompt:
             framed_system = _compose_system_prompt_with_dedup_tail(
@@ -953,6 +1015,9 @@ class CcAgentRunner(ModeRunner):
             effective_goal = (
                 f"<system>\n{framed_system}\n</system>\n\n{invocation.goal}"
             )
+
+        from .rwset import RwSet, merge_rwset_into_extras
+        rw_tracker = RwSet()
 
         final_text = ""
         turn_timed_out = False
@@ -967,6 +1032,7 @@ class CcAgentRunner(ModeRunner):
                 event_count += 1
                 if event.event_type == "assistant_tool_use":
                     tool_call_count += 1
+                    _observe_rw_from_event(rw_tracker, event)
                 msg = getattr(event, "message", None)
                 if msg is None:
                     continue
@@ -1006,13 +1072,19 @@ class CcAgentRunner(ModeRunner):
         # counter.
         child_spawn_depth = spawn_depth + 1
 
-        def _inherit(child_meta: dict[str, Any]) -> dict[str, Any]:
+        def _inherit(
+            child_meta: dict[str, Any],
+            *,
+            goal: str | None = None,
+        ) -> tuple[dict[str, Any], str | None]:
             out = dict(child_meta)
             for key in INHERITABLE_METADATA_KEYS:
                 if key in parent_meta and key not in out:
                     out[key] = parent_meta[key]
             out[SPAWN_DEPTH_METADATA_KEY] = child_spawn_depth
-            return out
+            # Clamp write/read scope + keep parent invariants (child may
+            # narrow / add, never widen / drop).
+            return apply_constraint_ceiling(parent_meta, out, goal=goal)
 
         if research_buffer is not None and hasattr(research_buffer, "drain"):
             from .ccx_research_tool import normalize_focus_paths
@@ -1030,10 +1102,11 @@ class CcAgentRunner(ModeRunner):
                         depends_on_previous=depends_on_previous,
                     ),
                 }
+                meta, new_goal = _inherit(metadata, goal=raw["question"])
                 subtasks.append(SubagentInvocation(
-                    goal=raw["question"],
+                    goal=new_goal if new_goal is not None else raw["question"],
                     mode="research",
-                    metadata=_inherit(metadata),
+                    metadata=meta,
                 ))
 
         spawn_depth_refused = 0
@@ -1058,10 +1131,11 @@ class CcAgentRunner(ModeRunner):
                         depends_on_previous=depends_on_previous,
                     ),
                 }
+                meta, new_goal = _inherit(metadata, goal=raw["goal"])
                 subtasks.append(SubagentInvocation(
-                    goal=raw["goal"],
+                    goal=new_goal if new_goal is not None else raw["goal"],
                     mode=raw.get("mode", "agent"),
-                    metadata=_inherit(metadata),
+                    metadata=meta,
                 ))
                 spawn_index += 1
 
@@ -1091,13 +1165,14 @@ class CcAgentRunner(ModeRunner):
                         depends_on_previous=depends_on_previous,
                     ),
                 }
+                meta, new_goal = _inherit(metadata, goal=raw["instruction"])
                 subtasks.append(SubagentInvocation(
                     # ``mode`` is "sgar" (→ ccx.sgar / .sgar/) or "sgarx"
                     # (→ ccx.sgarx / .sgarx/, with reopen/abandon). Both
                     # share this buffer; the unified tool stamps the variant.
-                    goal=raw["instruction"],
+                    goal=new_goal if new_goal is not None else raw["instruction"],
                     mode=raw.get("mode", "sgar"),
-                    metadata=_inherit(metadata),
+                    metadata=meta,
                 ))
 
         extras: dict[str, Any] = {
@@ -1109,6 +1184,9 @@ class CcAgentRunner(ModeRunner):
             "research_count": research_count,
             "sgar_count": sgar_count,
         }
+        if guard_install_failed:
+            extras["ccx_guard_install_failed"] = list(guard_install_failed)
+        extras = merge_rwset_into_extras(extras, rw_tracker)
         if spawn_depth_exceeded:
             extras["spawn_depth"] = spawn_depth
             extras["spawn_depth_limit"] = self.max_spawn_depth
@@ -1176,6 +1254,30 @@ def _run_in_thread(coro: Any) -> Any:
     if "error" in box:
         raise box["error"]
     return box.get("result")
+
+
+def _observe_rw_from_event(rw_tracker: Any, event: Any) -> None:
+    """Best-effort path extraction from a cc SessionEvent into an RwSet."""
+    msg = getattr(event, "message", None)
+    meta = getattr(msg, "metadata", None) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    payload = meta.get("structured_payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    tool_name = (
+        payload.get("tool_name")
+        or getattr(msg, "tool_name", None)
+        or meta.get("tool_name")
+        or ""
+    )
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = meta.get("arguments") if isinstance(meta.get("arguments"), dict) else {}
+    try:
+        rw_tracker.observe_tool(str(tool_name), arguments)
+    except Exception:  # noqa: BLE001 — never break the turn for telemetry
+        pass
 
 
 # ``_run_in_fresh_loop`` is exported with the leading underscore

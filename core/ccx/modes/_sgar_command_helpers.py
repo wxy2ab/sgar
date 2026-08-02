@@ -38,6 +38,24 @@ _COMMAND_ALIASES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("close-stage",), "close-stage"),
     (("reopen-stage",), "reopen-stage"),
     (("abandon-stage",), "abandon-stage"),
+    # Stage-internal candidate frontier (sgarx-only via supports_frontier).
+    (("frontier",), "frontier"),
+    (("list-frontier",), "frontier"),
+    (("list", "frontier"), "frontier"),
+    (("propose-candidate",), "propose-candidate"),
+    (("propose", "candidate"), "propose-candidate"),
+    (("audit-candidate",), "audit-candidate"),
+    (("audit", "candidate"), "audit-candidate"),
+    (("promote-candidate",), "promote-candidate"),
+    (("promote", "candidate"), "promote-candidate"),
+    (("patch-candidate",), "patch-candidate"),
+    (("patch", "candidate"), "patch-candidate"),
+    (("discard-candidate",), "discard-candidate"),
+    (("discard", "candidate"), "discard-candidate"),
+    (("show-candidate",), "show-candidate"),
+    (("show", "candidate"), "show-candidate"),
+    (("import-candidate-mission",), "import-candidate-mission"),
+    (("import", "candidate", "mission"), "import-candidate-mission"),
     # Mission isolation — previously CLI-only. Wired into the agent-driven
     # surface so a supervisor can drive isolated sub-tasks (input-hash
     # staleness, scoped outputs) that DO NOT advance the hard DAG. Both the
@@ -58,6 +76,17 @@ _COMMAND_ALIASES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("status",), "status"),
     (("init",), "init"),
 )
+
+_FRONTIER_COMMANDS = frozenset({
+    "frontier",
+    "propose-candidate",
+    "audit-candidate",
+    "promote-candidate",
+    "patch-candidate",
+    "discard-candidate",
+    "show-candidate",
+    "import-candidate-mission",
+})
 
 _RESUME_MARKER = "## Prior session context"
 _MEMORY_MARKER = "## Persistent memory"
@@ -368,6 +397,209 @@ def _artifact_paths(tokens: list[str]) -> list[str]:
     return _option_multi(tokens, "--artifact")
 
 
+def _candidate_artifact_paths(tokens: list[str]) -> list[str]:
+    """Merge repeatable ``--artifact`` and CSV ``--artifacts``."""
+    paths = list(_option_multi(tokens, "--artifact"))
+    csv = _option(tokens, "--artifacts", "")
+    if csv.strip():
+        paths.extend(part.strip() for part in csv.split(",") if part.strip())
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _frontier_stage_id(runtime: Any, tokens: list[str]) -> str:
+    if "--stage" in tokens:
+        stage_id = _option(tokens, "--stage").strip()
+        if not stage_id:
+            raise SgarError("--stage requires a value")
+        return stage_id
+    state = runtime.store.load_state()
+    if state.current_stage_id:
+        return str(state.current_stage_id)
+    raise SgarError(
+        "frontier command requires --stage or an active current stage"
+    )
+
+
+def _require_nonblank(option: str, value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise SgarError(f"{option} requires a non-blank value")
+    return text
+
+
+def _format_frontier_text(runtime: Any, stage_id: str) -> str:
+    frontier = runtime.list_frontier(stage_id)
+    candidates = runtime.list_candidates(stage_id)
+    promoted = frontier.promoted_candidate_id or "-"
+    lines = [
+        f"Frontier {stage_id} policy={frontier.policy} "
+        f"active={len(frontier.active_candidate_ids)} "
+        f"promoted={promoted} "
+        f"budgets={len(candidates)}/{frontier.max_candidates} "
+        f"{frontier.audit_count}/{frontier.max_audits} "
+        f"{frontier.patch_count}/{frontier.max_patches}",
+        "candidates:",
+    ]
+    if not candidates:
+        lines.append("  (none)")
+    else:
+        for record in candidates:
+            parent = record.parent_id or "-"
+            lines.append(
+                f"  - {record.candidate_id} {record.status} parent={parent}"
+            )
+    return "\n".join(lines)
+
+
+def _format_candidate_text(record: Any) -> str:
+    parent = record.parent_id or "-"
+    artifacts = ", ".join(record.artifact_paths) if record.artifact_paths else "-"
+    return "\n".join([
+        f"candidate {record.candidate_id} status={record.status} "
+        f"parent={parent} origin={record.origin} hash={record.candidate_hash}",
+        f"summary: {record.summary or '-'}",
+        f"artifacts: {artifacts}",
+    ])
+
+
+def _run_frontier_instruction(
+    runtime: Any,
+    command: str,
+    tokens: list[str],
+) -> tuple[str, dict[str, Any]]:
+    stage_id = _frontier_stage_id(runtime, tokens)
+    if command == "frontier":
+        text = _format_frontier_text(runtime, stage_id)
+        return text, {"stage_id": stage_id}
+    if command == "propose-candidate":
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        summary = _require_nonblank("--summary", _option(tokens, "--summary"))
+        artifacts = _candidate_artifact_paths(tokens)
+        if not artifacts:
+            raise SgarError(
+                "propose-candidate requires --artifact / artifact_paths"
+            )
+        record = runtime.propose_candidate(
+            stage_id,
+            candidate_id=candidate_id,
+            summary=summary,
+            artifact_paths=artifacts,
+        )
+        return (
+            f"OK propose-candidate {record.candidate_id} "
+            f"status={record.status} hash={record.candidate_hash}",
+            {"stage_id": stage_id, "candidate": _serialize(record)},
+        )
+    if command == "audit-candidate":
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        from_checks = _flag(tokens, "--from-checks")
+        passed_flag = _flag(tokens, "--pass")
+        failed_flag = _flag(tokens, "--fail")
+        if from_checks:
+            if passed_flag or failed_flag:
+                raise SgarError(
+                    "audit-candidate --from-checks cannot combine with "
+                    "--pass or --fail"
+                )
+            if _option_multi(tokens, "--finding"):
+                raise SgarError(
+                    "audit-candidate --from-checks cannot combine with --finding"
+                )
+            record = runtime.audit_candidate_from_checks(stage_id, candidate_id)
+        else:
+            if passed_flag and failed_flag:
+                raise SgarError("audit-candidate cannot combine --pass and --fail")
+            if not passed_flag and not failed_flag:
+                raise SgarError(
+                    "audit-candidate requires --pass, --fail, or --from-checks"
+                )
+            findings = _option_multi(tokens, "--finding")
+            method = (
+                _option(tokens, "--method", "criterion_checks") or "criterion_checks"
+            )
+            record = runtime.audit_candidate(
+                stage_id,
+                candidate_id,
+                passed=passed_flag,
+                findings=findings,
+                method=method,
+                evidence_paths=_option_multi(tokens, "--evidence") or None,
+            )
+        frontier = runtime.list_frontier(stage_id)
+        return (
+            f"OK audit-candidate {record.candidate_id} "
+            f"status={record.status} audit_count={frontier.audit_count}",
+            {"stage_id": stage_id, "candidate": _serialize(record)},
+        )
+    if command == "promote-candidate":
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        record = runtime.promote_candidate(stage_id, candidate_id)
+        return (
+            f"OK promote-candidate {record.candidate_id}",
+            {"stage_id": stage_id, "candidate": _serialize(record)},
+        )
+    if command == "patch-candidate":
+        parent_id = _require_nonblank("--from", _option(tokens, "--from"))
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        summary = _require_nonblank("--summary", _option(tokens, "--summary"))
+        artifacts = _candidate_artifact_paths(tokens)
+        if not artifacts:
+            raise SgarError(
+                "patch-candidate requires --artifact / artifact_paths"
+            )
+        record = runtime.patch_candidate(
+            stage_id,
+            parent_id=parent_id,
+            candidate_id=candidate_id,
+            summary=summary,
+            artifact_paths=artifacts,
+        )
+        return (
+            f"OK patch-candidate {record.candidate_id} "
+            f"parent={record.parent_id} status={record.status}",
+            {"stage_id": stage_id, "candidate": _serialize(record)},
+        )
+    if command == "discard-candidate":
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        record = runtime.discard_candidate(stage_id, candidate_id)
+        return (
+            f"OK discard-candidate {record.candidate_id} status={record.status}",
+            {"stage_id": stage_id, "candidate": _serialize(record)},
+        )
+    if command == "show-candidate":
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        record = runtime.get_candidate(stage_id, candidate_id)
+        return _format_candidate_text(record), {
+            "stage_id": stage_id,
+            "candidate": _serialize(record),
+        }
+    if command == "import-candidate-mission":
+        mission_id = _require_nonblank("--mission", _option(tokens, "--mission"))
+        candidate_id = _require_nonblank("--id", _option(tokens, "--id"))
+        summary_raw = _option(tokens, "--summary", "")
+        summary = summary_raw.strip() or None
+        record = runtime.import_candidate_from_mission(
+            stage_id,
+            mission_id=mission_id,
+            candidate_id=candidate_id,
+            summary=summary,
+            artifact_paths=_candidate_artifact_paths(tokens) or None,
+        )
+        return (
+            f"OK import-candidate-mission {record.candidate_id} "
+            f"origin={record.origin} status={record.status}",
+            {"stage_id": stage_id, "candidate": _serialize(record)},
+        )
+    raise SgarError(f"unrecognized frontier command: {command}")
+
+
 def _format_trace(records: list[dict]) -> str:
     if not records:
         return "No SGAR trace records."
@@ -431,10 +663,16 @@ def run_sgar_instruction(
     *,
     llm: Any = None,
     supports_reopen_abandon: bool = False,
+    supports_frontier: bool = False,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     command, command_text = resolve_sgar_command(instruction, metadata=metadata)
     tokens = _tokens(command_text)
+
+    if command in _FRONTIER_COMMANDS:
+        if not supports_frontier:
+            raise SgarError(f"{command} requires sgarx")
+        return _run_frontier_instruction(runtime, command, tokens)
 
     if command == "init":
         state = runtime.init()
@@ -566,14 +804,24 @@ def run_sgar_instruction(
                 "create-mission requires at least one --expected-output"
             )
         scope = _option_multi(tokens, "--scope") or None
-        manifest = runtime.create_mission(
-            mission_id=mission_id,
-            kind=kind,
-            objective=objective,
-            input_paths=input_paths,
-            expected_outputs=expected_outputs,
-            allowed_scope=scope,
-        )
+        target_criterion = _option(tokens, "--target-criterion") or None
+        create_kwargs: dict[str, Any] = {
+            "mission_id": mission_id,
+            "kind": kind,
+            "objective": objective,
+            "input_paths": input_paths,
+            "expected_outputs": expected_outputs,
+            "allowed_scope": scope,
+        }
+        if target_criterion is not None:
+            from ..sgarx.runtime import SgarxRuntime
+
+            if not isinstance(runtime, SgarxRuntime):
+                raise SgarError(
+                    "create-mission --target-criterion requires sgarx"
+                )
+            create_kwargs["target_criterion"] = target_criterion
+        manifest = runtime.create_mission(**create_kwargs)
         return f"Created mission {mission_id}.", {
             "manifest": _serialize(manifest),
             "mission_id": mission_id,
@@ -604,6 +852,8 @@ def run_sgar_instruction(
 __all__ = [
     "SGAR_GOVERNANCE_REJECTED",
     "SGAR_INSTRUCTION_UNRECOGNIZED",
+    "_format_candidate_text",
+    "_format_frontier_text",
     "_session_id",
     "governance_error_extras",
     "resolve_sgar_command",

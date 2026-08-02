@@ -36,6 +36,8 @@ from core.cc.tools.base import (
     ValidationResult,
 )
 
+from .incremental_verify import normalize_scope
+from .rwset import READ_SCOPE_METADATA_KEY, WRITE_SCOPE_METADATA_KEY
 from .subagent import CCX_REQUIRES_APPROVAL_UNSUPPORTED
 
 
@@ -65,6 +67,25 @@ _TOOL_DESCRIPTION = (
     "agent node in the orchestration DAG."
 )
 
+_WRITE_SCOPE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Paths / path prefixes this child will WRITE. Siblings whose write "
+        "scopes overlap are serialized instead of run in parallel, so "
+        "declaring it prevents two children from racing on the same files."
+    ),
+}
+
+_READ_SCOPE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Paths / path prefixes this child will READ. Used together with "
+        "write_scope to detect read/write conflicts between siblings."
+    ),
+}
+
 _INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -87,14 +108,21 @@ _INPUT_SCHEMA: dict[str, Any] = {
                 "Optional machine-verified acceptance contract folded into "
                 "the child's metadata['ccx_contract']. Spawner-authored; "
                 "honored by 'agent' mode under cc_query_loop when the runner "
-                "has the spawn-contract feature enabled."
+                "has the spawn-contract feature enabled. Shape: "
+                "{acceptance:[{id,text,check?,scope?}], "
+                "verify:'check'|'none', loop:{max_iters,no_progress_stop}}. "
+                "Optional per-item 'scope' lists path prefixes for "
+                "incremental verification."
             ),
         },
+        "write_scope": _WRITE_SCOPE_SCHEMA,
+        "read_scope": _READ_SCOPE_SCHEMA,
         "spawns": {
             "type": "array",
             "description": (
-                "Bulk spawn — list of {goal, mode, metadata, contract} "
-                "entries. Mutually exclusive with the top-level 'goal' field."
+                "Bulk spawn — list of {goal, mode, metadata, contract, "
+                "write_scope, read_scope} entries. Mutually exclusive with "
+                "the top-level 'goal' field."
             ),
             "items": {
                 "type": "object",
@@ -106,6 +134,8 @@ _INPUT_SCHEMA: dict[str, Any] = {
                     },
                     "metadata": {"type": "object"},
                     "contract": {"type": "object"},
+                    "write_scope": _WRITE_SCOPE_SCHEMA,
+                    "read_scope": _READ_SCOPE_SCHEMA,
                 },
                 "required": ["goal"],
             },
@@ -134,6 +164,25 @@ def _with_contract(
     """
     if contract is not None:
         metadata.setdefault("ccx_contract", contract)
+    return metadata
+
+
+def _with_scopes(
+    metadata: dict[str, Any], entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Fold the convenience ``write_scope`` / ``read_scope`` fields into the
+    metadata keys ``rwset`` reads, so conflicting siblings get serialized.
+
+    ``setdefault`` for the same reason as ``_with_contract``: a caller who
+    wrote the metadata key directly wins over the schema field.
+    """
+    for field_name, key in (
+        ("write_scope", WRITE_SCOPE_METADATA_KEY),
+        ("read_scope", READ_SCOPE_METADATA_KEY),
+    ):
+        scope = list(normalize_scope(entry.get(field_name)))
+        if scope:
+            metadata.setdefault(key, scope)
     return metadata
 
 
@@ -304,8 +353,11 @@ class CcxSpawnTool(BaseTool):
             spawns_input.append(SpawnRequest(
                 goal=str(args["goal"]),
                 mode=str(args.get("mode") or "agent"),
-                metadata=_with_contract(
-                    dict(args.get("metadata") or {}), args.get("contract"),
+                metadata=_with_scopes(
+                    _with_contract(
+                        dict(args.get("metadata") or {}), args.get("contract"),
+                    ),
+                    args,
                 ),
             ))
         else:
@@ -314,9 +366,12 @@ class CcxSpawnTool(BaseTool):
                 spawns_input.append(SpawnRequest(
                     goal=str(entry["goal"]),
                     mode=str(entry.get("mode") or "agent"),
-                    metadata=_with_contract(
-                        dict(entry.get("metadata") or {}),
-                        entry.get("contract"),
+                    metadata=_with_scopes(
+                        _with_contract(
+                            dict(entry.get("metadata") or {}),
+                            entry.get("contract"),
+                        ),
+                        entry,
                     ),
                     sequential_with_previous=(sequential and index > 0),
                 ))

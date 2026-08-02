@@ -27,10 +27,14 @@ _PLANNER_SYSTEM_EN = (
     "2. verification — HOW to verify the goal is met, set ONCE and never "
     "relaxed later. Prefer objective machine checks; add a judge rubric only "
     "for aspects no command can test. Two fields:\n"
-    "   - checks: a list of {id, text, check} objects. 'check' is a SINGLE "
-    "shell command run via shlex.split (NO shell features: no pipes, &&, >, "
-    "globs — wrap those explicitly as `sh -c \"...\"`). Exit code 0 == the "
-    "criterion passes. These are the AUTHORITATIVE objective gate.\n"
+    "   - checks: a list of {id, text, check, scope?} objects. 'check' is a "
+    "SINGLE shell command run via shlex.split (NO shell features: no pipes, "
+    "&&, >, globs — wrap those explicitly as `sh -c \"...\"`). Exit code 0 "
+    "== the criterion passes. These are the AUTHORITATIVE objective gate. "
+    "Optional 'scope' is a list of path prefixes this check depends on "
+    "(same semantics as spawn contract acceptance.scope / SGAR "
+    "`[scope: …]`); when set, incremental verify may skip the check if the "
+    "latest patch does not touch those paths.\n"
     "     Each check MUST be PORTABLE and SELF-CONTAINED — runnable as-is from "
     "the working directory on a POSIX shell (macOS/BSD AND Linux). Use only "
     "portable tools (test, ls, grep -q, cat); do NOT use sha256sum, `stat -f`, "
@@ -51,10 +55,21 @@ _PLANNER_SYSTEM_EN = (
     "execute as a fixed step list, 'complex' if it needs investigation / the "
     "shape of the work is uncertain.\n"
     "4. dag — the first iteration's plan as a list of work nodes "
-    "{id, goal, depends_on}. 'id' is a short label (e.g. 'n1'). 'depends_on' "
-    "is a list of OTHER node ids that must finish first (only backward "
-    "references — no cycles). Independent nodes run in parallel.\n"
-    "5. rationale — one or two sentences on why this decomposition.\n\n"
+    "{id, goal, depends_on, write_scope, read_scope}. 'id' is a short label "
+    "(e.g. 'n1'). 'depends_on' is a list of OTHER node ids that must finish "
+    "first (only backward references — no cycles). Independent nodes run in "
+    "parallel. 'write_scope' / 'read_scope' are optional path prefixes the "
+    "node will write / read; declare them so nodes that touch the same files "
+    "are run in sequence instead of racing.\n"
+    "5. cutset_anchors — REQUIRED whenever the dag has a closed loop (two "
+    "nodes that need each other): a list of interface / schema / directory / "
+    "decision anchors that cut the loop into a deterministic order. A cyclic "
+    "dag WITHOUT cutset_anchors is rejected and the whole goal degrades to a "
+    "single sequential agent. Emit [] when the dag is acyclic. When anchors "
+    "are provided, the runtime materializes them as boundary-first nodes "
+    "(Establish boundary: …) and strips the intra-cycle edges so the former "
+    "loop fans out after the boundary wave.\n"
+    "6. rationale — one or two sentences on why this decomposition.\n\n"
     "Make checks concrete and runnable from the project working directory. "
     "Return strict JSON only — no preamble, no markdown fences."
 )
@@ -64,9 +79,12 @@ _PLANNER_SYSTEM_ZH = (
     "1. restated_goal —— 用一段话清晰复述「完成」的含义。\n"
     "2. verification —— 如何验证目标达成，一次设定、后续绝不放宽。优先使用客观的"
     "机器检查；只有命令无法覆盖的方面才加裁判规则。两个字段：\n"
-    "   - checks：{id, text, check} 对象列表。'check' 是经 shlex.split 执行的"
-    "单条 shell 命令（不支持管道、&&、> 、通配符——需要时用 `sh -c \"...\"` 显式"
-    "包裹）。退出码 0 表示该项通过。这是权威的客观闸门。\n"
+    "   - checks：{id, text, check, scope?} 对象列表。'check' 是经 shlex.split "
+    "执行的单条 shell 命令（不支持管道、&&、> 、通配符——需要时用 "
+    "`sh -c \"...\"` 显式包裹）。退出码 0 表示该项通过。这是权威的客观闸门。"
+    "可选 'scope' 为该检查依赖的路径前缀列表（语义同 spawn contract "
+    "acceptance.scope / SGAR `[scope: …]`）；有 scope 时，若最近补丁未触达这些"
+    "路径，增量验证可跳过该检查。\n"
     "     每条 check 必须可移植且自洽——在工作目录下用 POSIX shell（macOS/BSD "
     "与 Linux 均可）原样可跑。只用可移植工具（test、ls、grep -q、cat）；不要用 "
     "sha256sum、`stat -f`、GNU 专有选项或其他平台相关二进制。引用的路径必须相对"
@@ -79,10 +97,17 @@ _PLANNER_SYSTEM_ZH = (
     "（若 checks 已完全覆盖目标则为 null）。\n"
     "3. complexity —— 若目标清晰明确、可按固定步骤执行则为 'simple'；若需要调查"
     "、工作形态不确定则为 'complex'。\n"
-    "4. dag —— 首轮计划，工作节点列表 {id, goal, depends_on}。'id' 为短标签"
-    "（如 'n1'）。'depends_on' 是必须先完成的其他节点 id 列表（仅向后引用、无环）。"
-    "互不依赖的节点并行执行。\n"
-    "5. rationale —— 一两句说明为何如此分解。\n\n"
+    "4. dag —— 首轮计划，工作节点列表 {id, goal, depends_on, write_scope, "
+    "read_scope}。'id' 为短标签（如 'n1'）。'depends_on' 是必须先完成的其他节点 "
+    "id 列表（仅向后引用、无环）。互不依赖的节点并行执行。'write_scope' / "
+    "'read_scope' 可选，声明该节点将写/读的路径前缀；声明后，写集合冲突的节点会"
+    "被串行化而不是并发争用同一批文件。\n"
+    "5. cutset_anchors —— 只要 dag 存在闭环（两个节点互相依赖）就必须给出：切开"
+    "闭环、使其变为确定性顺序的接口/schema/目录/关键决策锚点列表。带环但没有 "
+    "cutset_anchors 的 dag 会被拒绝，整个目标退化为单个串行 agent。dag 无环时给 "
+    "[]。给出锚点后，运行时会把它们物化为前置边界节点（Establish boundary: …），"
+    "并剥掉环内边，使原闭环节点在边界波次之后扇出。\n"
+    "6. rationale —— 一两句说明为何如此分解。\n\n"
     "checks 要具体、可在项目工作目录直接运行。只返回严格 JSON——不要前导说明、"
     "不要代码块围栏。"
 )
@@ -92,9 +117,12 @@ _PLANNER_USER_TEMPLATE = (
     'Respond with strict JSON: {{"restated_goal": "...", '
     '"complexity": "simple"|"complex", '
     '"verification": {{"checks": [{{"id": "V1", "text": "...", '
-    '"check": "<shell command, exit 0 = pass>"}}], '
+    '"check": "<shell command, exit 0 = pass>", '
+    '"scope": [<optional path prefixes>]}}], '
     '"judge_rubric": "<text or null>"}}, '
-    '"dag": [{{"id": "n1", "goal": "...", "depends_on": []}}], '
+    '"dag": [{{"id": "n1", "goal": "...", "depends_on": [], '
+    '"write_scope": [<optional paths>], "read_scope": [<optional paths>]}}], '
+    '"cutset_anchors": [<required when the dag has a cycle, else []>], '
     '"rationale": "..."}}'
 )
 
@@ -170,12 +198,15 @@ _REPLAN_SYSTEM_EN = (
     "addresses the specific failures below.\n\n"
     "- Keep what worked; change/add nodes that target the failing checks.\n"
     "- 'dag' is a list of {id, goal, depends_on} (backward references only).\n"
+    "- If the revised dag has a closed loop, you MUST also emit "
+    "'cutset_anchors' (interface / schema / directory / decision anchors that "
+    "cut the loop deterministically); a cyclic dag without them is rejected.\n"
     "- If the fixed step-list approach is failing because the task actually "
     "needs open-ended investigation, set \"route\": \"plan\" to delegate "
     "decomposition to the planner next iteration; otherwise omit it.\n\n"
     "Return strict JSON only: {\"dag\": [{\"id\": \"n1\", \"goal\": \"...\", "
-    "\"depends_on\": []}], \"route\": \"plan\"(optional), \"rationale\": "
-    "\"...\"}."
+    "\"depends_on\": []}], \"cutset_anchors\": [](required if cyclic), "
+    "\"route\": \"plan\"(optional), \"rationale\": \"...\"}."
 )
 
 _REPLAN_SYSTEM_ZH = (
@@ -184,10 +215,13 @@ _REPLAN_SYSTEM_ZH = (
     "进行修正。\n\n"
     "- 保留有效部分；修改/新增针对失败检查的节点。\n"
     "- 'dag' 是 {id, goal, depends_on} 列表（仅向后引用）。\n"
+    "- 若修订后的 dag 存在闭环，必须同时给出 'cutset_anchors'（切开闭环的接口/"
+    "schema/目录/关键决策锚点）；带环但无锚点的 dag 会被拒绝。\n"
     "- 若固定步骤清单失败是因为任务实际需要开放式调查，设置 \"route\": \"plan\" "
     "以在下一轮把分解委托给规划器；否则省略。\n\n"
     "只返回严格 JSON：{\"dag\": [{\"id\": \"n1\", \"goal\": \"...\", "
-    "\"depends_on\": []}], \"route\": \"plan\"(可选), \"rationale\": \"...\"}。"
+    "\"depends_on\": []}], \"cutset_anchors\": [](有环时必填), "
+    "\"route\": \"plan\"(可选), \"rationale\": \"...\"}。"
 )
 
 _REPLAN_USER_TEMPLATE = (

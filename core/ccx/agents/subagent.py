@@ -108,11 +108,15 @@ def to_spawn_result(
             "v5 nodes would otherwise wait forever at the ccx boundary."
         )
 
+    # Principle 8: serialize siblings whose declared write/read scopes conflict.
+    from .rwset import serialize_conflicting_invocations
+    invocations, conflict_issues = serialize_conflicting_invocations(invocations)
+
     inv_modes = [str(inv.mode or "agent") for inv in invocations]
     node_ids: list[str] = [new_id(mode) for mode in inv_modes]
 
     specs: list[NodeSpec] = []
-    dependency_issues: list[str] = []
+    dependency_issues: list[str] = list(conflict_issues)
     for i, inv in enumerate(invocations):
         tool_name = tool_for_mode.get(inv.mode)
         if tool_name is None:

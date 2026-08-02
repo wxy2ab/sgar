@@ -93,7 +93,14 @@ from ..sgar.checks import (
 )
 from ..sgar.models import ExitCriterion
 from . import goal_prompts
-from .progress import EverPassedTracker, monotone_progress_enabled
+from .incremental_verify import normalize_scope, select_criteria_for_changes
+from .patch_first import PATCH_FIRST_METADATA_KEY
+from .progress import EverPassedTracker, monotone_progress_enabled, observe_progress
+from .syndrome import (
+    build_syndrome_from_evidence,
+    changed_paths_from_git,
+    format_syndrome_detail,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +113,11 @@ CCX_GOAL_REQUEST_METADATA_KEY = "ccx_goal"
 #: deterministic short-circuit. Set by the goal loop on the inner plan drive;
 #: absent for every non-goal run (the short-circuit is then inert).
 CCX_GOAL_DAG_METADATA_KEY = "ccx_goal_dag"
+
+#: Metadata key carrying the planner's cutset anchors alongside the DAG.
+#: ``PlanModeRunner`` refuses a cyclic explicit DAG that does not carry it, so
+#: the key is what makes a legitimate closed loop executable.
+CCX_CUTSET_ANCHORS_METADATA_KEY = "ccx_cutset_anchors"
 
 #: ``session_snapshot`` output key. ``None`` when goal mode is not engaged.
 CCX_GOAL_VERDICT_SNAPSHOT_KEY = "goal_verdict"
@@ -182,6 +194,11 @@ class GoalDagNode:
     node_id: str
     goal: str
     depends_on: list[str] = field(default_factory=list)
+    #: Declared read/write footprint (principle 8). Carried into the plan-mode
+    #: subtask metadata so siblings whose write sets collide are serialized
+    #: instead of racing on the same files.
+    write_scope: list[str] = field(default_factory=list)
+    read_scope: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -191,6 +208,15 @@ class GoalPlan:
     route: GoalRoute
     dag: list[GoalDagNode]
     rationale: str = ""
+    cutset_anchors: list[str] = field(default_factory=list)
+    """Boundary anchors that cut a cyclic DAG into a deterministic order.
+
+    Principle 3: a closed-loop decomposition may only be executed when the
+    planner names the interfaces / schemas / decisions that break the cycle.
+    ``PlanModeRunner`` refuses a cyclic explicit DAG that carries none, so this
+    list is the ONLY way a legitimate closed loop reaches execution instead of
+    degrading to a single sequential agent.
+    """
 
 
 # drive_once(request) -> AgentRunResult, awaited. The caller injects its
@@ -284,6 +310,7 @@ def plan_goal(
             checks=[*verification.checks, *build_code_task_contract("criteria")],
         )
     dag = _parse_dag(data.get("dag"), fallback_goal=restated)
+    cutset_anchors = _parse_str_list(data.get("cutset_anchors"))
     route = _resolve_route(route_override, data.get("complexity"))
     rationale = str(data.get("rationale") or "")
     if not verification.has_gate():
@@ -299,7 +326,7 @@ def plan_goal(
     )
     return GoalPlan(
         restated_goal=restated, verification=verification, route=route,
-        dag=dag, rationale=rationale,
+        dag=dag, rationale=rationale, cutset_anchors=cutset_anchors,
     )
 
 
@@ -378,6 +405,7 @@ def _criteria_from_raw(raw: Any) -> list[ExitCriterion]:
             description=text or cid,
             blocking=True,
             check=check_str or None,
+            scope=normalize_scope(item.get("scope")),
         ))
     return out
 
@@ -398,10 +426,30 @@ def _parse_dag(raw: Any, *, fallback_goal: str) -> list[GoalDagNode]:
             deps = (
                 [str(d) for d in deps_raw] if isinstance(deps_raw, list) else []
             )
-            nodes.append(GoalDagNode(node_id=node_id, goal=node_goal, depends_on=deps))
+            nodes.append(GoalDagNode(
+                node_id=node_id,
+                goal=node_goal,
+                depends_on=deps,
+                write_scope=_parse_str_list(node.get("write_scope")),
+                read_scope=_parse_str_list(node.get("read_scope")),
+            ))
     if not nodes:
         nodes = [GoalDagNode(node_id="n0", goal=fallback_goal, depends_on=[])]
     return nodes
+
+
+def _parse_str_list(raw: Any) -> list[str]:
+    """De-duplicated, whitespace-trimmed string list from LLM JSON (or [])."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
 
 
 def _resolve_route(route_override: str, complexity_raw: Any) -> GoalRoute:
@@ -424,10 +472,17 @@ def _resolve_route(route_override: str, complexity_raw: Any) -> GoalRoute:
 # --------------------------------------------------------------------------- #
 
 def serialize_dag(dag: list[GoalDagNode]) -> list[dict[str, Any]]:
-    return [
-        {"id": n.node_id, "goal": n.goal, "depends_on": list(n.depends_on)}
-        for n in dag
-    ]
+    out: list[dict[str, Any]] = []
+    for n in dag:
+        node: dict[str, Any] = {
+            "id": n.node_id, "goal": n.goal, "depends_on": list(n.depends_on),
+        }
+        if n.write_scope:
+            node["write_scope"] = list(n.write_scope)
+        if n.read_scope:
+            node["read_scope"] = list(n.read_scope)
+        out.append(node)
+    return out
 
 
 async def _execute_dag_once(
@@ -444,13 +499,25 @@ async def _execute_dag_once(
     meta = dict(request.metadata or {})
     # The goal-mode params must not leak into the inner plan drive.
     meta.pop(CCX_GOAL_REQUEST_METADATA_KEY, None)
+    if retry_detail:
+        # A repair round: same write discipline the run/spawn loops apply
+        # (principle 1). Inherited by children via INHERITABLE_METADATA_KEYS.
+        meta[PATCH_FIRST_METADATA_KEY] = True
     if plan.route.kind == "explicit":
         meta[CCX_GOAL_DAG_METADATA_KEY] = serialize_dag(plan.dag)
+        # Without this the cyclic-DAG pass-through in PlanModeRunner is
+        # unreachable from goal mode and every closed loop degrades to a
+        # single agent.
+        if plan.cutset_anchors:
+            meta[CCX_CUTSET_ANCHORS_METADATA_KEY] = list(plan.cutset_anchors)
+        else:
+            meta.pop(CCX_CUTSET_ANCHORS_METADATA_KEY, None)
         # The explicit DAG node goals already carry any replan fix, so the
         # instruction is purely cosmetic here.
         instruction = plan.restated_goal
     else:
         meta.pop(CCX_GOAL_DAG_METADATA_KEY, None)
+        meta.pop(CCX_CUTSET_ANCHORS_METADATA_KEY, None)
         instruction = plan.restated_goal
         if retry_detail:
             instruction = (
@@ -470,6 +537,7 @@ def verify_goal(
     *, verification: VerificationSpec, cwd: str, check_timeout_s: float,
     producer_result: AgentRunResult, llm: LLMCallable, language: str,
     llm_timeout_s: float, log: Callable[[str], None] = _noop_log,
+    changed_paths: list[str] | None = None,
 ) -> tuple[bool, list[dict[str, Any]], dict[str, Any] | None]:
     """Return ``(met, check_evidence, judge_verdict)``.
 
@@ -477,20 +545,39 @@ def verify_goal(
     and the judge is NOT consulted. The judge runs only when every check is green
     and a rubric exists; it is adversarial (defaults to not-met) and fed machine
     ground truth, never the producer's self-claim as a success signal.
+
+    ``changed_paths`` (principle 7) restricts the first pass to the checks whose
+    declared ``scope`` intersects this round's diff; a green subset is always
+    re-confirmed on the full suite before ``met`` can be True, so an
+    under-declared scope costs time, never correctness. ``None`` (the default)
+    runs the full suite directly — existing callers are unaffected.
     """
     checkable = verification.checkable()
     check_evidence: list[dict[str, Any]] = []
     all_checks_pass = True
     if checkable:
+        to_run = select_criteria_for_changes(
+            checkable, changed_paths if changed_paths else None,
+        )
         outcomes = [
             run_criterion_check(c, cwd=cwd, timeout_s=check_timeout_s)
-            for c in checkable
+            for c in to_run
         ]
-        check_evidence = [_outcome_dict(o) for o in outcomes]
         failing = [o for o in outcomes if not o.passed]
+        if not failing and len(to_run) < len(checkable):
+            log(
+                f"incremental subset green ({len(to_run)}/{len(checkable)}) — "
+                "confirming on full check suite"
+            )
+            outcomes = [
+                run_criterion_check(c, cwd=cwd, timeout_s=check_timeout_s)
+                for c in checkable
+            ]
+            failing = [o for o in outcomes if not o.passed]
+        check_evidence = [_outcome_dict(o) for o in outcomes]
         all_checks_pass = not failing
         if failing:
-            log(f"{len(failing)}/{len(checkable)} machine check(s) failing")
+            log(f"{len(failing)}/{len(outcomes)} machine check(s) failing")
             unrunnable = [o for o in failing if check_unrunnable(o)]
             if unrunnable:
                 log(
@@ -710,13 +797,22 @@ def replan_dag(
         log("replan produced no DAG — keeping previous DAG (no-progress bound applies)")
         return plan
     new_dag = _parse_dag(data.get("dag"), fallback_goal=plan.restated_goal)
+    # A revised DAG may keep the closed loop; carry the previous anchors when the
+    # replanner names none so a legitimate cycle does not lose its cut and
+    # silently degrade to a single agent mid-run.
+    cutset_anchors = (
+        _parse_str_list(data.get("cutset_anchors"))
+        or list(plan.cutset_anchors)
+    )
     route = plan.route
     new_route_kind = str(data.get("route") or "").strip().lower()
     if route.source != "override" and new_route_kind == "plan":
         route = GoalRoute("plan", "replan", "planner")
         log("replan flipped route explicit→plan (task needs investigation)")
     # verification is carried through unchanged (same object, by replace).
-    return replace(plan, dag=new_dag, route=route)
+    return replace(
+        plan, dag=new_dag, route=route, cutset_anchors=cutset_anchors,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1113,17 +1209,13 @@ async def run_goal_loop(
 
     detail: str | None = None
     prev_failing_checks: int | None = None
+    prev_failing_ids: frozenset[str] | None = None
     no_progress = 0
     last_result: AgentRunResult | None = None
     last_check_ev: list[dict[str, Any]] = []
     last_judge: dict[str, Any] | None = None
     warned_redrive = False
-    # Progress signal (default OFF ⇒ count-delta, byte-identical). Under
-    # CCX_MONOTONE_PROGRESS a round is progress iff a check passed that had
-    # never passed before, so an oscillating check set cannot keep the goal
-    # loop re-driving past no_progress_stop. The judge phase (all checks green)
-    # never grows the ever-passed set, so it stays bounded by no_progress_stop
-    # exactly as before. See progress.py.
+    # Progress: default ON ⇒ monotone ever-passed + failing-set shrink.
     monotone = monotone_progress_enabled()
     progress_tracker = EverPassedTracker() if monotone else None
 
@@ -1158,10 +1250,12 @@ async def run_goal_loop(
             )
             return await _finalize(result, verdict)
 
+        changed_paths = await asyncio.to_thread(changed_paths_from_git, cwd)
         met, check_ev, judge = await asyncio.to_thread(
             verify_goal, verification=verification, cwd=cwd,
             check_timeout_s=check_timeout_s, producer_result=result, llm=llm,
             language=language, llm_timeout_s=llm_timeout_s, log=log,
+            changed_paths=changed_paths or None,
         )
         last_check_ev = check_ev
         last_judge = judge
@@ -1186,7 +1280,17 @@ async def run_goal_loop(
             verdict = _finish(plan, "passed", attempt, "satisfied", check_ev, judge)
             return await _finalize(result, verdict)
 
-        detail = _format_failure_detail(failing, judge)
+        if failing:
+            syndrome = build_syndrome_from_evidence(
+                cwd, failing, changed_paths=changed_paths or None,
+            )
+            detail = format_syndrome_detail(syndrome, attempt=attempt)
+            if judge is not None and not judge.get("met"):
+                detail += "\n\nJudge assessment (goal not met):\n" + "\n".join(
+                    f"- {r}" for r in (judge.get("reasons") or [])
+                )
+        else:
+            detail = _format_failure_detail(failing, judge)
 
         # Harness-defect early stop (opt-in, default OFF). When EVERY failing
         # check this round is UNRUNNABLE (malformed command / missing binary /
@@ -1210,50 +1314,33 @@ async def run_goal_loop(
                 )
                 return await _finalize(result, verdict)
 
-        # Progress tracking keys off the objective failing-CHECK count, NOT a
-        # blended check+judge score. Rationale: the judge is consulted only once
-        # all checks are green (see verify_goal), so it is invisible while any
-        # check is red and then appears as a flat "+1". Blending the two would
-        # mis-score the round that clears the LAST check while the judge first
-        # returns red (count stays flat 1→1) as a no-progress stall and could
-        # stop a still-converging goal early with a mislabeled verdict. So:
-        #  - while checks are failing, progress = the failing-check count shrank;
-        #  - the round that clears the last check (entering the judge phase) is
-        #    always progress;
-        #  - in the pure judge phase (all checks green) a binary judge has no
-        #    count to shrink, so it gets ``no_progress_stop`` consecutive red
-        #    rounds before we give up — bounded, but never tripped by a real
-        #    check-fix.
-        # (``n_failing_checks`` / ``outstanding`` were computed above, before the
-        # per-iteration ledger write.)
-        if monotone:
-            # Monotone measure (opt-in): a round is progress iff it passed a
-            # check that had never passed before. Clearing the last failing
-            # check newly-passes it → progress (entering the judge phase, same
-            # as the count-delta path). Re-passing a check that regressed does
-            # NOT grow the ever-passed set → not scored as progress, which is
-            # exactly the oscillation the count-delta path fails to stop.
-            newly = progress_tracker.observe(
+        # Progress: monotone ON ⇒ ever-passed growth or failing-set shrink;
+        # OFF ⇒ failing-count decrease. Clearing the last check (entering
+        # judge phase) is always progress. Pure judge-phase red rounds do
+        # not grow ever-passed, so no_progress_stop still bounds them.
+        made_progress, failing_ids = observe_progress(
+            monotone=monotone,
+            ever_tracker=progress_tracker,
+            prev_failing_ids=prev_failing_ids,
+            passed_ids=(
                 ev.get("criterion_id") for ev in check_ev if ev.get("passed")
-            )
-            # First round is always the baseline (never a stall on its own),
-            # matching the count-delta branch below.
-            progressed = prev_failing_checks is None or newly
-        elif prev_failing_checks is None:
-            progressed = True  # first round = baseline
-        elif n_failing_checks < prev_failing_checks:
-            # Objective check set shrank. This ALSO covers clearing the last
-            # failing check (n→0 from a positive prev, since 0 < prev whenever
-            # prev >= 1) — i.e. entering the judge phase counts as progress, so a
-            # real check-fix is never mis-scored as a stall even on the round the
-            # judge first turns red.
-            progressed = True
+            ),
+            failing_ids=(ev.get("criterion_id") for ev in failing),
+            prev_failing_count=prev_failing_checks,
+        )
+        if prev_failing_checks is None and prev_failing_ids is None:
+            progressed = True  # first round baseline
+        elif (
+            prev_failing_checks is not None
+            and n_failing_checks == 0
+            and prev_failing_checks > 0
+        ):
+            progressed = True  # entered judge phase
         else:
-            # Same / grown check count, or a pure judge-phase red round (all
-            # checks green, judge not met): no objective progress this round.
-            progressed = False
+            progressed = made_progress
         no_progress = 0 if progressed else no_progress + 1
         prev_failing_checks = n_failing_checks
+        prev_failing_ids = failing_ids
 
         log(f"attempt {attempt}: goal not met ({outstanding} outstanding)")
 
@@ -1405,6 +1492,7 @@ def _format_failure_detail(
 
 
 __all__ = [
+    "CCX_CUTSET_ANCHORS_METADATA_KEY",
     "CCX_GOAL_REQUEST_METADATA_KEY",
     "CCX_GOAL_DAG_METADATA_KEY",
     "CCX_GOAL_VERDICT_SNAPSHOT_KEY",

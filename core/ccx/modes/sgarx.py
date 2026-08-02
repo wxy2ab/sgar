@@ -2,14 +2,16 @@
 
 The runner behind ``agent_mode='sgarx'``. Identical command surface to
 ``BlueprintModeRunner`` plus the sgarx-only stage recovery commands
-(``reopen-stage`` / ``abandon-stage``); the runtime backing each command
-is :class:`SgarxRuntime` (writes to ``.sgarx/``) instead of
+(``reopen-stage`` / ``abandon-stage``) and stage-internal candidate
+frontier commands; the runtime backing each command is
+:class:`SgarxRuntime` (writes to ``.sgarx/``) instead of
 :class:`SgarRuntime` (writes to ``.sgar/``).
 
 The dispatch body is NOT duplicated from blueprint.py anymore: both
 runners call ``_sgar_command_helpers.run_sgar_instruction``, so a
 dispatch-level fix lands once. This runner only differs in the runtime
-class it constructs and ``supports_reopen_abandon=True``.
+class it constructs and ``supports_reopen_abandon`` /
+``supports_frontier``.
 """
 
 from __future__ import annotations
@@ -76,6 +78,7 @@ class BlueprintxModeRunner(ModeRunner):
                 invocation.goal,
                 llm=self.llm,
                 supports_reopen_abandon=True,
+                supports_frontier=True,
                 metadata=invocation.metadata,
             )
         except SgarError as exc:
