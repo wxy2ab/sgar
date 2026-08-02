@@ -2,6 +2,7 @@
 
 from .autobuild import (
     AutobuildReport,
+    ImplementResult,
     ProjectPlan,
     StagePlan,
     StageReport,
@@ -36,6 +37,7 @@ __all__ = [
     "CriterionResult",
     "DoctorResult",
     "ExitCriterion",
+    "ImplementResult",
     "ProjectMode",
     "ProjectPlan",
     "ProjectState",

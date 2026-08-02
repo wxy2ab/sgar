@@ -88,7 +88,7 @@ def implementation_requires_task_sync(
 ) -> bool:
     if current_tasks_snapshot and current_tasks_snapshot != previous_tasks_snapshot:
         return False
-    code_mutation_tools = {"file_write", "file_edit", "delete_file"}
+    code_mutation_tools = {"file_write", "file_edit", "file_edit_batch", "delete_file"}
     for result in tool_results:
         if result.success and result.tool_name in code_mutation_tools:
             return True

@@ -115,6 +115,16 @@ def parse_exit_criteria(markdown: str) -> list[ExitCriterion]:
         if check_match:
             check = check_match.group(1).strip() or None
             raw = raw[: check_match.start()].rstrip()
+        # Optional ``[scope: path, ...]`` — peeled after check so both may
+        # appear; check remains the last bracketed element when both present.
+        scope: tuple[str, ...] = ()
+        scope_match = re.search(r"\[scope:\s*(.+?)\]\s*$", raw, re.I)
+        if scope_match:
+            from ..agents.incremental_verify import normalize_scope
+            scope = normalize_scope(
+                [p.strip() for p in scope_match.group(1).split(",") if p.strip()]
+            )
+            raw = raw[: scope_match.start()].rstrip()
         marker = re.match(r"^\[(blocking|non-blocking)\]\s*(.+)$", raw, re.I)
         blocking = True
         if marker:
@@ -133,6 +143,7 @@ def parse_exit_criteria(markdown: str) -> list[ExitCriterion]:
                 description=description,
                 blocking=blocking,
                 check=check,
+                scope=scope,
             ))
     return criteria
 

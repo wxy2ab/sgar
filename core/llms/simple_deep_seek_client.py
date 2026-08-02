@@ -43,22 +43,30 @@ class SimpleDeepSeekClient(LLMApiClient):
                  max_tokens: int = 64000, temperature: float = 1.0, top_p: float = 1,
                  presence_penalty: float = 0, frequency_penalty: float = 0, stop: Union[str, List[str]] = None,
                  reasoning_effort: Optional[str] = "high", extra_body: Optional[Dict[str, Any]] = None,
-                 thinking: bool = True, context_window_tokens: Optional[int] = None):
+                 thinking: bool = True, context_window_tokens: Optional[int] = None,
+                 read_timeout: Optional[float] = None,
+                 max_retries: Optional[int] = None,
+                 one_chat_max_attempts: Optional[int] = None):
         config = Config()
         if api_key == "" :
             api_key = config.get("deep_seek_api_key")
-            
-        # 自定义httpx客户端以处理DeepSeek API偶尔的连接中断问题
-        http_client = httpx.Client(
-            limits=httpx.Limits(max_keepalive_connections=100, max_connections=200),
-            timeout=httpx.Timeout(timeout=600.0, connect=60.0, read=600.0, write=120.0)
+
+        # Defaults preserve historical behavior (600s read, 5 retries, 10 one_chat).
+        # Commodity producer may pass shorter values to avoid Wave24 empty-spin.
+        self._api_key = api_key
+        self._base_url = base_url
+        self._read_timeout = float(600.0 if read_timeout is None else read_timeout)
+        self._max_retries = int(5 if max_retries is None else max_retries)
+        # tenacity wrapper around one_chat; OpenAI max_retries alone is not enough.
+        self._one_chat_max_attempts = int(
+            10 if one_chat_max_attempts is None else one_chat_max_attempts
         )
-        
-        self.client = OpenAI(
-            api_key=api_key, 
+        self._http_limits = httpx.Limits(max_keepalive_connections=100, max_connections=200)
+        self._http_client, self.client = self._build_http_clients(
+            api_key=api_key,
             base_url=base_url,
-            http_client=http_client,
-            max_retries=5  # OpenAI客户端内置重试
+            read_timeout=self._read_timeout,
+            max_retries=self._max_retries,
         )
         self.task = "代码"
         self.chat_count = 0
@@ -97,6 +105,8 @@ class SimpleDeepSeekClient(LLMApiClient):
         self.presence_penalty = presence_penalty
         self.frequency_penalty = frequency_penalty
         self.stop = stop
+        # Optional OpenAI-compatible sampling seed (e.g. V21 independent judges).
+        self.seed: Optional[int] = None
         self.reasoning_effort = reasoning_effort
         self.extra_body = copy.deepcopy(extra_body) if extra_body is not None else {
             "thinking": {
@@ -117,6 +127,68 @@ class SimpleDeepSeekClient(LLMApiClient):
             if context_window_tokens
             else _default_context_window(self.model)
         )
+
+    @staticmethod
+    def _build_http_clients(
+        *,
+        api_key: str,
+        base_url: str,
+        read_timeout: float,
+        max_retries: int,
+        limits: Optional[httpx.Limits] = None,
+    ) -> tuple[httpx.Client, OpenAI]:
+        """Build httpx + OpenAI clients with explicit read timeout / retries."""
+
+        lim = limits or httpx.Limits(max_keepalive_connections=100, max_connections=200)
+        read = float(read_timeout)
+        timeout = httpx.Timeout(timeout=read, connect=60.0, read=read, write=120.0)
+        http_client = httpx.Client(limits=lim, timeout=timeout)
+        openai_client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http_client,
+            max_retries=int(max_retries),
+            timeout=timeout,
+        )
+        return http_client, openai_client
+
+    def reconfigure_http(
+        self,
+        *,
+        read_timeout: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        one_chat_max_attempts: Optional[int] = None,
+    ) -> None:
+        """Rebuild transport for shorter timeouts (commodity producer Wave25)."""
+
+        if read_timeout is not None:
+            self._read_timeout = float(read_timeout)
+        if max_retries is not None:
+            self._max_retries = int(max_retries)
+        if one_chat_max_attempts is not None:
+            self._one_chat_max_attempts = int(one_chat_max_attempts)
+        old_http = getattr(self, "_http_client", None)
+        self._http_client, self.client = self._build_http_clients(
+            api_key=getattr(self, "_api_key", ""),
+            base_url=getattr(self, "_base_url", "https://api.deepseek.com/"),
+            read_timeout=self._read_timeout,
+            max_retries=self._max_retries,
+            limits=getattr(self, "_http_limits", None),
+        )
+        if old_http is not None:
+            try:
+                old_http.close()
+            except Exception:
+                pass
+        # Reasoning client may wrap transport for robust streaming.
+        if getattr(self, "_robust_streaming", False):
+            try:
+                from core.llms._deepseek_stream import wrap_client_for_robust_streaming
+
+                self._raw_client = self.client
+                self.client = wrap_client_for_robust_streaming(self.client, self)
+            except Exception:
+                pass
 
     def set_system_message(self, system_message: str = "你是一个智能助手,擅长把复杂问题清晰明白通俗易懂地解答出来"):
         self.history = [{"role": "system", "content": system_message}]
@@ -270,6 +342,8 @@ class SimpleDeepSeekClient(LLMApiClient):
             "stop": self.stop,
             "stream": is_stream
         }
+        if getattr(self, "seed", None) is not None:
+            kwargs["seed"] = int(self.seed)
 
         if self.reasoning_effort is not None:
             kwargs["reasoning_effort"] = self.reasoning_effort
@@ -313,12 +387,31 @@ class SimpleDeepSeekClient(LLMApiClient):
             else:
                 raise
 
-    @retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=2, min=5, max=60))
     def one_chat(self, message: str, is_stream: bool = False) -> Union[str, Iterator[str]]:
-        if not self.history:
-            self.set_system_message()
-        msg = [{"role": "user", "content": message}] if isinstance(message, str) else message
-        return self._create_chat_completion(msg, is_stream)
+        """Single-turn chat with configurable tenacity attempts (default 10).
+
+        Wave25 commodity producer lowers ``_one_chat_max_attempts`` so OpenAI
+        transport timeouts are not multiplied by a hard-coded 10× wrapper.
+        """
+
+        attempts = max(1, int(getattr(self, "_one_chat_max_attempts", 10) or 10))
+
+        @retry(
+            stop=stop_after_attempt(attempts),
+            wait=wait_exponential(multiplier=2, min=5, max=60),
+            reraise=True,
+        )
+        def _call() -> Union[str, Iterator[str]]:
+            if not self.history:
+                self.set_system_message()
+            msg = (
+                [{"role": "user", "content": message}]
+                if isinstance(message, str)
+                else message
+            )
+            return self._create_chat_completion(msg, is_stream)
+
+        return _call()
 
     def tool_chat(self, user_message: str, tools: List[Dict[str, Any]], function_module: Any, is_stream: bool = False) -> Union[str, Iterator[str]]:
         if not self.history:

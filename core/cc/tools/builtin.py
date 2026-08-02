@@ -17,6 +17,7 @@ from .exit_plan_mode import ExitPlanModeTool
 from .exit_spec_mode import ExitSpecModeTool
 from .file_read import FileReadTool
 from .file_edit import FileEditTool
+from .file_edit_batch import FileEditBatchTool
 from .file_write import FileWriteTool
 from .plan_artifact_write import PlanArtifactWriteTool
 from .glob_tool import GlobTool
@@ -51,6 +52,7 @@ def build_builtin_tool_registry(
     registry = ToolRegistry()
     registry.register(FileReadTool())
     registry.register(FileEditTool(config=resolved_config))
+    registry.register(FileEditBatchTool(config=resolved_config))
     registry.register(FileWriteTool(config=resolved_config))
     registry.register(TodoWriteTool())
     registry.register(GlobTool())

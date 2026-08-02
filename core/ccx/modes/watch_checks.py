@@ -123,15 +123,19 @@ class CheckResult:
     reason: str = ""
     observed: Any = None
     expected: Any = None
+    check_id: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "kind": self.kind,
             "ok": self.ok,
             "reason": self.reason,
             "observed": self.observed,
             "expected": self.expected,
         }
+        if self.check_id:
+            out["check_id"] = self.check_id
+        return out
 
 
 CheckSpec = dict[str, Any]
@@ -751,6 +755,23 @@ def run_check(spec: CheckSpec, obs: ObservationDigest) -> CheckResult:
         )
 
 
+def _stable_check_id(spec: dict[str, Any], index: int) -> str:
+    explicit = str(spec.get("id") or spec.get("name") or "").strip()
+    if explicit:
+        return explicit
+    kind = str(spec.get("kind") or "?")
+    return f"c{index}:{kind}"
+
+
+def plan_check_ids(plan: dict[str, Any]) -> list[str]:
+    """Stable ids for every check dict in ``plan['checks']`` (plan order)."""
+    out: list[str] = []
+    for i, spec in enumerate(plan.get("checks") or []):
+        if isinstance(spec, dict):
+            out.append(_stable_check_id(spec, i))
+    return out
+
+
 def run_verification_plan(
     plan: dict[str, Any], obs: ObservationDigest,
 ) -> list[CheckResult]:
@@ -758,19 +779,28 @@ def run_verification_plan(
     order). Callers treat an empty list as "all checks passed"."""
     checks = plan.get("checks") or []
     failures: list[CheckResult] = []
-    for spec in checks:
+    for i, spec in enumerate(checks):
         if not isinstance(spec, dict):
             continue
+        cid = _stable_check_id(spec, i)
         err = validate_check(spec)
         if err:
             failures.append(CheckResult(
                 ok=False, kind=str(spec.get("kind") or "?"),
                 reason=err, observed=spec, expected=None,
+                check_id=cid,
             ))
             continue
         res = run_check(spec, obs)
         if not res.ok:
-            failures.append(res)
+            failures.append(CheckResult(
+                ok=res.ok,
+                kind=res.kind,
+                reason=res.reason,
+                observed=res.observed,
+                expected=res.expected,
+                check_id=cid,
+            ))
     return failures
 
 
@@ -779,6 +809,7 @@ __all__ = [
     "CheckResult",
     "CheckSpec",
     "ObservationDigest",
+    "plan_check_ids",
     "run_check",
     "run_verification_plan",
     "supported_kinds",

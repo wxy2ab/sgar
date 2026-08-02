@@ -30,6 +30,10 @@ from typing import Any
 from .parsing import parse_llm_json
 from ._dag_helpers import _order_for_backward_deps
 from ._goal import current_goal_text
+from ..agents.metadata_inheritance import (
+    INVARIANTS_METADATA_KEY,
+    format_invariants_block,
+)
 from ..agents.subagent import (
     ModeRunner,
     SubagentInvocation,
@@ -41,6 +45,31 @@ from .prompts import PromptLoadError, fallback_system_prompt, load_mode_prompts
 
 
 logger = logging.getLogger(__name__)
+
+
+def _stamp_invariants_on_subtasks(
+    subtasks: list[SubagentInvocation],
+    invariants: list[str],
+) -> list[SubagentInvocation]:
+    """Inject plan invariants into every subtask goal + metadata."""
+    clean = [str(x).strip() for x in invariants if str(x).strip()]
+    if not clean:
+        return subtasks
+    block = format_invariants_block(clean)
+    out: list[SubagentInvocation] = []
+    for st in subtasks:
+        meta = dict(st.metadata or {})
+        meta[INVARIANTS_METADATA_KEY] = list(clean)
+        out.append(SubagentInvocation(
+            goal=(st.goal or "") + block,
+            mode=st.mode,
+            metadata=meta,
+            requires_approval=st.requires_approval,
+            max_attempts=st.max_attempts,
+            timeout_s=st.timeout_s,
+            preferred_model=st.preferred_model,
+        ))
+    return out
 
 
 # Fallback constants — authoritative source is
@@ -71,6 +100,14 @@ SYSTEM_PROMPT_EN = (
     "  same plan is allowed and encouraged.\n"
     "- For DAG ordering (item N depends on items 1 AND 3 but not 2), set "
     "  ``depends_on: [<zero-based indices>]`` on item N.\n"
+    "- If the work has cyclic / closed-loop dependencies, you MUST also "
+    "  emit ``cutset_anchors``: a list of interface/schema/directory/"
+    "  decision anchors that cut the cycle into a deterministic order. "
+    "  A cycle without cutset_anchors is rejected.\n"
+    "- Declare each item's file footprint when you know it: "
+    "  ``write_scope`` / ``read_scope`` as lists of path prefixes. Items "
+    "  whose write scopes overlap are run in sequence instead of racing on "
+    "  the same files; omit the field when the footprint is unknown.\n"
     "- Always include a short ``rationale`` explaining why these items, in "
     "  this dependency shape.\n\n"
     "Return strict JSON only — no preamble, no fences."
@@ -86,6 +123,11 @@ SYSTEM_PROMPT_ZH = (
     "  允许（鼓励）在同一个计划里混合使用并行项和链式项。\n"
     "- DAG 顺序（第 N 项同时依赖 1 和 3 但不依赖 2）：在该项上设置\n"
     "  depends_on: [<0 起的下标列表>]。\n"
+    "- 若存在闭环依赖，必须同时给出 cutset_anchors（接口/schema/目录/"
+    "  关键决策等切集锚点）；无锚点的环会被拒绝。\n"
+    "- 已知时请声明每一项的文件范围：write_scope / read_scope，取值为"
+    "路径前缀列表。写范围重叠的项会被串行执行而不是争用同一批文件；"
+    "范围未知时省略该字段。\n"
     "- 始终给出 rationale，解释为什么是这些项以及这种依赖形状。\n\n"
     "只返回严格的 JSON——不要有前导说明，也不要代码块围栏。"
 )
@@ -94,8 +136,10 @@ SYSTEM_PROMPT_ZH = (
 _USER_TEMPLATE_FALLBACK = (
     "Goal: {goal}\n\n"
     'Respond with: {{"plan_items": [{{"goal": "...", '
-    '"depends_on_previous": false, "depends_on": [<optional indices>]}}'
-    ', ...], "rationale": "..."}}'
+    '"depends_on_previous": false, "depends_on": [<optional indices>], '
+    '"write_scope": [<optional paths>], "read_scope": [<optional paths>]}}'
+    ', ...], "cutset_anchors": [<optional anchors>], '
+    '"invariants": [<optional>], "rationale": "..."}}'
 )
 
 
@@ -194,6 +238,77 @@ class PlanModeRunner(ModeRunner):
             )
             return result
 
+        # Principle 3: a dependency cycle without cutset anchors is not a
+        # silently-broken DAG — degrade to a single sequential agent.
+        cycle_issues = [
+            i for i in (plan.get("dependency_issues") or [])
+            if "cycle" in str(i).lower()
+        ]
+        cutset = list(plan.get("cutset_anchors") or [])
+        if cycle_issues and not cutset:
+            result = SubagentResult(
+                final_text=(
+                    "Plan declared a dependency cycle without cutset_anchors; "
+                    "refusing to silently break the cycle. Falling back to a "
+                    "single agent. Issues: " + "; ".join(cycle_issues)
+                ),
+                subtasks=[
+                    SubagentInvocation(
+                        goal=invocation.goal,
+                        mode="agent",
+                        metadata={
+                            "ccx_parent_mode": "plan",
+                            "ccx_fallback": True,
+                            "ccx_cycle_without_cutset": True,
+                            "ccx_root_goal": root_goal,
+                        },
+                    ),
+                ],
+                extras={
+                    "goal": root_goal,
+                    "cutset_required": True,
+                    "dependency_issues": cycle_issues,
+                },
+            )
+            self._record(
+                started_at=started_at,
+                invocation=invocation,
+                system=system, user=user, response=response,
+                plan=plan, result=result,
+                parse_status="cycle_without_cutset",
+                sequential_reason="cycle without cutset_anchors → single agent",
+            )
+            return result
+
+        cutset_applied = False
+        if cycle_issues and cutset:
+            # Materialize boundary-first DAG instead of the silently-broken order.
+            dag = _items_to_id_dag(plan["items"])
+            _ordered0, _issues0, residual = _topo_order_ex(dag, break_cycles=True)
+            ordered, apply_issues = _apply_cutset(dag, cutset, cycle_ids=residual)
+            plan = dict(plan)
+            plan["dependency_issues"] = list(plan.get("dependency_issues") or []) + apply_issues
+            plan["items"] = [
+                {
+                    "goal": n["goal"],
+                    "depends_on_previous": False,
+                    "depends_on": [],  # filled as indices below
+                    **({"write_scope": list(n["write_scope"])} if n.get("write_scope") else {}),
+                    **({"read_scope": list(n["read_scope"])} if n.get("read_scope") else {}),
+                    **({"ccx_cutset_node": True} if n.get("ccx_cutset_node") else {}),
+                    "_node_id": n["id"],
+                    "_depends_on_ids": list(n.get("depends_on") or []),
+                }
+                for n in ordered
+            ]
+            id_to_index = {n["id"]: i for i, n in enumerate(ordered)}
+            for item, node in zip(plan["items"], ordered):
+                item["depends_on"] = [
+                    id_to_index[d] for d in (node.get("depends_on") or [])
+                    if d in id_to_index
+                ]
+            cutset_applied = True
+
         # Per-item dependency model: each subtask carries its own
         # depends_on_previous flag and (optionally) an explicit
         # depends_on index list. ``to_spawn_result`` honours these
@@ -201,7 +316,9 @@ class PlanModeRunner(ModeRunner):
         # in parallel.
         flags = [bool(item.get("depends_on_previous")) for item in plan["items"]]
         any_explicit_dag = any(item.get("depends_on") for item in plan["items"])
-        if any_explicit_dag:
+        if cutset_applied:
+            sequential_reason = "cycle rewritten via cutset_anchors (boundary-first)"
+        elif any_explicit_dag:
             sequential_reason = "explicit depends_on indices used"
         elif all(flags) and flags:
             sequential_reason = "all items chained via depends_on_previous"
@@ -213,24 +330,40 @@ class PlanModeRunner(ModeRunner):
         else:
             sequential_reason = "all items independent (parallel siblings)"
 
-        subtasks = [
-            SubagentInvocation(
-                goal=item["goal"],
-                mode="spec",
-                metadata={
-                    "ccx_parent_mode": "plan",
-                    "ccx_plan_index": i,
-                    "ccx_root_goal": root_goal,
-                    "ccx_depends_on_previous": bool(item.get("depends_on_previous")),
-                    "ccx_depends_on": list(item.get("depends_on") or []),
-                },
-            )
-            for i, item in enumerate(plan["items"])
-        ]
+        subtasks = []
+        for i, item in enumerate(plan["items"]):
+            meta: dict[str, Any] = {
+                "ccx_parent_mode": "plan",
+                "ccx_plan_index": i,
+                "ccx_root_goal": root_goal,
+                "ccx_depends_on_previous": bool(item.get("depends_on_previous")),
+                "ccx_depends_on": list(item.get("depends_on") or []),
+            }
+            if item.get("write_scope"):
+                meta["ccx_write_scope"] = list(item["write_scope"])
+            if item.get("read_scope"):
+                meta["ccx_read_scope"] = list(item["read_scope"])
+            if item.get("ccx_cutset_node"):
+                meta["ccx_cutset_node"] = True
+            # Cutset boundary nodes run as agents (establish the freeze);
+            # ordinary plan items still go through spec.
+            mode = "agent" if item.get("ccx_cutset_node") else "spec"
+            subtasks.append(SubagentInvocation(
+                goal=item["goal"], mode=mode, metadata=meta,
+            ))
+        invariants = list(plan.get("invariants") or [])
+        if invariants:
+            subtasks = _stamp_invariants_on_subtasks(subtasks, invariants)
         extras: dict[str, Any] = {
             "goal": root_goal,
             "items": plan["items"],
         }
+        if cutset:
+            extras["cutset_anchors"] = cutset
+        if cutset_applied:
+            extras["cutset_applied"] = True
+        if invariants:
+            extras["invariants"] = list(invariants)
         if artifacts:
             extras["artifact_paths"] = artifacts
         # We deliberately keep `sequential=False` at the result level —
@@ -292,12 +425,85 @@ class PlanModeRunner(ModeRunner):
             deps_raw = node.get("depends_on") or []
             deps = [str(d) for d in deps_raw] if isinstance(deps_raw, list) else []
             seen_ids[node_id] = len(norm)
-            norm.append({"id": node_id, "goal": node_goal, "depends_on": deps})
+            entry: dict[str, Any] = {
+                "id": node_id, "goal": node_goal, "depends_on": deps,
+            }
+            ws = _as_str_list(node.get("write_scope") or node.get("ccx_write_scope"))
+            rs = _as_str_list(node.get("read_scope") or node.get("ccx_read_scope"))
+            if ws:
+                entry["write_scope"] = ws
+            if rs:
+                entry["read_scope"] = rs
+            norm.append(entry)
         if not norm:
             norm = [{"id": "n0", "goal": invocation.goal, "depends_on": []}]
 
-        ordered, order_issues = _topo_order(norm)
+        cutset = list(
+            (invocation.metadata or {}).get("ccx_cutset_anchors")
+            or (invocation.metadata or {}).get("cutset_anchors")
+            or []
+        )
+        # Don't silently break cycles here — either fall back or rewrite via cutset.
+        ordered, order_issues, residual = _topo_order_ex(
+            norm, break_cycles=False,
+        )
         dependency_issues.extend(order_issues)
+
+        # Principle 3: fail-loud on cycles without cutset anchors.
+        cycle_issues = [i for i in order_issues if "cycle" in str(i).lower()]
+        cutset_applied = False
+        if residual and not cutset:
+            msg = (
+                "explicit DAG has a dependency cycle without cutset_anchors; "
+                "refusing to execute a silently broken topology. "
+                + "; ".join(cycle_issues)
+            )
+            result = SubagentResult(
+                final_text=msg,
+                subtasks=[
+                    SubagentInvocation(
+                        goal=invocation.goal,
+                        mode="agent",
+                        metadata={
+                            "ccx_parent_mode": "plan",
+                            "ccx_goal_explicit": True,
+                            "ccx_cycle_without_cutset": True,
+                            "ccx_fallback": True,
+                            "ccx_root_goal": root_goal,
+                        },
+                    ),
+                ],
+                sequential=False,
+                extras={
+                    "goal": root_goal,
+                    "ccx_goal_explicit": True,
+                    "cutset_required": True,
+                    "dependency_issues": dependency_issues,
+                },
+            )
+            self._record(
+                started_at=started_at,
+                invocation=invocation,
+                system="(goal-mode explicit DAG — cycle without cutset)",
+                user="",
+                response="",
+                plan={
+                    "items": ordered, "rationale": "", "dropped": dropped,
+                    "dependency_issues": dependency_issues,
+                },
+                result=result,
+                parse_status="cycle_without_cutset",
+                sequential_reason="explicit DAG cycle without cutset → single agent",
+            )
+            return result
+
+        if residual and cutset:
+            # Rewrite into boundary-first DAG instead of accepting the silent break.
+            ordered, apply_issues = _apply_cutset(
+                norm, cutset, cycle_ids=residual,
+            )
+            dependency_issues.extend(apply_issues)
+            cutset_applied = True
 
         id_to_index = {node["id"]: idx for idx, node in enumerate(ordered)}
         subtasks: list[SubagentInvocation] = []
@@ -318,17 +524,35 @@ class PlanModeRunner(ModeRunner):
                     continue
                 if j not in dep_indices:
                     dep_indices.append(j)
+            meta: dict[str, Any] = {
+                "ccx_parent_mode": "plan",
+                "ccx_plan_index": idx,
+                "ccx_root_goal": root_goal,
+                "ccx_goal_explicit": True,
+                "ccx_depends_on": dep_indices,
+            }
+            if node.get("ccx_cutset_node"):
+                meta["ccx_cutset_node"] = True
+            if node.get("write_scope"):
+                meta["ccx_write_scope"] = list(node["write_scope"])
+            if node.get("read_scope"):
+                meta["ccx_read_scope"] = list(node["read_scope"])
             subtasks.append(SubagentInvocation(
                 goal=node["goal"],
                 mode="agent",
-                metadata={
-                    "ccx_parent_mode": "plan",
-                    "ccx_plan_index": idx,
-                    "ccx_root_goal": root_goal,
-                    "ccx_goal_explicit": True,
-                    "ccx_depends_on": dep_indices,
-                },
+                metadata=meta,
             ))
+
+        extras: dict[str, Any] = {
+            "goal": root_goal,
+            "ccx_goal_explicit": True,
+        }
+        if cutset:
+            extras["cutset_anchors"] = list(cutset)
+        if cutset_applied:
+            extras["cutset_applied"] = True
+        if dependency_issues:
+            extras["dependency_issues"] = dependency_issues
 
         result = SubagentResult(
             final_text=(
@@ -336,7 +560,7 @@ class PlanModeRunner(ModeRunner):
             ),
             subtasks=subtasks,
             sequential=False,
-            extras={"goal": root_goal, "ccx_goal_explicit": True},
+            extras=extras,
         )
         self._record(
             started_at=started_at,
@@ -347,10 +571,15 @@ class PlanModeRunner(ModeRunner):
             plan={
                 "items": ordered, "rationale": "", "dropped": dropped,
                 "dependency_issues": dependency_issues,
+                **({"cutset_applied": True} if cutset_applied else {}),
             },
             result=result,
             parse_status="explicit",
-            sequential_reason="goal-mode explicit DAG materialized deterministically",
+            sequential_reason=(
+                "goal-mode explicit DAG + cutset rewrite"
+                if cutset_applied
+                else "goal-mode explicit DAG materialized deterministically"
+            ),
         )
         return result
 
@@ -423,7 +652,20 @@ def _topo_order(
     original index so the result is deterministic. A residual cycle is broken
     deterministically (the still-blocked nodes are appended in original order)
     and reported in ``issues`` — never an infinite loop, never a dropped node.
+
+    Prefer :func:`_apply_cutset` when a cycle has declared anchors — that path
+    rewrites the graph instead of silently appending residual nodes.
     """
+    ordered, issues, _residual = _topo_order_ex(norm, break_cycles=True)
+    return ordered, issues
+
+
+def _topo_order_ex(
+    norm: list[dict[str, Any]],
+    *,
+    break_cycles: bool = True,
+) -> tuple[list[dict[str, Any]], list[str], set[str]]:
+    """Like :func:`_topo_order`, also returning residual cycle member ids."""
     ids = {node["id"] for node in norm}
     index_of = {node["id"]: i for i, node in enumerate(norm)}
     indeg: dict[str, int] = {}
@@ -443,19 +685,111 @@ def _topo_order(
         for child in children[nid]:
             indeg[child] -= 1
             if indeg[child] == 0:
-                # insert keeping original-index order among the ready set
                 ready.append(child)
                 ready.sort(key=lambda n: index_of[n])
 
     issues: list[str] = []
-    if len(ordered_ids) < len(norm):
-        remaining = [n["id"] for n in norm if n["id"] not in set(ordered_ids)]
+    residual = {
+        n["id"] for n in norm if n["id"] not in set(ordered_ids)
+    }
+    if residual:
+        remaining = [n["id"] for n in norm if n["id"] in residual]
+        if break_cycles:
+            issues.append(
+                "explicit DAG has a dependency cycle among "
+                f"{remaining}; broke it by appending those nodes in original order"
+            )
+            ordered_ids.extend(remaining)
+        else:
+            issues.append(
+                "explicit DAG has a dependency cycle among "
+                f"{remaining}"
+            )
+    return (
+        [norm[index_of[nid]] for nid in ordered_ids if nid in index_of],
+        issues,
+        residual,
+    )
+
+
+def _apply_cutset(
+    norm: list[dict[str, Any]],
+    cutset_anchors: list[str],
+    *,
+    cycle_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Rewrite a cyclic DAG into cutset-first then fan-out (principle 3).
+
+    Injects synthetic ``cutset:{i}`` boundary nodes, strips intra-cycle edges,
+    and makes every cycle member depend on all cutset nodes. Re-runs Kahn so
+    the result is acyclic: boundary wave first, then the former cycle nodes.
+    """
+    anchors = [str(a).strip() for a in cutset_anchors if str(a).strip()]
+    if not anchors or not cycle_ids:
+        ordered, issues = _topo_order(norm)
+        return ordered, issues
+
+    cutset_nodes: list[dict[str, Any]] = []
+    cutset_ids: list[str] = []
+    existing = {n["id"] for n in norm}
+    for i, anchor in enumerate(anchors):
+        cid = f"cutset:{i}"
+        # Avoid colliding with a planner-supplied id.
+        n = 0
+        while cid in existing or cid in cutset_ids:
+            n += 1
+            cid = f"cutset:{i}.{n}"
+        cutset_ids.append(cid)
+        cutset_nodes.append({
+            "id": cid,
+            "goal": f"Establish boundary: {anchor}",
+            "depends_on": [],
+            "ccx_cutset_node": True,
+        })
+
+    rewritten: list[dict[str, Any]] = []
+    for node in norm:
+        nid = str(node["id"])
+        deps = [str(d) for d in (node.get("depends_on") or [])]
+        if nid in cycle_ids:
+            deps = [d for d in deps if d not in cycle_ids]
+            for cid in cutset_ids:
+                if cid not in deps:
+                    deps.append(cid)
+        new_node = dict(node)
+        new_node["depends_on"] = deps
+        rewritten.append(new_node)
+
+    combined = cutset_nodes + rewritten
+    ordered, order_issues, residual = _topo_order_ex(combined, break_cycles=True)
+    issues = [
+        f"cutset applied: injected {len(cutset_ids)} boundary node(s); "
+        f"stripped intra-cycle edges among {sorted(cycle_ids)}",
+    ]
+    issues.extend(order_issues)
+    if residual:
         issues.append(
-            "explicit DAG has a dependency cycle among "
-            f"{remaining}; broke it by appending those nodes in original order"
+            f"cutset rewrite still residual cycle among {sorted(residual)} "
+            "(appended in original order)"
         )
-        ordered_ids.extend(remaining)
-    return [norm[index_of[nid]] for nid in ordered_ids], issues
+    return ordered, issues
+
+
+def _items_to_id_dag(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert index-based plan items into an id-keyed DAG for cutset rewrite."""
+    out: list[dict[str, Any]] = []
+    for i, item in enumerate(items):
+        entry: dict[str, Any] = {
+            "id": f"n{i}",
+            "goal": str(item.get("goal") or ""),
+            "depends_on": [f"n{d}" for d in (item.get("depends_on") or [])],
+        }
+        if item.get("write_scope"):
+            entry["write_scope"] = list(item["write_scope"])
+        if item.get("read_scope"):
+            entry["read_scope"] = list(item["read_scope"])
+        out.append(entry)
+    return out
 
 
 def _parse_plan_response(response: str) -> dict[str, Any]:
@@ -476,6 +810,8 @@ def _parse_plan_response(response: str) -> dict[str, Any]:
     )
     items = data.get("plan_items") or data.get("items") or []
     rationale = data.get("rationale") or data.get("summary") or ""
+    cutset_anchors = _as_str_list(data.get("cutset_anchors"))
+    invariants = _as_str_list(data.get("invariants"))
     pending_items: list[tuple[int, dict[str, Any], list[int]]] = []
     dependency_issues: list[str] = []
     dropped = 0
@@ -500,11 +836,18 @@ def _parse_plan_response(response: str) -> dict[str, Any]:
                         depends_on.append(int(v))
                     except (TypeError, ValueError):
                         pass
-            pending_items.append((original_index, {
+            item_dict: dict[str, Any] = {
                 "goal": str(raw["goal"]),
                 "depends_on_previous": bool(raw.get("depends_on_previous", False)),
                 "depends_on": [],
-            }, depends_on))
+            }
+            ws = _as_str_list(raw.get("write_scope") or raw.get("ccx_write_scope"))
+            rs = _as_str_list(raw.get("read_scope") or raw.get("ccx_read_scope"))
+            if ws:
+                item_dict["write_scope"] = ws
+            if rs:
+                item_dict["read_scope"] = rs
+            pending_items.append((original_index, item_dict, depends_on))
         else:
             dropped += 1
     old_to_new = {
@@ -547,7 +890,19 @@ def _parse_plan_response(response: str) -> dict[str, Any]:
         "rationale": rationale,
         "dropped": dropped,
         "dependency_issues": dependency_issues,
+        "cutset_anchors": cutset_anchors,
+        "invariants": invariants,
     }
+
+
+def _as_str_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw if str(x).strip()]
+    return []
 
 
 __all__ = ["PlanModeRunner", "build_plan_prompt"]

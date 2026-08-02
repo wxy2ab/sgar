@@ -73,15 +73,29 @@ class ExitCriterion:
     command contradicts (exit code 0 = pass). ``None`` → self-reported
     verification only, exactly as before.
     """
+    scope: tuple[str, ...] = ()
+    """Optional path prefixes this check depends on (principle 7).
+
+    Empty ⇒ global check (always re-run). When set, incremental verification
+    may skip the check if the latest patch's changed paths do not intersect.
+    """
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ExitCriterion":
         check = data.get("check")
+        scope_raw = data.get("scope") or ()
+        if isinstance(scope_raw, str):
+            scope: tuple[str, ...] = (scope_raw,) if scope_raw.strip() else ()
+        elif isinstance(scope_raw, (list, tuple)):
+            scope = tuple(str(s) for s in scope_raw if str(s).strip())
+        else:
+            scope = ()
         return cls(
             criterion_id=str(data.get("criterion_id") or ""),
             description=str(data.get("description") or ""),
             blocking=bool(data.get("blocking", True)),
             check=str(check) if check else None,
+            scope=scope,
         )
 
 

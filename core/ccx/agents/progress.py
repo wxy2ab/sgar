@@ -1,37 +1,20 @@
-"""Monotone convergence measure for governed repair loops (default OFF).
+"""Monotone convergence measure for governed repair loops (default ON).
 
 The governed spawn / goal / run loops decide whether to keep re-driving by
-a PROGRESS signal: a round "made progress" if it moved the loop closer to
-"all checks green". The default signal is *count-delta* — the number of
-failing checks went DOWN versus the previous round. That is a stall
-DETECTOR, not a convergence PROOF: an oscillating repair (fixing check B
-regresses check A, then the next round fixes A and regresses B) keeps the
-failing COUNT bouncing 2↔3 forever, resetting the no-progress counter every
-other round, so the loop only ever terminates on the ``max_iters`` clock.
-Raise that clock (a large iteration budget) and such a loop never
-terminates — the budget is the only thing standing between it and
-non-termination.
+a PROGRESS signal. The legacy signal is *count-delta* (failing-check count
+went DOWN). That detects stalls but does not prove convergence: an
+oscillating repair can bounce the count forever and only stop on
+``max_iters``.
 
-Enabling ``CCX_MONOTONE_PROGRESS`` swaps the count-delta signal for a
-strictly-monotone one: a round makes progress iff it SATISFIED A CHECK THAT
-WAS NEVER SATISFIED BEFORE. The set of ever-passed criteria only grows and
-is bounded by the criteria count, so at most ``len(criteria)`` rounds can
-report progress; between any two the no-progress counter climbs toward
-``no_progress_stop``. Termination is therefore guaranteed in
-``O(len(criteria) * no_progress_stop)`` rounds INDEPENDENT of ``max_iters``
-— a real convergence proof. A check that flips back to failing no longer
-resets the counter, because re-passing an already-ever-passed check does
-not grow the set.
+Default (ON) uses a strictly-monotone measure:
 
-This is strictly a *tightening* on oscillation, never a false stall on
-genuine forward motion: the only round the monotone measure scores as
-"no progress" while count-delta scores "progress" is a RE-pass of a
-previously-passed check — exactly the oscillation we want to stop. A check
-passing for the first time is progress under both.
+* progress iff a check passed that had NEVER passed before.
 
-Default OFF keeps every governed loop byte-identical: the tracker is only
-consulted inside an ``if monotone_progress_enabled()`` branch; the ``else``
-branch is the unchanged count-delta code.
+(Failing-set shrink alone is intentionally NOT progress: an oscillating
+2↔1 count would otherwise reset the no-progress counter forever.)
+
+Opt OUT with ``CCX_MONOTONE_PROGRESS=0`` / ``false`` / ``off`` / ``no`` to
+restore the legacy count-delta signal.
 """
 
 from __future__ import annotations
@@ -40,29 +23,26 @@ import os
 from typing import Iterable
 
 _ENV = "CCX_MONOTONE_PROGRESS"
+_FALSEY = frozenset({"0", "false", "no", "off"})
 
 
 def monotone_progress_enabled() -> bool:
-    """True when ``CCX_MONOTONE_PROGRESS`` opts the monotone measure in.
+    """True unless ``CCX_MONOTONE_PROGRESS`` explicitly opts the measure out.
 
-    Truthy = ``1`` / ``true`` / ``yes`` / ``on`` (case-insensitive). Any
-    other value — and the unset default — is OFF, so governed loops keep
-    their byte-identical count-delta behaviour.
+    Default ON (unset or empty ⇒ monotone). Falsy = ``0`` / ``false`` /
+    ``no`` / ``off`` (case-insensitive).
     """
-    return os.environ.get(_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.environ.get(_ENV)
+    if raw is None:
+        return True
+    text = raw.strip().lower()
+    if text == "":
+        return True
+    return text not in _FALSEY
 
 
 class EverPassedTracker:
-    """Tracks the union of criterion ids that have passed in ANY round.
-
-    :meth:`observe` folds one round's passed-criteria ids into the running
-    set and returns whether the set GREW — i.e. at least one
-    never-before-passed check passed this round. That boolean is the
-    monotone progress signal. The set only grows and is bounded by the
-    total criteria count, so ``True`` is returned at most ``len(criteria)``
-    times over the loop's whole life regardless of how the failing COUNT
-    oscillates.
-    """
+    """Tracks the union of criterion ids that have passed in ANY round."""
 
     __slots__ = ("_ever",)
 
@@ -80,4 +60,41 @@ class EverPassedTracker:
         return frozenset(self._ever)
 
 
-__all__ = ["monotone_progress_enabled", "EverPassedTracker"]
+def observe_progress(
+    *,
+    monotone: bool,
+    ever_tracker: EverPassedTracker | None,
+    prev_failing_ids: frozenset[str] | None,
+    passed_ids: Iterable[str],
+    failing_ids: Iterable[str],
+    prev_failing_count: int | None,
+) -> tuple[bool, frozenset[str]]:
+    """Return ``(made_progress, failing_ids_frozenset)``.
+
+    * Monotone ON: progress iff ever-passed grew (a check passed that had
+      never passed before). Failing-set shrink alone is NOT progress — an
+      oscillating 2↔1 failing count would otherwise reset forever.
+    * Monotone OFF: progress iff failing count decreased (legacy).
+
+    On the first failing round (no previous baseline) returns
+    ``(True, failing)`` so callers do not yet increment ``no_progress``.
+    """
+    failing = frozenset(fid for fid in failing_ids if fid is not None)
+    if not monotone:
+        if prev_failing_count is None:
+            return True, failing
+        return len(failing) < prev_failing_count, failing
+
+    newly = False
+    if ever_tracker is not None:
+        newly = ever_tracker.observe(passed_ids)
+    if prev_failing_ids is None and prev_failing_count is None:
+        return True, failing
+    return newly, failing
+
+
+__all__ = [
+    "EverPassedTracker",
+    "monotone_progress_enabled",
+    "observe_progress",
+]

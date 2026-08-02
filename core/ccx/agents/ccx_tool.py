@@ -45,6 +45,8 @@ from .ccx_research_tool import (
 )
 from .ccx_sgar_tool import SgarBuffer, SgarRequest
 from .ccx_spawn_tool import SpawnBuffer, SpawnRequest
+from .incremental_verify import normalize_scope
+from .rwset import READ_SCOPE_METADATA_KEY, WRITE_SCOPE_METADATA_KEY
 from .subagent import CCX_REQUIRES_APPROVAL_UNSUPPORTED
 
 
@@ -65,11 +67,15 @@ _TOOL_DESCRIPTION = (
     "Spawn one or more subagents that run after this turn finishes. Pick a "
     "mode and pass a payload that matches it:\n"
     "- mode in {plan, spec, agent, doc, ask, blueprint}: payload={goal, "
-    "metadata?, contract?}. The child runs as that mode (use 'agent' for "
+    "metadata?, contract?, write_scope?, read_scope?}. The child runs as "
+    "that mode (use 'agent' for "
     "ordinary decomposition, 'doc'/'ask' for documentation or read-only Q&A, "
     "'plan'/'spec'/'blueprint' to drive structured planning). Optional "
     "'contract' attaches machine-verified acceptance checks the child must "
-    "satisfy (honored by 'agent' mode under cc_query_loop).\n"
+    "satisfy (honored by 'agent' mode under cc_query_loop). Optional "
+    "'write_scope'/'read_scope' declare which paths the child touches; "
+    "siblings with overlapping write scopes are serialized instead of "
+    "racing on the same files.\n"
     "- mode='research': payload={question, scope?, focus_paths?}. The "
     "child runs read-only with Grep/Glob/Read and returns structured "
     "findings (summary + evidence). Use when N independent investigative "
@@ -84,6 +90,24 @@ _TOOL_DESCRIPTION = (
     "Use spawns=[{mode, payload}, ...] to enqueue several at once; modes "
     "may be mixed. Each becomes its own node in the orchestration DAG."
 )
+
+_WRITE_SCOPE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Paths / path prefixes this child will WRITE. Siblings whose write "
+        "scopes overlap are serialized instead of run in parallel."
+    ),
+}
+
+_READ_SCOPE_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string"},
+    "description": (
+        "Paths / path prefixes this child will READ. Combined with "
+        "write_scope to detect read/write conflicts between siblings."
+    ),
+}
 
 _INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -122,12 +146,16 @@ _INPUT_SCHEMA: dict[str, Any] = {
                 "Optional machine-verified acceptance contract for a spawn "
                 "mode (honored by 'agent' under cc_query_loop). Spawner-"
                 "authored — do NOT ask the child to emit it. Shape: "
-                "{acceptance:[{id,text,check?}], verify:'check'|'none', "
-                "loop:{max_iters,no_progress_stop}}. The child's turn re-runs "
-                "with failing-check evidence until each [check:] command "
-                "passes or a bound trips."
+                "{acceptance:[{id,text,check?,scope?}], "
+                "verify:'check'|'none', "
+                "loop:{max_iters,no_progress_stop}}. Optional per-item "
+                "'scope' is a list of path prefixes for incremental "
+                "verification. The child's turn re-runs with failing-check "
+                "evidence until each [check:] command passes or a bound trips."
             ),
         },
+        "write_scope": _WRITE_SCOPE_SCHEMA,
+        "read_scope": _READ_SCOPE_SCHEMA,
         "spawns": {
             "type": "array",
             "description": (
@@ -147,6 +175,8 @@ _INPUT_SCHEMA: dict[str, Any] = {
                     "instruction": {"type": "string"},
                     "metadata": {"type": "object"},
                     "contract": {"type": "object"},
+                    "write_scope": _WRITE_SCOPE_SCHEMA,
+                    "read_scope": _READ_SCOPE_SCHEMA,
                 },
             },
         },
@@ -212,6 +242,20 @@ def _normalise_entry(
             md = dict(payload.get("metadata") or {})
             md.setdefault("ccx_contract", contract)
             payload["metadata"] = md
+        # Same fold for the declared read/write footprint, which ``rwset``
+        # reads to serialize siblings that would otherwise race on the same
+        # files (principle 8).
+        for field_name, key in (
+            ("write_scope", WRITE_SCOPE_METADATA_KEY),
+            ("read_scope", READ_SCOPE_METADATA_KEY),
+        ):
+            scope = list(normalize_scope(
+                payload.pop(field_name, None) or entry.get(field_name)
+            ))
+            if scope:
+                md = dict(payload.get("metadata") or {})
+                md.setdefault(key, scope)
+                payload["metadata"] = md
     return mode, payload
 
 

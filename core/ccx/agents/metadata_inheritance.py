@@ -45,6 +45,19 @@ The set is intentionally a ``frozenset`` (not a tuple) so:
 
 from __future__ import annotations
 
+from typing import Any, Sequence
+
+#: Declared footprint / invariant keys that survive plan → spec → agent hops.
+#: Not in ``INHERITABLE_METADATA_KEYS``: those use plain setdefault (child
+#: wins if present). Constraint ceilings must *clamp* a child that tries
+#: to widen scope or drop parent invariants — see
+#: :func:`apply_constraint_ceiling`.
+WRITE_SCOPE_METADATA_KEY: str = "ccx_write_scope"
+READ_SCOPE_METADATA_KEY: str = "ccx_read_scope"
+INVARIANTS_METADATA_KEY: str = "ccx_invariants"
+
+_INVARIANTS_GOAL_MARKER = "GLOBAL INVARIANTS (must hold after your work):"
+
 
 #: Parent invocation metadata keys auto-propagated into spawned children.
 #:
@@ -73,6 +86,13 @@ from __future__ import annotations
 #: * ``mission_id`` — the active SGAR mission id. Mirrors ``stage_id``
 #:   for mission-level operations (mission manifests, mission-local
 #:   result files).
+#: * ``ccx_patch_first`` — the repair-turn write discipline (principle
+#:   1). Stamped by the governed loops on every redrive; a child that
+#:   does not inherit it can full-rewrite a file its parent was
+#:   forbidden to touch, which defeats the sparse-patch guarantee at
+#:   exactly the moment (a repair round) it matters most. The paired
+#:   ``ccx_rewrite_allowed`` escape hatch is deliberately NOT
+#:   inheritable: rewrite authorization must be granted per node.
 INHERITABLE_METADATA_KEYS: frozenset[str] = frozenset({
     "sgar_session",
     "session_id",
@@ -80,6 +100,7 @@ INHERITABLE_METADATA_KEYS: frozenset[str] = frozenset({
     "request_metadata",
     "stage_id",
     "mission_id",
+    "ccx_patch_first",
 })
 
 
@@ -134,10 +155,139 @@ def coerce_spawn_depth(value: object) -> int:
     return max(0, depth)
 
 
+def _as_str_list(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        return [text] if text else []
+    if isinstance(raw, (list, tuple)):
+        out: list[str] = []
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+    return []
+
+
+def format_invariants_block(invariants: Sequence[str]) -> str:
+    """Renderable block appended to subtask goals (principle 10)."""
+    lines = ["", _INVARIANTS_GOAL_MARKER]
+    for inv in invariants:
+        text = str(inv).strip()
+        if text:
+            lines.append(f"- {text}")
+    if len(lines) <= 2:
+        return ""
+    return "\n".join(lines)
+
+
+def _norm_path(path: str) -> str:
+    text = path.strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text
+
+
+def _path_under_ceiling(path: str, ceiling: Sequence[str]) -> bool:
+    """True when ``path`` is covered by any ceiling prefix / glob."""
+    if not ceiling:
+        return True
+    pn = _norm_path(path)
+    for entry in ceiling:
+        cn = _norm_path(str(entry)).rstrip("/")
+        if not cn:
+            continue
+        if pn == cn or pn.startswith(cn + "/"):
+            return True
+        # Allow ceiling entries that already look like globs (``pkg/*.py``).
+        if any(ch in cn for ch in "*?["):
+            from .write_scope_guard import path_matches_any_glob
+            if path_matches_any_glob(pn, [str(entry)], cwd=""):
+                return True
+    return False
+
+
+def clamp_scope_to_ceiling(
+    parent_scope: Sequence[str],
+    child_scope: Sequence[str] | None,
+) -> list[str]:
+    """Child may narrow the parent's scope; never widen past it.
+
+    Empty child ⇒ inherit parent. Child paths outside the ceiling are
+    stripped; if nothing remains, fall back to the parent ceiling so an
+    LLM cannot escape the guard by declaring only out-of-ceiling paths.
+    """
+    parent = _as_str_list(parent_scope)
+    if not parent:
+        return _as_str_list(child_scope)
+    child = _as_str_list(child_scope)
+    if not child:
+        return list(parent)
+    kept = [p for p in child if _path_under_ceiling(p, parent)]
+    return kept if kept else list(parent)
+
+
+def apply_constraint_ceiling(
+    parent_meta: Any,
+    child_meta: dict[str, Any],
+    *,
+    goal: str | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Clamp child metadata (and optionally goal text) to parent ceilings.
+
+    * ``ccx_write_scope`` / ``ccx_read_scope`` — intersect with parent
+      (parent empty ⇒ no clamp).
+    * ``ccx_invariants`` — parent entries always kept; child may add.
+    * Goal text — if parent stamped invariants and the goal lacks the
+      marker block, append it (spec/fallback hops rewrite goals).
+
+    Returns ``(new_metadata, new_goal_or_None)``. ``new_goal_or_None`` is
+    ``None`` when the goal string is unchanged.
+    """
+    out = dict(child_meta)
+    parent = parent_meta if isinstance(parent_meta, dict) else {}
+    parent_write = _as_str_list(parent.get(WRITE_SCOPE_METADATA_KEY))
+    parent_read = _as_str_list(parent.get(READ_SCOPE_METADATA_KEY))
+    parent_inv = _as_str_list(parent.get(INVARIANTS_METADATA_KEY))
+
+    if parent_write:
+        out[WRITE_SCOPE_METADATA_KEY] = clamp_scope_to_ceiling(
+            parent_write, out.get(WRITE_SCOPE_METADATA_KEY),
+        )
+    if parent_read:
+        out[READ_SCOPE_METADATA_KEY] = clamp_scope_to_ceiling(
+            parent_read, out.get(READ_SCOPE_METADATA_KEY),
+        )
+    if parent_inv:
+        child_inv = _as_str_list(out.get(INVARIANTS_METADATA_KEY))
+        merged: list[str] = []
+        for item in [*parent_inv, *child_inv]:
+            if item not in merged:
+                merged.append(item)
+        out[INVARIANTS_METADATA_KEY] = merged
+
+    new_goal: str | None = None
+    if parent_inv and goal is not None:
+        text = str(goal)
+        if _INVARIANTS_GOAL_MARKER not in text:
+            block = format_invariants_block(parent_inv)
+            if block:
+                new_goal = text + block
+    return out, new_goal
+
+
 __all__ = [
     "DEFAULT_MAX_SPAWN_DEPTH",
     "DEFAULT_MAX_SPAWN_FANOUT",
     "INHERITABLE_METADATA_KEYS",
+    "INVARIANTS_METADATA_KEY",
+    "READ_SCOPE_METADATA_KEY",
     "SPAWN_DEPTH_METADATA_KEY",
+    "WRITE_SCOPE_METADATA_KEY",
+    "apply_constraint_ceiling",
+    "clamp_scope_to_ceiling",
     "coerce_spawn_depth",
+    "format_invariants_block",
 ]

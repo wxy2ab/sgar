@@ -9,6 +9,7 @@ from ..modes.llm_client import text_of
 from .models import (
     CriterionResult,
     DoctorResult,
+    ExitCriterion,
     ProjectMode,
     ProjectState,
     SgarError,
@@ -90,6 +91,54 @@ class SgarRuntime:
         # with no check, or this flag left off, behaves exactly as before.
         self.run_criterion_checks = run_criterion_checks
         self.criterion_check_timeout_s = criterion_check_timeout_s
+
+    def _run_gated_checks(
+        self,
+        criteria: list[ExitCriterion],
+        *,
+        evidence_into: list[CriterionResult] | None = None,
+    ) -> None:
+        """Run machine checks with incremental filter + full confirmation.
+
+        Principle 7: scoped checks whose path set does not intersect the
+        working-tree diff are skipped on the first pass; a green subset is
+        always re-confirmed on the full candidate list before accepting.
+        """
+        if not criteria:
+            return
+        from ..agents.incremental_verify import select_criteria_for_changes
+        from ..agents.syndrome import changed_paths_from_git
+
+        changed = changed_paths_from_git(self.store.cwd)
+        to_run = select_criteria_for_changes(
+            criteria, changed if changed else None,
+        )
+        by_id = {
+            r.criterion_id: r for r in (evidence_into or [])
+        }
+
+        def _one(criterion: ExitCriterion) -> None:
+            outcome = run_criterion_check(
+                criterion,
+                cwd=self.store.cwd,
+                timeout_s=self.criterion_check_timeout_s,
+            )
+            if not outcome.passed:
+                raise SgarError(
+                    f"exit criterion {criterion.criterion_id} machine "
+                    f"check failed: {outcome.evidence_line()}"
+                )
+            result = by_id.get(criterion.criterion_id)
+            if result is not None:
+                result.evidence = _join_evidence(
+                    result.evidence, outcome.evidence_line(),
+                )
+
+        for criterion in to_run:
+            _one(criterion)
+        if len(to_run) < len(criteria):
+            for criterion in criteria:
+                _one(criterion)
 
     def init(
         self, *, project_name: str | None = None, force: bool = False,
@@ -431,23 +480,14 @@ class SgarRuntime:
             # is not a governance risk), and a disabled runtime is a no-op.
             if self.run_criterion_checks:
                 by_criterion = {c.criterion_id: c for c in criteria}
-                for result in results:
-                    criterion = by_criterion.get(result.criterion_id)
-                    if criterion is None or not criterion.check or not result.passed:
-                        continue
-                    outcome = run_criterion_check(
-                        criterion,
-                        cwd=self.store.cwd,
-                        timeout_s=self.criterion_check_timeout_s,
-                    )
-                    if not outcome.passed:
-                        raise SgarError(
-                            f"exit criterion {result.criterion_id} machine "
-                            f"check failed: {outcome.evidence_line()}"
-                        )
-                    result.evidence = _join_evidence(
-                        result.evidence, outcome.evidence_line(),
-                    )
+                to_gate = [
+                    by_criterion[r.criterion_id]
+                    for r in results
+                    if r.passed
+                    and r.criterion_id in by_criterion
+                    and by_criterion[r.criterion_id].check
+                ]
+                self._run_gated_checks(to_gate, evidence_into=results)
 
             existing: dict[str, CriterionResult] = {}
             if self.store.verification_json_path(stage_id).exists():
@@ -522,20 +562,16 @@ class SgarRuntime:
             # close). Opt-in; no-op when disabled or when no blocking
             # criterion declares a check.
             if self.run_criterion_checks:
-                for criterion in criteria:
-                    if not criterion.check or not criterion.blocking:
-                        continue
-                    outcome = run_criterion_check(
-                        criterion,
-                        cwd=self.store.cwd,
-                        timeout_s=self.criterion_check_timeout_s,
-                    )
-                    if not outcome.passed:
-                        raise SgarError(
-                            f"stage {stage_id} cannot close: exit criterion "
-                            f"{criterion.criterion_id} machine check failed: "
-                            f"{outcome.evidence_line()}"
-                        )
+                blocking_checked = [
+                    c for c in criteria if c.check and c.blocking
+                ]
+                try:
+                    self._run_gated_checks(blocking_checked)
+                except SgarError as exc:
+                    # Preserve the close-stage error wording tests / callers expect.
+                    raise SgarError(
+                        f"stage {stage_id} cannot close: {exc}"
+                    ) from exc
             stage_ids = extract_stage_ids_from_roadmap(
                 self.store.read_text(self.store.roadmap_path)
             )

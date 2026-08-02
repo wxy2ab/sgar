@@ -92,7 +92,9 @@ _MAX_GENERIC_READ_ONLY_STALL_ROUNDS = 30
 # Tools whose successful use means the round mutated source. Shared by the
 # implementation grace/stall accounting and the opt-in post-edit verification
 # step so both agree on what "this round changed code" means.
-_CODE_MUTATION_TOOLS = frozenset({"file_write", "file_edit", "delete_file"})
+_CODE_MUTATION_TOOLS = frozenset(
+    {"file_write", "file_edit", "file_edit_batch", "delete_file"}
+)
 
 
 async def _run_post_edit_verification(
@@ -993,8 +995,18 @@ async def run_single_turn(
             collected_results=collected_results,
         )
         if post_edit_verdict is not None:
-            latest_post_edit_verify_passed = post_edit_verdict.passed
-            latest_post_edit_verify_unrunnable = bool(post_edit_verdict.unrunnable)
+            prior_genuine_red = (
+                latest_post_edit_verify_passed is False
+                and not latest_post_edit_verify_unrunnable
+            )
+            if post_edit_verdict.unrunnable and prior_genuine_red:
+                # Keep sticky genuine RED for autocomplete; still surface the note.
+                pass
+            else:
+                latest_post_edit_verify_passed = post_edit_verdict.passed
+                latest_post_edit_verify_unrunnable = bool(
+                    post_edit_verdict.unrunnable
+                )
             _verdict_note = _post_edit_verdict_note(post_edit_verdict)
             if use_messages_mode:
                 conversation_messages.append({"role": "user", "content": _verdict_note})
@@ -1016,13 +1028,8 @@ async def run_single_turn(
                     },
                 ),
             )
-        else:
-            # No fresh verdict this round (read-only / shell-only / feature off).
-            # Clear any prior RED so a stale failure cannot permanently block
-            # ``_auto_complete_tasks`` after the model fixed things outside
-            # ``_CODE_MUTATION_TOOLS`` (e.g. via shell) without re-triggering verify.
-            latest_post_edit_verify_passed = None
-            latest_post_edit_verify_unrunnable = False
+        # No fresh verdict (read-only / shell-only / feature off): keep prior
+        # RED/GREEN sticky so a failed verify cannot be cleared before autocomplete.
 
         exited_mode = _mode_exited(pre_tool_state, dict(session.metadata.state))
         current_tasks_snapshot = _implementation_tasks_snapshot(session)
@@ -1186,7 +1193,14 @@ async def run_single_turn(
             )
             return
 
-        _progress_tools = {"file_write", "file_edit", "delete_file", "shell", "powershell"}
+        _progress_tools = {
+            "file_write",
+            "file_edit",
+            "file_edit_batch",
+            "delete_file",
+            "shell",
+            "powershell",
+        }
         # When the session's tool registry has NO write tools registered
         # (read-only investigator sessions for doc / ask / research modes
         # — the registry is restricted by ``restrict_tool_registry``

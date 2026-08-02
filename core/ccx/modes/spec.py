@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from ..agents.incremental_verify import normalize_scope
+from ..agents.metadata_inheritance import apply_constraint_ceiling
 from ..agents.subagent import (
     ModeRunner,
     SubagentInvocation,
@@ -50,7 +52,11 @@ SYSTEM_PROMPT_EN = (
     "  only on items that need the immediately-preceding item's output.\n"
     "- For DAG ordering, set ``depends_on: [<zero-based indices>]``.\n"
     "- Mixing parallel and chained items in the same spec is encouraged "
-    "  whenever the work allows it.\n\n"
+    "  whenever the work allows it.\n"
+    "- Declare each item's file footprint when you know it: "
+    "  ``write_scope`` / ``read_scope`` as lists of path prefixes. Items "
+    "  whose write scopes overlap are run in sequence instead of racing on "
+    "  the same files; omit the field when the footprint is unknown.\n\n"
     "Return strict JSON only — no preamble, no fences."
 )
 
@@ -62,7 +68,10 @@ SYSTEM_PROMPT_ZH = (
     "- 默认并行。仅当后一项必须等前一项产出时，才设置\n"
     "  depends_on_previous: true。\n"
     "- DAG：在该项上设置 depends_on: [<0 起的下标列表>]。\n"
-    "- 鼓励在同一个 spec 里混合使用并行项和链式项。\n\n"
+    "- 鼓励在同一个 spec 里混合使用并行项和链式项。\n"
+    "- 已知时请声明每一项的文件范围：write_scope / read_scope，取值为"
+    "路径前缀列表。写范围重叠的项会被串行执行而不是争用同一批文件；"
+    "范围未知时省略该字段。\n\n"
     "只返回严格的 JSON。"
 )
 
@@ -103,7 +112,8 @@ def build_spec_prompt(
         )
     parts.append(
         'Respond with: {"spec_items": [{"goal": "...", '
-        '"depends_on_previous": false, "depends_on": [<optional indices>]}'
+        '"depends_on_previous": false, "depends_on": [<optional indices>], '
+        '"write_scope": [<optional paths>], "read_scope": [<optional paths>]}'
         ', ...], "rationale": "..."}'
     )
     user = "\n\n".join(parts)
@@ -148,19 +158,27 @@ class SpecModeRunner(ModeRunner):
 
         if not spec.get("items"):
             # Fallback: single agent task with the spec goal verbatim.
+            # Constraint ceilings from the parent (plan-declared write_scope /
+            # invariants) MUST survive — fallback degrades decomposition, not
+            # the declared footprint / invariants.
+            fb_meta, fb_goal = apply_constraint_ceiling(
+                invocation.metadata or {},
+                {
+                    "ccx_parent_mode": "spec",
+                    "ccx_fallback": True,
+                    "ccx_root_goal": root_goal,
+                    "ccx_parent_plan_goal": current_goal,
+                },
+                goal=invocation.goal,
+            )
             result = SubagentResult(
                 final_text=spec.get("rationale", "")
                 or "(no spec items returned; falling back to single agent)",
                 subtasks=[
                     SubagentInvocation(
-                        goal=invocation.goal,
+                        goal=fb_goal if fb_goal is not None else invocation.goal,
                         mode="agent",
-                        metadata={
-                            "ccx_parent_mode": "spec",
-                            "ccx_fallback": True,
-                            "ccx_root_goal": root_goal,
-                            "ccx_parent_plan_goal": current_goal,
-                        },
+                        metadata=fb_meta,
                     ),
                 ],
                 extras={"goal": current_goal, "raw": response[:1000]},
@@ -188,23 +206,37 @@ class SpecModeRunner(ModeRunner):
         else:
             sequential_reason = "all items independent (parallel siblings)"
 
-        subtasks = [
-            SubagentInvocation(
-                goal=item["goal"],
-                mode="agent",
-                metadata={
-                    "ccx_parent_mode": "spec",
-                    "ccx_spec_index": i,
-                    "ccx_parent_plan_goal": current_goal,
-                    # Propagate root goal down the chain so agents
-                    # aren't blind to the project-level intent.
-                    "ccx_root_goal": root_goal,
-                    "ccx_depends_on_previous": bool(item.get("depends_on_previous")),
-                    "ccx_depends_on": list(item.get("depends_on") or []),
-                },
+        parent_meta = invocation.metadata or {}
+        subtasks = []
+        for i, item in enumerate(spec["items"]):
+            meta = {
+                "ccx_parent_mode": "spec",
+                "ccx_spec_index": i,
+                "ccx_parent_plan_goal": current_goal,
+                # Propagate root goal down the chain so agents
+                # aren't blind to the project-level intent.
+                "ccx_root_goal": root_goal,
+                "ccx_depends_on_previous": bool(item.get("depends_on_previous")),
+                "ccx_depends_on": list(item.get("depends_on") or []),
+                # Declared footprint (principle 8): siblings whose write
+                # sets collide get serialized instead of racing.
+                **(
+                    {"ccx_write_scope": list(item["write_scope"])}
+                    if item.get("write_scope") else {}
+                ),
+                **(
+                    {"ccx_read_scope": list(item["read_scope"])}
+                    if item.get("read_scope") else {}
+                ),
+            }
+            meta, goal = apply_constraint_ceiling(
+                parent_meta, meta, goal=item["goal"],
             )
-            for i, item in enumerate(spec["items"])
-        ]
+            subtasks.append(SubagentInvocation(
+                goal=goal if goal is not None else item["goal"],
+                mode="agent",
+                metadata=meta,
+            ))
         extras: dict[str, Any] = {
             "goal": current_goal,
             "items": spec["items"],
@@ -325,11 +357,22 @@ def _parse_spec_response(response: str) -> dict[str, Any]:
                         depends_on.append(int(v))
                     except (TypeError, ValueError):
                         pass
-            pending_items.append((original_index, {
+            item: dict[str, Any] = {
                 "goal": str(raw["goal"]),
                 "depends_on_previous": bool(raw.get("depends_on_previous", False)),
                 "depends_on": [],
-            }, depends_on))
+            }
+            ws = list(normalize_scope(
+                raw.get("write_scope") or raw.get("ccx_write_scope")
+            ))
+            rs = list(normalize_scope(
+                raw.get("read_scope") or raw.get("ccx_read_scope")
+            ))
+            if ws:
+                item["write_scope"] = ws
+            if rs:
+                item["read_scope"] = rs
+            pending_items.append((original_index, item, depends_on))
         else:
             dropped += 1
     old_to_new = {

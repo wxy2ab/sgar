@@ -73,8 +73,11 @@ from ..sgar.checks import (
     stop_on_unrunnable_enabled,
 )
 from ..sgar.models import ExitCriterion
-from .progress import EverPassedTracker, monotone_progress_enabled
+from .incremental_verify import normalize_scope, select_criteria_for_changes
+from .patch_first import stamp_patch_first
+from .progress import EverPassedTracker, monotone_progress_enabled, observe_progress
 from .subagent import SubagentInvocation, SubagentResult
+from .syndrome import build_syndrome, format_syndrome_detail
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +203,7 @@ def _parse_acceptance(raw: Any) -> list[ExitCriterion]:
             description=text,
             blocking=True,
             check=check_str or None,
+            scope=normalize_scope(item.get("scope")),
         ))
     return criteria
 
@@ -269,8 +273,9 @@ def run_governed_spawn(
     # run exactly once, no gating.
     if contract.verify == "none" or not criteria:
         result = run_once(invocation)
+        # Ungated execution is not verified completion (principle 6).
         return _attach_verdict(result, {
-            "passed": True,
+            "passed": False,
             "status": "ungated",
             "verify": contract.verify,
             "iters": 1,
@@ -280,13 +285,13 @@ def run_governed_spawn(
 
     detail: str | None = None
     prev_failing: int | None = None
+    prev_failing_ids: frozenset[str] | None = None
     no_progress = 0
     last_result: SubagentResult | None = None
     last_evidence: list[dict[str, Any]] = []
-    # Progress signal (default OFF ⇒ count-delta, byte-identical). Under
-    # CCX_MONOTONE_PROGRESS the ever-passed set replaces the count delta so an
-    # oscillating repair (a check that re-fails after passing) can no longer
-    # keep the loop alive past no_progress_stop. See progress.py.
+    last_syndrome: dict[str, Any] | None = None
+    # Progress: default ON ⇒ monotone ever-passed + failing-set shrink.
+    # Opt out with CCX_MONOTONE_PROGRESS=0. See progress.py.
     monotone = monotone_progress_enabled()
     progress_tracker = EverPassedTracker() if monotone else None
 
@@ -312,12 +317,27 @@ def run_governed_spawn(
                 "evidence": [],
             })
 
+        changed_paths = _changed_paths_from_result(result)
+        # Incremental verify (principle 7): only re-run checks whose scope
+        # intersects the patch; unscope'd checks always run. Full suite when
+        # no change set is known.
+        to_run = select_criteria_for_changes(
+            criteria, changed_paths if changed_paths else None,
+        )
         outcomes = [
             run_criterion_check(c, cwd=cwd, timeout_s=check_timeout_s)
-            for c in criteria
+            for c in to_run
         ]
-        last_evidence = [_outcome_dict(o) for o in outcomes]
+        # If we skipped some global-unrelated checks but all selected passed,
+        # still re-run the FULL suite once before declaring success.
         failing = [o for o in outcomes if not o.passed]
+        if not failing and len(to_run) < len(criteria):
+            outcomes = [
+                run_criterion_check(c, cwd=cwd, timeout_s=check_timeout_s)
+                for c in criteria
+            ]
+            failing = [o for o in outcomes if not o.passed]
+        last_evidence = [_outcome_dict(o) for o in outcomes]
 
         if not failing:
             log(f"attempt {attempt}: all {len(criteria)} check(s) passed")
@@ -328,13 +348,18 @@ def run_governed_spawn(
                 "iters": attempt,
                 "stop_reason": "satisfied",
                 "evidence": last_evidence,
+                "syndrome": last_syndrome,
             })
 
         log(
-            f"attempt {attempt}: {len(failing)}/{len(criteria)} check(s) "
+            f"attempt {attempt}: {len(failing)}/{len(outcomes)} check(s) "
             f"failing"
         )
-        detail = _format_failure_detail(failing)
+        syndrome = build_syndrome(
+            cwd, failing, changed_paths=changed_paths or None,
+        )
+        last_syndrome = syndrome.to_dict()
+        detail = format_syndrome_detail(syndrome, attempt=attempt)
 
         # Harness-defect early stop (opt-in, default OFF). When EVERY failing
         # check this round is UNRUNNABLE (malformed command / missing binary /
@@ -360,25 +385,21 @@ def run_governed_spawn(
                     "iters": attempt,
                     "stop_reason": "harness_defect",
                     "evidence": last_evidence,
+                    "syndrome": last_syndrome,
                 })
 
-        # Progress = the failing-check count went DOWN versus the previous
-        # round. The first failing round just records the baseline. Under
-        # CCX_MONOTONE_PROGRESS, "progress" instead means a check passed that
-        # had never passed before (a strictly-monotone measure oscillation
-        # cannot reset); the OFF branch below is the unchanged count-delta.
-        if monotone:
-            newly = progress_tracker.observe(
-                o.criterion_id for o in outcomes if o.passed
-            )
-            if prev_failing is not None:
-                no_progress = 0 if newly else no_progress + 1
-        elif prev_failing is not None:
-            if len(failing) >= prev_failing:
-                no_progress += 1
-            else:
-                no_progress = 0
+        made_progress, failing_ids = observe_progress(
+            monotone=monotone,
+            ever_tracker=progress_tracker,
+            prev_failing_ids=prev_failing_ids,
+            passed_ids=(o.criterion_id for o in outcomes if o.passed),
+            failing_ids=(o.criterion_id for o in failing),
+            prev_failing_count=prev_failing,
+        )
+        if prev_failing is not None:
+            no_progress = 0 if made_progress else no_progress + 1
         prev_failing = len(failing)
+        prev_failing_ids = failing_ids
 
         if no_progress >= contract.no_progress_stop:
             log(
@@ -392,6 +413,7 @@ def run_governed_spawn(
                 "iters": attempt,
                 "stop_reason": "no_progress",
                 "evidence": last_evidence,
+                "syndrome": last_syndrome,
             })
 
     # max_iters exhausted with failures still present.
@@ -404,6 +426,7 @@ def run_governed_spawn(
         "iters": contract.max_iters,
         "stop_reason": "max_iters",
         "evidence": last_evidence,
+        "syndrome": last_syndrome,
     })
 
 
@@ -458,25 +481,22 @@ def _unrunnable_criterion_ids(evidence: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-def _format_failure_detail(failing: list[CheckOutcome]) -> str:
-    lines = [
-        "The following machine-verified acceptance checks are still FAILING. "
-        "Fix the underlying problem so each one passes. The checks are re-run "
-        "independently after your turn — do NOT claim success yourself.",
-        "",
-    ]
-    for outcome in failing:
-        lines.append(f"- [{outcome.criterion_id}] {outcome.evidence_line()}")
-    return "\n".join(lines)
+def _changed_paths_from_result(result: SubagentResult) -> list[str]:
+    extras = result.extras or {}
+    writes = extras.get("write_set") or []
+    if isinstance(writes, (list, tuple)):
+        return [str(p) for p in writes if p]
+    return []
 
 
 def _augment_goal(
     invocation: SubagentInvocation, *, attempt: int, detail: str,
 ) -> SubagentInvocation:
-    """Rebuild the goal from the ORIGINAL goal + the latest failure detail.
+    """Rebuild the goal from the ORIGINAL goal + the latest syndrome detail.
 
     Built from ``invocation.goal`` each round (not cumulatively appended) so a
     multi-round repair doesn't pile stale evidence blocks on top of each other.
+    Repair redrives stamp patch-first so the model prefers sparse edits.
     """
     augmented = (
         f"{invocation.goal}\n\n"
@@ -484,7 +504,14 @@ def _augment_goal(
         f"[CONTRACT RETRY — attempt {attempt}]\n"
         f"{detail}"
     )
-    return replace(invocation, goal=augmented)
+    meta = stamp_patch_first(invocation.metadata, enabled=True)
+    # Carry patch-first into the system_prompt channel when present.
+    existing_sp = str(meta.get("system_prompt") or "")
+    from .patch_first import append_patch_first_hint
+    meta["system_prompt"] = append_patch_first_hint(
+        existing_sp, language=str(meta.get("language") or "en"),
+    )
+    return replace(invocation, goal=augmented, metadata=meta)
 
 
 __all__ = [

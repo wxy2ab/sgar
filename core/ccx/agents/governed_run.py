@@ -58,7 +58,9 @@ from ..sgar.checks import (
     stop_on_unrunnable_enabled,
 )
 from .governed_spawn import CONTRACT_METADATA_KEY, SpawnContract, parse_contract
-from .progress import EverPassedTracker, monotone_progress_enabled
+from .incremental_verify import select_criteria_for_changes
+from .progress import EverPassedTracker, monotone_progress_enabled, observe_progress
+from .syndrome import build_syndrome, changed_paths_from_git, format_syndrome_detail
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +195,9 @@ async def run_run_audit_loop(
     # no gating — mirror run_governed_spawn's ungated path.
     if contract.verify == "none" or not criteria:
         result = await drive_once(request)
+        # Ungated is not verified completion (principle 6).
         return _stamp(result, {
-            "passed": True,
+            "passed": False,
             "status": "ungated",
             "verify": contract.verify,
             "iters": 1,
@@ -211,14 +214,12 @@ async def run_run_audit_loop(
 
     detail: str | None = None
     prev_failing: int | None = None
+    prev_failing_ids: frozenset[str] | None = None
     no_progress = 0
     last_result: AgentRunResult | None = None
     last_evidence: list[dict[str, Any]] = []
+    last_syndrome: dict[str, Any] | None = None
     warned_redrive = False
-    # Progress signal (default OFF ⇒ count-delta, byte-identical). Under
-    # CCX_MONOTONE_PROGRESS the ever-passed set replaces the count delta so an
-    # oscillating repair cannot keep re-driving the whole DAG past
-    # no_progress_stop. See progress.py.
     monotone = monotone_progress_enabled()
     progress_tracker = EverPassedTracker() if monotone else None
 
@@ -226,22 +227,12 @@ async def run_run_audit_loop(
         req = request if detail is None else _augment_request(
             request, attempt=attempt, detail=detail,
         )
-        # Live surfacing of the documented re-drive limitation (additive): the
-        # first re-drive (attempt >= 2) re-runs the whole DAG, so a
-        # non-idempotent step re-applies. Logged once so an operator watching
-        # the run sees it, not only readers of the source docstring.
         if attempt >= 2 and not warned_redrive:
             warned_redrive = True
             log(_REDRIVE_LIVE_WARNING.format(attempt=attempt))
         result = await drive_once(req)
         last_result = result
 
-        # A deterministic startup failure (the engine thread couldn't even run
-        # — translated runtime-setup error) won't be fixed by re-driving the
-        # same workspace, and would otherwise burn the whole iteration budget on
-        # identical failures. Abort with an honest verdict. NOTE: a non-completed
-        # verdict / degraded result is NOT a run_failed — the DAG ran and may
-        # have left workspace artifacts, so we still let the judge read disk.
         if result.failed and result.error_code == "CCX_RUN_FAILED":
             log(f"attempt {attempt}: run failed to execute — aborting audit")
             return _stamp(result, {
@@ -251,14 +242,34 @@ async def run_run_audit_loop(
                 "iters": attempt,
                 "stop_reason": "run_failed",
                 "evidence": last_evidence,
+                "syndrome": last_syndrome,
             })
 
+        # Incremental verify (principle 7): re-run only the checks whose scope
+        # intersects this round's working-tree diff; unscoped checks always run.
+        # An empty/unknown diff falls back to the full suite.
+        changed_paths = changed_paths_from_git(cwd)
+        to_run = select_criteria_for_changes(
+            criteria, changed_paths if changed_paths else None,
+        )
         outcomes = [
             run_criterion_check(c, cwd=cwd, timeout_s=check_timeout_s)
-            for c in criteria
+            for c in to_run
         ]
-        last_evidence = [_outcome_dict(o) for o in outcomes]
         failing = [o for o in outcomes if not o.passed]
+        # A green subset is not a green run: an under-declared scope would
+        # otherwise pass the gate. Confirm on the full suite before passing.
+        if not failing and len(to_run) < len(criteria):
+            log(
+                f"attempt {attempt}: incremental subset green "
+                f"({len(to_run)}/{len(criteria)}) — confirming on full suite"
+            )
+            outcomes = [
+                run_criterion_check(c, cwd=cwd, timeout_s=check_timeout_s)
+                for c in criteria
+            ]
+            failing = [o for o in outcomes if not o.passed]
+        last_evidence = [_outcome_dict(o) for o in outcomes]
 
         if not failing:
             log(f"attempt {attempt}: all {len(criteria)} check(s) passed")
@@ -269,21 +280,16 @@ async def run_run_audit_loop(
                 "iters": attempt,
                 "stop_reason": "satisfied",
                 "evidence": last_evidence,
+                "syndrome": last_syndrome,
             })
 
         log(
-            f"attempt {attempt}: {len(failing)}/{len(criteria)} check(s) failing"
+            f"attempt {attempt}: {len(failing)}/{len(outcomes)} check(s) failing"
         )
-        detail = _format_run_audit_detail(failing)
+        syndrome = build_syndrome(cwd, failing, changed_paths=changed_paths or None)
+        last_syndrome = syndrome.to_dict()
+        detail = format_syndrome_detail(syndrome, attempt=attempt)
 
-        # Harness-defect early stop (opt-in, default OFF). When EVERY failing
-        # check this round is UNRUNNABLE (malformed command / missing binary /
-        # shell syntax error), a re-drive can never repair it. Always surface
-        # that; under ``CCX_STOP_ON_UNRUNNABLE`` also stop NOW with
-        # ``stop_reason="harness_defect"`` instead of re-driving the whole DAG
-        # (~10× cost) against an immutable check that cannot execute. Default
-        # OFF ⇒ control flow is byte-identical (only an extra log line, and only
-        # in the already-abnormal all-unrunnable case).
         unrunnable_now = [o for o in failing if check_unrunnable(o)]
         if len(unrunnable_now) == len(failing):
             log(
@@ -300,25 +306,21 @@ async def run_run_audit_loop(
                     "iters": attempt,
                     "stop_reason": "harness_defect",
                     "evidence": last_evidence,
+                    "syndrome": last_syndrome,
                 })
 
-        # Progress = the failing-check count went DOWN vs the previous round.
-        # The first failing round just records the baseline. Under
-        # CCX_MONOTONE_PROGRESS, "progress" instead means a check passed that
-        # had never passed before (oscillation cannot reset it); the OFF branch
-        # below is the unchanged count-delta.
-        if monotone:
-            newly = progress_tracker.observe(
-                o.criterion_id for o in outcomes if o.passed
-            )
-            if prev_failing is not None:
-                no_progress = 0 if newly else no_progress + 1
-        elif prev_failing is not None:
-            if len(failing) >= prev_failing:
-                no_progress += 1
-            else:
-                no_progress = 0
+        made_progress, failing_ids = observe_progress(
+            monotone=monotone,
+            ever_tracker=progress_tracker,
+            prev_failing_ids=prev_failing_ids,
+            passed_ids=(o.criterion_id for o in outcomes if o.passed),
+            failing_ids=(o.criterion_id for o in failing),
+            prev_failing_count=prev_failing,
+        )
+        if prev_failing is not None:
+            no_progress = 0 if made_progress else no_progress + 1
         prev_failing = len(failing)
+        prev_failing_ids = failing_ids
 
         if no_progress >= contract.no_progress_stop:
             log(
@@ -332,6 +334,7 @@ async def run_run_audit_loop(
                 "iters": attempt,
                 "stop_reason": "no_progress",
                 "evidence": last_evidence,
+                "syndrome": last_syndrome,
             })
 
     log(f"stopping: reached run-level max_iters={max_iters}")
@@ -343,6 +346,7 @@ async def run_run_audit_loop(
         "iters": max_iters,
         "stop_reason": "max_iters",
         "evidence": last_evidence,
+        "syndrome": last_syndrome,
     })
 
 
@@ -421,36 +425,27 @@ def _unrunnable_criterion_ids(evidence: list[dict[str, Any]]) -> list[str]:
     ]
 
 
-def _format_run_audit_detail(failing: list[CheckOutcome]) -> str:
-    lines = [
-        "The following machine-verified run-level acceptance checks are still "
-        "FAILING. Fix the underlying problem so each one passes. The checks are "
-        "re-run independently after the whole run completes — do NOT claim "
-        "success yourself.",
-        "",
-    ]
-    for outcome in failing:
-        lines.append(f"- [{outcome.criterion_id}] {outcome.evidence_line()}")
-    return "\n".join(lines)
-
-
 def _augment_request(
     request: AgentRunRequest, *, attempt: int, detail: str,
 ) -> AgentRunRequest:
-    """Rebuild the instruction from the ORIGINAL instruction + latest failures.
+    """Rebuild the instruction from the ORIGINAL instruction + latest syndrome.
 
     Built from ``request.instruction`` each round (not cumulatively appended) so
     a multi-round repair doesn't pile stale evidence blocks on each other.
     Mirrors ``governed_spawn._augment_goal`` with a distinct ``[RUN AUDIT
-    RETRY]`` marker.
+    RETRY]`` marker. Stamps patch-first into request metadata for child agents.
     """
+    from .patch_first import PATCH_FIRST_METADATA_KEY
+
     augmented = (
         f"{request.instruction}\n\n"
         f"---\n"
         f"[RUN AUDIT RETRY — attempt {attempt}]\n"
         f"{detail}"
     )
-    return replace(request, instruction=augmented)
+    meta = dict(request.metadata or {})
+    meta[PATCH_FIRST_METADATA_KEY] = True
+    return replace(request, instruction=augmented, metadata=meta)
 
 
 __all__ = [
